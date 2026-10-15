@@ -19,3 +19,19 @@ zarn-providers = { path = "crates/zarn-providers" }
 zarn-tools = { path = "crates/zarn-tools" }
 zarn-tui = { path = "crates/zarn-tui" }
 zarn-config = { path = "crates/zarn-config" }
+
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+reqwest = { version = "0.13", default-features = false, features = ["json", "stream", "rustls", "rustls-native-certs", "http2", "charset"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+futures = "0.3"
+eventsource-stream = "0.2"
+tiktoken-rs = "0.12"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "2"
+base64 = "0.23"
+tokio-stream = "0.1"
