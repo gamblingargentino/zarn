@@ -7,9 +7,10 @@ use zarn_core::provider::Event;
 use zarn_core::tools::{Ctx, ToolRegistry};
 use zarn_core::types::Message;
 use zarn_providers::OpenAiCompatProvider;
+use zarn_tools::permissions::Permissions;
 
 fn usage() -> ! {
-    eprintln!("usage: zarn --print \"prompt\"");
+    eprintln!("usage: zarn [--print \"prompt\"]");
     std::process::exit(2);
 }
 
@@ -25,7 +26,8 @@ async fn main() -> Result<()> {
 
     let args: Vec<String> = std::env::args().skip(1).collect();
     let prompt = match args.as_slice() {
-        [flag, prompt] if flag == "--print" => prompt.clone(),
+        [] => None,
+        [flag, prompt] if flag == "--print" => Some(prompt.clone()),
         _ => usage(),
     };
 
@@ -42,15 +44,22 @@ async fn main() -> Result<()> {
     let provider = Arc::new(OpenAiCompatProvider::new(base_url, api_key));
     let tools = Arc::new(ToolRegistry::new());
     let ctx = Arc::new(Ctx::new(std::env::current_dir()?));
-    let agent = Agent::new(
-        provider,
-        tools,
-        ctx,
-        AgentConfig {
-            model,
-            ..AgentConfig::default()
-        },
-    );
+    let config = AgentConfig {
+        model,
+        ..AgentConfig::default()
+    };
+
+    let Some(prompt) = prompt else {
+        let (prompt_sink, permissions) = zarn_tui::permission_channel();
+        let gate = Arc::new(Permissions::new(prompt_sink));
+        let agent = Arc::new(
+            Agent::new(provider, tools, ctx, config).with_gate(gate),
+        );
+        zarn_tui::run(agent, Vec::new(), permissions).await?;
+        return Ok(());
+    };
+
+    let agent = Agent::new(provider, tools, ctx, config).with_gate(Arc::new(Permissions::headless()));
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
     let printer = tokio::spawn(async move {
