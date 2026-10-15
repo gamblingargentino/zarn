@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use zarn_core::agent::{Agent, AgentConfig, AgentEvent};
 use zarn_core::provider::Event;
-use zarn_core::tools::{Ctx, ToolRegistry};
+use zarn_core::tools::Ctx;
 use zarn_core::types::Message;
 use zarn_providers::OpenAiCompatProvider;
 use zarn_tools::permissions::Permissions;
@@ -42,7 +42,7 @@ async fn main() -> Result<()> {
     let model = std::env::var("ZARN_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
 
     let provider = Arc::new(OpenAiCompatProvider::new(base_url, api_key));
-    let tools = Arc::new(ToolRegistry::new());
+    let tools = Arc::new(zarn_tools::builtins());
     let ctx = Arc::new(Ctx::new(std::env::current_dir()?));
     let config = AgentConfig {
         model,
