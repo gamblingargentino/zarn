@@ -1,6 +1,7 @@
 use crate::provider::{Event, Provider, ProviderError};
-use crate::tools::{Ctx, ToolOutput, ToolRegistry};
+use crate::tools::{Ctx, Risk, ToolOutput, ToolRegistry};
 use crate::types::{Content, Message, Request, StopReason, ToolCall};
+use async_trait::async_trait;
 use futures::StreamExt;
 use serde_json::Value;
 use std::sync::Arc;
@@ -20,6 +21,17 @@ pub enum AgentEvent {
         name: String,
         output: ToolOutput,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GateDecision {
+    Allow,
+    Deny(String),
+}
+
+#[async_trait]
+pub trait ToolGate: Send + Sync {
+    async fn check(&self, name: &str, risk: Risk, args: &Value) -> GateDecision;
 }
 
 #[derive(Clone, Debug)]
@@ -46,6 +58,7 @@ pub struct Agent {
     tools: Arc<ToolRegistry>,
     ctx: Arc<Ctx>,
     config: AgentConfig,
+    gate: Option<Arc<dyn ToolGate>>,
 }
 
 struct Collected {
@@ -66,7 +79,13 @@ impl Agent {
             tools,
             ctx,
             config,
+            gate: None,
         }
+    }
+
+    pub fn with_gate(mut self, gate: Arc<dyn ToolGate>) -> Self {
+        self.gate = Some(gate);
+        self
     }
 
     pub fn provider(&self) -> &Arc<dyn Provider> {
@@ -207,9 +226,12 @@ impl Agent {
 
         let output = match self.tools.get(&call.name) {
             None => ToolOutput::error(format!("unknown tool: {}", call.name)),
-            Some(tool) => match tool.run(call.args.clone(), &self.ctx).await {
-                Ok(out) => out,
-                Err(err) => ToolOutput::error(format!("{err:#}")),
+            Some(tool) => match self.permit(&call.name, tool.risk(), &call.args).await {
+                GateDecision::Deny(reason) => ToolOutput::error(reason),
+                GateDecision::Allow => match tool.run(call.args.clone(), &self.ctx).await {
+                    Ok(out) => out,
+                    Err(err) => ToolOutput::error(format!("{err:#}")),
+                },
             },
         };
 
@@ -222,6 +244,15 @@ impl Agent {
             .await;
 
         output
+    }
+}
+
+impl Agent {
+    async fn permit(&self, name: &str, risk: Risk, args: &Value) -> GateDecision {
+        match &self.gate {
+            None => GateDecision::Allow,
+            Some(gate) => gate.check(name, risk, args).await,
+        }
     }
 }
 
