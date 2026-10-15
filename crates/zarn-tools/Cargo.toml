@@ -15,3 +15,5 @@ ignore.workspace = true
 regex.workspace = true
 tiktoken-rs.workspace = true
 tracing.workspace = true
+reqwest.workspace = true
+eventsource-stream.workspace = true

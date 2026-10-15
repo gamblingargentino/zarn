@@ -1,8 +1,10 @@
 pub mod agent;
+pub mod commands;
 pub mod compact;
 pub mod cost;
 pub mod prompted;
 pub mod provider;
 pub mod session;
+pub mod subagent;
 pub mod tools;
 pub mod types;
