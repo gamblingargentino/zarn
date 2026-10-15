@@ -13,3 +13,4 @@ tokio-util.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
+dirs.workspace = true
