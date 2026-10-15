@@ -1,0 +1,6 @@
+[package]
+name = "zarn-core"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]

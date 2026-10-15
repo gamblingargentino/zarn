@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/zarn-core",
+    "crates/zarn-providers",
+    "crates/zarn-tools",
+    "crates/zarn-tui",
+    "crates/zarn-config",
+    "crates/zarn",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+
+[workspace.dependencies]
+zarn-core = { path = "crates/zarn-core" }
+zarn-providers = { path = "crates/zarn-providers" }
+zarn-tools = { path = "crates/zarn-tools" }
+zarn-tui = { path = "crates/zarn-tui" }
+zarn-config = { path = "crates/zarn-config" }

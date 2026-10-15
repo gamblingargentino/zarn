@@ -1,0 +1,11 @@
+[package]
+name = "zarn"
+edition.workspace = true
+version.workspace = true
+
+[dependencies]
+zarn-core.workspace = true
+zarn-providers.workspace = true
+zarn-tools.workspace = true
+zarn-tui.workspace = true
+zarn-config.workspace = true
