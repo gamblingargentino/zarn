@@ -4,3 +4,12 @@ edition.workspace = true
 version.workspace = true
 
 [dependencies]
+zarn-core.workspace = true
+zarn-providers.workspace = true
+zarn-tools.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+toml.workspace = true
+anyhow.workspace = true
+dirs.workspace = true
+tracing.workspace = true
