@@ -51,7 +51,9 @@ pub fn load_from(user: Option<&Path>, project: &Path) -> Vec<AgentFile> {
 
 pub fn load() -> Vec<AgentFile> {
     let project = dir(Scope::Project).unwrap_or_default();
-    load_from(dir(Scope::User).as_deref(), &project)
+    let mut found = load_from(dir(Scope::User).as_deref(), &project);
+    found.extend(crate::plugins::agents(&crate::plugins::installed()));
+    found
 }
 
 pub fn render(def: &AgentDef) -> String {

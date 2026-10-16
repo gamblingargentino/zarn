@@ -64,7 +64,7 @@ pub fn draw_panel(frame: &mut Frame, panel: &Panel, accent: Color) {
     let mut tabs = Vec::new();
     for (i, tab) in TABS.iter().enumerate() {
         if i > 0 {
-            tabs.push(Span::styled(" │ ", dim()));
+            tabs.push(Span::styled("  ", dim()));
         }
         let style = if *tab == panel.tab {
             Style::default()

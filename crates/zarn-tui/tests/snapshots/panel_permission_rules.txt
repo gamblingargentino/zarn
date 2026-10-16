@@ -1,5 +1,5 @@
 ╭ zarn settings · changes save as you go ──────────────────────────────────────────────────────────╮
-│Providers │ Models │ Skills │ MCP │ Agents │ Modes │ Quota │ Permissions │ Hooks │ General        │
+│Providers  Models  Skills  MCP  Agents  Modes  Quota  Permissions  Hooks  Plugins  General        │
 │                                                                                                  │
 │› bash          deny  user                                                                        │
 │  read          allow  default                                                                    │

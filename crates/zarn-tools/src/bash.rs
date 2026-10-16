@@ -13,15 +13,21 @@ const DEFAULT_TIMEOUT_SECS: u64 = 120;
 
 pub struct Bash {
     sandbox: bool,
+    shells: Option<Arc<crate::shells::Shells>>,
 }
 
 impl Bash {
     pub fn new() -> Self {
-        Bash { sandbox: false }
+        Bash { sandbox: false, shells: None }
     }
 
     pub fn sandboxed() -> Self {
-        Bash { sandbox: true }
+        Bash { sandbox: true, shells: None }
+    }
+
+    pub fn with_shells(mut self, shells: Arc<crate::shells::Shells>) -> Self {
+        self.shells = Some(shells);
+        self
     }
 }
 
@@ -108,6 +114,10 @@ impl Tool for Bash {
                     "timeout": {
                         "type": "integer",
                         "description": "Timeout in seconds (default 120)"
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "Start the command in the background and return an id at once; read it with bash_output and stop it with bash_kill"
                     }
                 },
                 "required": ["command"]
@@ -148,6 +158,18 @@ impl Tool for Bash {
                 builder.env_remove(name);
             }
             builder.env("ZARN_SANDBOX", "1");
+        }
+
+        if args.get("background").and_then(Value::as_bool).unwrap_or(false) {
+            let Some(shells) = &self.shells else {
+                return Ok(ToolOutput::error("background commands are not available here"));
+            };
+            return Ok(match shells.start(command, builder) {
+                Ok(id) => ToolOutput::ok(format!(
+                    "started {id} in the background: {command}\nread its output with bash_output (id {id}) and stop it with bash_kill"
+                )),
+                Err(err) => ToolOutput::error(format!("cannot run {program}: {err}")),
+            });
         }
 
         let mut child = match builder.spawn() {

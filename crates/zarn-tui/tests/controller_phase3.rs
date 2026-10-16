@@ -171,11 +171,12 @@ async fn snapshot_permissions_shows_rules_mode_and_resolution() {
     c.app_mut().blocks.clear();
     c.app_mut().theme.banner = false;
     c.type_line("/permissions");
-    let out = screen(&c, 100, 22);
+    let out = screen(&c, 100, 30);
     snapshot("chat_permissions_summary", &out);
     let text = out.join("\n");
     assert!(text.contains("mode     accept-edits"));
     assert!(text.contains("deny  bash(rm -rf:*)  (user)"));
-    assert!(text.contains("edit   allow accept-edits mode"));
-    assert!(text.contains("read   allow default for its risk"));
+    assert!(text.contains("edit           allow accept-edits mode"));
+    assert!(text.contains("read           allow default for its risk"));
+    assert!(text.contains("webfetch       ask   default for its risk"));
 }

@@ -24,6 +24,7 @@ pub enum Tab {
     Quota,
     Permissions,
     Hooks,
+    Plugins,
     General,
 }
 
@@ -36,7 +37,7 @@ pub enum QuotaState {
     Failed(String),
 }
 
-pub const TABS: [Tab; 10] = [
+pub const TABS: [Tab; 11] = [
     Tab::Providers,
     Tab::Models,
     Tab::Skills,
@@ -46,6 +47,7 @@ pub const TABS: [Tab; 10] = [
     Tab::Quota,
     Tab::Permissions,
     Tab::Hooks,
+    Tab::Plugins,
     Tab::General,
 ];
 
@@ -61,6 +63,7 @@ impl Tab {
             Tab::Quota => "Quota",
             Tab::Permissions => "Permissions",
             Tab::Hooks => "Hooks",
+            Tab::Plugins => "Plugins",
             Tab::General => "General",
         }
     }
@@ -80,6 +83,7 @@ impl Tab {
             Tab::Quota => "r refresh this provider · R refresh all",
             Tab::Permissions => "enter cycles · a allow · s ask · d deny, or delete a rule",
             Tab::Hooks => "hooks are edited under [hooks] in config.toml",
+            Tab::Plugins => "enter approves or revokes code · d remove · zarn plugin add installs",
             Tab::General => "enter change",
         }
     }
@@ -157,6 +161,7 @@ pub enum RowKind {
     Notifications,
     StatusLine,
     Mouse,
+    Plugin(String),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -219,6 +224,9 @@ pub enum ConfirmFor {
     DeleteMcp(String),
     DeleteAgent(usize),
     DeleteMode(usize),
+    ApprovePlugin(String),
+    RevokePlugin(String),
+    RemovePlugin(String),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -349,6 +357,7 @@ pub struct Panel {
     pub tests: BTreeMap<String, TestState>,
     store: Arc<KeyStore>,
     agent_dirs: (Option<PathBuf>, PathBuf),
+    plugin_root: Option<PathBuf>,
     mode_dirs: (Option<PathBuf>, PathBuf),
 }
 
@@ -448,6 +457,7 @@ impl Panel {
             tests: BTreeMap::new(),
             store,
             agent_dirs: (user_agents, project_agents),
+            plugin_root: zarn_config::paths::user_dir(),
             mode_dirs,
         }
     }
@@ -456,6 +466,15 @@ impl Panel {
         self.mode_dirs = (user, project);
         self.reload_modes();
         self
+    }
+
+    pub fn with_plugin_root(mut self, root: PathBuf) -> Self {
+        self.plugin_root = Some(root);
+        self
+    }
+
+    fn plugin_store(&self) -> Option<zarn_config::plugins::Store> {
+        self.plugin_root.as_deref().map(zarn_config::plugins::Store::at)
     }
 
     pub fn with_status_values(mut self, values: crate::status_line::Values) -> Self {
@@ -646,6 +665,23 @@ impl Panel {
                     }
                 }
                 rows
+            }
+            Tab::Plugins => {
+                let plugins = self.plugin_store().map(|s| s.installed()).unwrap_or_default();
+                if plugins.is_empty() {
+                    return vec![Row::new(
+                        "no plugins",
+                        "install one with zarn plugin add <directory or git URL>",
+                        RowKind::Info,
+                    )];
+                }
+                plugins
+                    .iter()
+                    .map(|p| {
+                        Row::new(p.name().to_string(), p.status(), RowKind::Plugin(p.name().to_string()))
+                            .note(p.contributions())
+                    })
+                    .collect()
             }
             Tab::Hooks => {
                 let mut rows: Vec<Row> = cfg
@@ -989,6 +1025,13 @@ impl Panel {
                 self.set_mcp_status(&name, "restarting…");
                 Some(Effect::RestartMcp(name))
             }
+            (Tab::Plugins, 'd', Some(RowKind::Plugin(name))) => {
+                self.editor = Some(Editor::Confirm(
+                    format!("Remove plugin {name} and its files? y/n"),
+                    ConfirmFor::RemovePlugin(name),
+                ));
+                None
+            }
             (Tab::Mcp, 'd', Some(RowKind::Mcp(name))) => {
                 self.editor = Some(Editor::Confirm(
                     format!("Remove MCP server {name}? y/n"),
@@ -1238,6 +1281,26 @@ impl Panel {
                 Some(Effect::RefreshQuota(Some(name)))
             }
             RowKind::Info => None,
+            RowKind::Plugin(name) => {
+                let plugin = self.plugin_store().and_then(|s| s.find(&name))?;
+                if !plugin.runs_code() {
+                    self.say(format!("{name} has no hooks or MCP servers; its commands, agents, skills and modes are on"));
+                    return None;
+                }
+                if plugin.approved() {
+                    self.editor = Some(Editor::Confirm(
+                        format!("Stop {name}'s hooks and MCP servers? y/n"),
+                        ConfirmFor::RevokePlugin(name),
+                    ));
+                } else {
+                    let code = plugin.code().iter().map(|c| format!("  {c}")).collect::<Vec<_>>().join("\n");
+                    self.editor = Some(Editor::Confirm(
+                        format!("Allow plugin {name} to run this code on your machine?\n{code}\ny/n"),
+                        ConfirmFor::ApprovePlugin(name),
+                    ));
+                }
+                None
+            }
             RowKind::Routing => {
                 let value = !cfg.routing.enabled();
                 let result = ops::set_routing_enabled(&mut self.layers, value).map(|_| ());
@@ -1505,6 +1568,27 @@ impl Panel {
                 let result = ops::remove_provider(&mut self.layers, &self.store, &name).map(|_| ());
                 self.tests.remove(&name);
                 self.saved(format!("provider {name} deleted"), result)
+            }
+            ConfirmFor::ApprovePlugin(name) => {
+                let result = match self.plugin_store() {
+                    Some(store) => store.approve(&name).map(|_| ()),
+                    None => Err(anyhow::anyhow!("no user config directory")),
+                };
+                self.saved(format!("{name}'s hooks and MCP servers are approved and on"), result)
+            }
+            ConfirmFor::RevokePlugin(name) => {
+                let result = match self.plugin_store() {
+                    Some(store) => store.revoke(&name),
+                    None => Err(anyhow::anyhow!("no user config directory")),
+                };
+                self.saved(format!("{name}'s hooks and MCP servers are off"), result)
+            }
+            ConfirmFor::RemovePlugin(name) => {
+                let result = match self.plugin_store() {
+                    Some(store) => store.remove(&name),
+                    None => Err(anyhow::anyhow!("no user config directory")),
+                };
+                self.saved(format!("plugin {name} removed"), result)
             }
             ConfirmFor::DeleteMcp(name) => {
                 let result = ops::mcp_remove(&mut self.layers, &name);

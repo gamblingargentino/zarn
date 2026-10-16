@@ -257,7 +257,7 @@ fn tab_completes_and_typing_arguments_closes_the_popup() {
 #[test]
 fn custom_commands_and_skills_show_in_the_popup() {
     let mut app = App::new("m");
-    app.entries = zarn_tui::popup::entries(&["review".into()], &[("pdf".into(), "forms".into())]);
+    app.entries = zarn_tui::popup::entries(&[("review".into(), String::new(), String::new())], &[("pdf".into(), "forms".into())]);
     for k in typed("/re") {
         app.on_key(k);
     }
@@ -690,4 +690,45 @@ fn snapshot_the_status_line_form_previews_live_and_refuses_bad_templates() {
     panel_key(&mut panel, KeyCode::Enter);
     assert!(panel.message.as_ref().unwrap().0.contains("the previous status line is kept"));
     assert!(fx.user_config().contains("status_line = \"{model}\""));
+}
+
+#[test]
+fn snapshot_the_plugins_tab_and_approve_a_plugins_code() {
+    let fx = Fixture::new(TWO_PROVIDERS);
+    let source = fx.root.join("kit-src");
+    std::fs::create_dir_all(source.join("commands")).unwrap();
+    std::fs::write(
+        source.join("plugin.toml"),
+        "name = \"kit\"\ndescription = \"sample\"\n\n[[hooks.pre_tool]]\ncommand = \"echo checking\"\n",
+    )
+    .unwrap();
+    std::fs::write(source.join("commands/fix.md"), "Fix it").unwrap();
+    let store = zarn_config::plugins::Store::at(&fx.root.join("user"));
+    store.install(source.to_str().unwrap()).unwrap();
+
+    let panel = fx.panel().with_plugin_root(fx.root.join("user")).open_at(Tab::Plugins);
+    let (mut panel, shown) = show(panel, 100, 10);
+    snapshot("panel_plugins", &shown);
+    assert!(shown.join("\n").contains("kit  enabled; hooks and MCP wait for approval  1 commands, 1 hooks"), "{shown:?}");
+
+    panel_key(&mut panel, KeyCode::Enter);
+    let (mut panel, shown) = show(panel, 100, 16);
+    let shown = shown.join("\n");
+    assert!(shown.contains("Allow plugin kit to run this code on your machine?"), "{shown}");
+    assert!(shown.contains("hook pre_tool: echo checking"), "{shown}");
+    assert_eq!(panel.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)), Some(Effect::Reload));
+    assert!(store.find("kit").unwrap().approved());
+    let (mut panel, shown) = show(panel, 100, 10);
+    assert!(shown.join("\n").contains("hooks and MCP approved"));
+
+    panel.on_key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+    panel.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+    assert!(store.installed().is_empty());
+}
+
+fn show(panel: Panel, width: u16, height: u16) -> (Panel, Vec<String>) {
+    let app = app_with_panel(panel);
+    let shown = rows(width, height, &app);
+    let Mode::Panel(panel) = app.mode else { unreachable!() };
+    (*panel, shown)
 }

@@ -61,6 +61,11 @@ pub enum Command {
         #[command(subcommand)]
         action: Option<McpAction>,
     },
+    #[command(about = "Install, list, approve and remove plugins")]
+    Plugin {
+        #[command(subcommand)]
+        action: Option<PluginAction>,
+    },
     #[command(about = "List the hooks that run before and after tools, prompts and turns")]
     Hooks {
         #[command(subcommand)]
@@ -90,6 +95,24 @@ pub enum Command {
         #[arg(long, help = "Skip network probes and MCP server starts")]
         offline: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PluginAction {
+    #[command(about = "Install a plugin from a directory or a git URL; nothing in it runs until you approve it")]
+    Add { source: String },
+    #[command(about = "List installed plugins, what they contribute and whether their code is approved")]
+    List,
+    #[command(about = "Show a plugin's hooks and MCP servers and allow them to run")]
+    Approve {
+        name: String,
+        #[arg(long, help = "Approve without asking")]
+        yes: bool,
+    },
+    #[command(about = "Stop a plugin's hooks and MCP servers from running")]
+    Revoke { name: String },
+    #[command(about = "Remove an installed plugin")]
+    Remove { name: String },
 }
 
 #[derive(Subcommand, Debug)]

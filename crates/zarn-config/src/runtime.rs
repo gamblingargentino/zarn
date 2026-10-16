@@ -242,6 +242,10 @@ impl Router {
         }
     }
 
+    pub fn for_model(&self, model: &str) -> (Arc<dyn Provider>, String) {
+        self.providers.for_model(Some(model))
+    }
+
     pub fn for_role(&self, role: &str) -> Routed {
         if !self.configured(role) {
             return self.main();
@@ -323,12 +327,29 @@ pub struct Runtime {
     pub parts: context::SystemParts,
     pub skills: Vec<Skill>,
     pub agents: Vec<AgentFile>,
+    pub warnings: Vec<String>,
+    pub parallel: usize,
+    pub deferred: Option<Arc<zarn_tools::tool_search::Deferred>>,
 }
 
 impl Runtime {
+    pub fn filter(&self) -> Option<zarn_core::agent::ToolFilter> {
+        let deferred = self.deferred.clone()?;
+        Some(Arc::new(move |spec: &zarn_core::types::ToolSpec| deferred.visible(&spec.name)))
+    }
+
+    pub fn agent(&self, ctx: Arc<Ctx>, gate: Arc<dyn zarn_core::agent::ToolGate>) -> zarn_core::agent::Agent {
+        let mut agent = zarn_core::agent::Agent::new(self.provider.clone(), self.tools.clone(), ctx, self.agent_config()).with_gate(gate);
+        if let Some(filter) = self.filter() {
+            agent = agent.with_filter(filter);
+        }
+        agent
+    }
+
     pub fn agent_config(&self) -> AgentConfig {
         AgentConfig {
             model: self.model.clone(),
+            parallel: self.parallel,
             ..AgentConfig::default()
         }
     }
@@ -360,10 +381,15 @@ pub struct Assembly {
     pub mode: Option<ModeDef>,
     pub approver: Option<Arc<dyn PlanApprover>>,
     pub todos: Option<zarn_tools::todo::TodoList>,
+    pub shells: Option<Arc<zarn_tools::shells::Shells>>,
+    pub task_gate: Option<Arc<dyn zarn_core::agent::ToolGate>>,
+    pub task_monitor: Option<zarn_core::subagent::TaskMonitor>,
+    pub background: Option<Arc<zarn_core::subagent::Background>>,
+    pub memory: Option<Arc<context::NestedMemory>>,
 }
 
 fn allowed(mode: &ModeDef, name: &str) -> bool {
-    mode.tools.is_empty() || mode.tools.iter().any(|t| t.eq_ignore_ascii_case(name)) || name == "exit_plan"
+    mode.tools.is_empty() || mode.tools.iter().any(|t| t.eq_ignore_ascii_case(name)) || name == "exit_plan" || name == "tool_search"
 }
 
 pub fn assemble(
@@ -397,21 +423,41 @@ pub fn assemble(
     let system = parts.join();
 
     let options = cfg.general.tool_options();
-    let mut tools: Vec<Box<dyn Tool>> = zarn_tools::builtin_list_with(options);
+    let shells = assembly.shells.clone().unwrap_or_default();
+    let mut tools: Vec<Box<dyn Tool>> = zarn_tools::builtin_list_sharing(options, shells);
+    let mut warnings = Vec::new();
+    if let Some(search) = &cfg.websearch {
+        match search.backend(&assembly.store) {
+            Ok(backend) => tools.push(Box::new(zarn_tools::web::WebSearch::new(backend))),
+            Err(err) => warnings.push(format!("websearch is off: {err}")),
+        }
+    }
     if !skills.is_empty() {
         tools.push(Box::new(SkillTool::new(skills.clone())));
     }
+    let parallel = cfg.general.max_parallel_agents();
     if !agents.is_empty() {
-        tools.push(Box::new(TaskTool::new(
+        let mut task = TaskTool::new(
             agents.iter().map(|a| a.def.clone()).collect(),
             router.factory(),
             subagent_tools(options),
             ctx,
             AgentConfig {
                 model: main.model.clone(),
+                parallel,
                 ..AgentConfig::default()
             },
-        )));
+        );
+        if let Some(gate) = assembly.task_gate.clone() {
+            task = task.with_gate(gate);
+        }
+        if let Some(monitor) = assembly.task_monitor.clone() {
+            task = task.with_monitor(monitor);
+        }
+        if let Some(background) = assembly.background.clone() {
+            task = task.with_background(background);
+        }
+        tools.push(Box::new(task));
     }
     if let Some(list) = assembly.todos.clone() {
         tools.push(Box::new(zarn_tools::todo::TodoTool::new(list)));
@@ -421,11 +467,27 @@ pub fn assemble(
     {
         tools.push(Box::new(ExitPlan::new(approver)));
     }
+    let mcp_specs: Vec<zarn_core::types::ToolSpec> = extra_tools
+        .iter()
+        .map(|t| t.spec())
+        .filter(|s| allowed(&mode, &s.name))
+        .collect();
     tools.extend(extra_tools);
+    let threshold = cfg.general.lazy_tools_threshold();
+    let deferred = if !mcp_specs.is_empty() && tools.len() > threshold {
+        let deferred = zarn_tools::tool_search::Deferred::new(mcp_specs.iter().map(|s| s.name.clone()));
+        tools.push(Box::new(zarn_tools::tool_search::ToolSearch::new(mcp_specs, deferred.clone())));
+        Some(deferred)
+    } else {
+        None
+    };
+    let memory = assembly.memory.clone().unwrap_or_else(|| context::NestedMemory::new(cwd));
+    let used = context::memory_used(&context::memory_files(cwd, crate::paths::user_dir().as_deref()), budget);
+    memory.set_budget((budget as usize).saturating_sub(used));
     let mut registry = ToolRegistry::new();
     for tool in tools {
         if allowed(&mode, &tool.spec().name) {
-            registry.register(redacting(tool));
+            registry.register(redacting(context::WithMemory::wrap(tool, memory.clone())));
         }
     }
 
@@ -440,6 +502,9 @@ pub fn assemble(
         parts,
         skills,
         agents,
+        warnings,
+        parallel,
+        deferred,
     })
 }
 

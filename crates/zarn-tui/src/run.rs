@@ -115,7 +115,7 @@ enum UiEvent {
     Mcp {
         name: String,
         config: ServerConfig,
-        result: Result<McpServer, String>,
+        result: Result<Box<McpServer>, String>,
     },
     Doctor(String),
     Notice(String),
@@ -136,6 +136,13 @@ enum UiEvent {
         output: zarn_core::tools::ToolOutput,
     },
     Window { model: String, window: u32 },
+    Task(zarn_core::subagent::TaskUpdate),
+    Expanded { result: Result<String, String>, model: Option<String> },
+    McpChanged(String),
+    McpLoggedIn { name: String, result: Result<(), String> },
+    McpRefreshed { name: String, result: Result<usize, String> },
+    McpPrompt(Result<String, String>),
+    Resolved { text: String, blocks: Vec<String>, notes: Vec<String> },
     Progress { command: String, line: String },
 }
 
@@ -221,6 +228,11 @@ pub struct Controller {
     editor_pending: bool,
     todos: zarn_tools::todo::TodoList,
     notifier: crate::notify::Notifier,
+    shells: Arc<zarn_tools::shells::Shells>,
+    background: Arc<zarn_core::subagent::Background>,
+    waiting: std::collections::VecDeque<PermissionRequest>,
+    turn_model: Option<String>,
+    memory: Arc<context::NestedMemory>,
     mouse: bool,
     mouse_on: bool,
 }
@@ -247,10 +259,11 @@ impl Controller {
         let cwd = std::env::current_dir()?;
         let ctx = Arc::new(Ctx::new(&cwd));
         let cwd_for_checkpoints = cwd.clone();
+        let cwd_for_memory = cwd.clone();
         let (prompt, permissions) = permission_channel();
         let gate = Arc::new(Permissions::new(prompt));
         let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>(256);
-        let commands = Commands::load(&paths::project_dir().join("commands"));
+        let commands = load_commands();
         let (plan_tx, plans) = mpsc::channel::<PlanAsk>(2);
 
         let mut controller = Controller {
@@ -308,6 +321,11 @@ impl Controller {
             editor_pending: false,
             todos: Arc::default(),
             notifier: crate::notify::Notifier::stdout(),
+            shells: zarn_tools::shells::Shells::new(),
+            background: zarn_core::subagent::Background::new(),
+            waiting: std::collections::VecDeque::new(),
+            turn_model: None,
+            memory: context::NestedMemory::new(&cwd_for_memory),
             mouse: false,
             mouse_on: false,
         };
@@ -688,16 +706,25 @@ impl Controller {
             mode,
             approver: Some(self.approver.clone() as Arc<dyn PlanApprover>),
             todos: Some(self.todos.clone()),
+            shells: Some(self.shells.clone()),
+            task_gate: Some(self.hooked_gate()),
+            task_monitor: Some({
+                let tx = self.ui_tx.clone();
+                Arc::new(move |update: zarn_core::subagent::TaskUpdate| {
+                    let _ = tx.try_send(UiEvent::Task(update));
+                })
+            }),
+            background: Some(self.background.clone()),
+            memory: Some(self.memory.clone()),
         };
         match runtime::assemble(&cfg, plan, &self.cwd, self.ctx.clone(), tools, assembly) {
             Ok(rt) => {
-                let agent = Agent::new(
-                    rt.provider.clone(),
-                    rt.tools.clone(),
-                    self.ctx.clone(),
-                    rt.agent_config(),
-                )
-                .with_gate(self.hooked_gate());
+                for warning in &rt.warnings {
+                    if self.warned.insert(warning.clone()) {
+                        self.app.notice(warning.clone());
+                    }
+                }
+                let agent = rt.agent(self.ctx.clone(), self.hooked_gate());
                 self.agent = Some(Arc::new(agent));
                 self.system = rt.system.clone();
                 self.set_system();
@@ -728,13 +755,37 @@ impl Controller {
     }
 
     fn refresh_entries(&mut self, cfg: &Config) {
-        let custom: Vec<String> = self
+        self.commands = load_commands();
+        let custom: Vec<(String, String, String)> = self
             .commands
-            .names()
+            .custom()
             .into_iter()
-            .filter_map(|n| n.strip_prefix('/').map(str::to_string))
-            .filter(|n| !zarn_core::commands::BUILTINS.iter().any(|(b, _)| b.trim_start_matches('/') == n))
+            .filter(|c| !zarn_core::commands::BUILTINS.iter().any(|(b, _)| b.trim_start_matches('/') == c.name))
+            .map(|c| (c.name.clone(), c.argument_hint.clone(), c.description.clone()))
+            .chain(self.mcp.values().filter_map(|m| m.server.clone()).flat_map(|server| {
+                server
+                    .prompts()
+                    .iter()
+                    .map(|p| {
+                        let usage: Vec<String> = p
+                            .arguments
+                            .iter()
+                            .map(|a| if a.required { format!("<{}>", a.name) } else { format!("[{}]", a.name) })
+                            .collect();
+                        let description = if p.description.is_empty() { "MCP prompt".to_string() } else { format!("MCP prompt: {}", p.description) };
+                        (format!("{}:{}", server.name(), p.name), usage.join(" "), description)
+                    })
+                    .collect::<Vec<_>>()
+            }))
             .collect();
+        for server in self.mcp.values().filter_map(|m| m.server.as_ref()) {
+            for resource in server.resources() {
+                let mention = format!("{}:{}", server.name(), resource.uri);
+                if !self.app.files.contains(&mention) {
+                    self.app.files.push(mention);
+                }
+            }
+        }
         let skills: Vec<(String, String)> = context::discover_skills()
             .into_iter()
             .filter(|s| cfg.skill_enabled(&s.name))
@@ -780,11 +831,13 @@ impl Controller {
         );
         self.panel_mcp_status(&name, "starting…");
         let tx = self.ui_tx.clone();
+        let store = self.store.clone();
         tokio::spawn(async move {
-            let result = match tokio::time::timeout(MCP_START_TIMEOUT, McpServer::start(&name, &config)).await {
+            let authed = zarn_config::mcp_auth::with_auth(&store, &name, &config).await;
+            let result = match tokio::time::timeout(MCP_START_TIMEOUT, McpServer::start(&name, &authed)).await {
                 Err(_) => Err("did not start within 30 seconds".to_string()),
                 Ok(Err(err)) => Err(zarn_config::auth::redact(&format!("{err:#}"))),
-                Ok(Ok(server)) => Ok(server),
+                Ok(Ok(server)) => Ok(Box::new(server)),
             };
             let _ = tx.send(UiEvent::Mcp { name, config, result }).await;
         });
@@ -964,6 +1017,16 @@ impl Controller {
         Ok(())
     }
 
+    fn next_permission(&mut self) {
+        while self.app.pending.is_none() {
+            let Some(request) = self.waiting.pop_front() else { break };
+            if request.reply.is_closed() {
+                continue;
+            }
+            self.show_permission(request);
+        }
+    }
+
     fn on_terminal(&mut self, event: TermEvent) -> bool {
         let action = match event {
             TermEvent::Key(key) => self.app.on_key(key),
@@ -985,14 +1048,17 @@ impl Controller {
             }
             _ => None,
         };
-        match action {
+        let keep = match action {
             Some(action) => self.act(action),
             None => true,
-        }
+        };
+        self.next_permission();
+        keep
     }
 
     async fn shutdown(&mut self) {
         zarn_tools::progress::unregister(&self.ctx);
+        self.shells.kill_all();
         self.cancel.cancel();
         for state in std::mem::take(&mut self.mcp).into_values() {
             if let Some(server) = state.server {
@@ -1083,6 +1149,10 @@ impl Controller {
     }
 
     fn show_permission(&mut self, mut request: PermissionRequest) {
+        if self.app.pending.is_some() {
+            self.waiting.push_back(request);
+            return;
+        }
         request.pattern = zarn_tools::permissions::suggest(&request.tool, &request.args, &self.cwd);
         request.preview = zarn_tools::diff::preview(&request.tool, &request.args, &self.cwd);
         self.app.pending_expanded = false;
@@ -1246,8 +1316,43 @@ impl Controller {
             return;
         }
         if let Some(text) = self.app.next_queued() {
+            if let Some(CoreCommand::Custom(invocation)) = self.commands.parse(&text) {
+                self.app.blocks.pop_if(|b| matches!(b, Block::User(t) if *t == text));
+                self.run_custom(&text, invocation);
+                return;
+            }
             self.submit(text);
         }
+    }
+
+    fn run_custom(&mut self, line: &str, invocation: zarn_core::commands::Invocation) {
+        if self.app.streaming {
+            self.app.enqueue(line.to_string(), line.to_string());
+            return;
+        }
+        let mut rules = Vec::new();
+        for entry in &invocation.command.allowed_tools {
+            match zarn_tools::permissions::parse_rule(entry) {
+                Ok(rule) => rules.push(rule),
+                Err(err) => self.app.notice(format!("/{}: allowed-tools entry {entry} ignored: {err}", invocation.command.name)),
+            }
+        }
+        self.gate.set_turn_rules(rules);
+        let text = invocation.prompt();
+        let model = invocation.command.model.clone();
+        if zarn_core::commands::bang_commands(&text).is_empty() {
+            self.turn_model = model;
+            self.submit(text);
+            return;
+        }
+        self.app.streaming = true;
+        let ctx = self.ctx.clone();
+        let gate = self.hooked_gate();
+        let tx = self.ui_tx.clone();
+        tokio::spawn(async move {
+            let result = zarn_tools::bang::expand(&text, &ctx, gate.as_ref()).await;
+            let _ = tx.send(UiEvent::Expanded { result, model }).await;
+        });
     }
 
     fn export(&mut self, path: Option<&str>) {
@@ -1701,9 +1806,95 @@ impl Controller {
         });
     }
 
+    fn resource_refs(&self, text: &str) -> Vec<(Arc<McpServer>, String)> {
+        let mut found = Vec::new();
+        for word in text.split_whitespace() {
+            let Some(rest) = word.strip_prefix('@') else { continue };
+            let rest = rest.trim_end_matches([',', '.', ';', ')', '!', '?']);
+            let Some((server, uri)) = rest.split_once(':') else { continue };
+            if uri.is_empty() {
+                continue;
+            }
+            if let Some(server) = self.mcp.get(server).and_then(|s| s.server.clone())
+                && !found.iter().any(|(s, u): &(Arc<McpServer>, String)| s.name() == server.name() && u == uri)
+            {
+                found.push((server, uri.to_string()));
+            }
+        }
+        found
+    }
+
+    fn mcp_prompt(&self, name: &str) -> Option<(Arc<McpServer>, zarn_tools::mcp::Prompt)> {
+        let (server, prompt) = name.split_once(':')?;
+        let server = self.mcp.get(server)?.server.clone()?;
+        let prompt = server.prompts().iter().find(|p| p.name == prompt)?.clone();
+        Some((server, prompt))
+    }
+
+    fn run_mcp_prompt(&mut self, server: Arc<McpServer>, prompt: zarn_tools::mcp::Prompt, args: &str) {
+        let words = zarn_core::commands::split_args(args);
+        let mut values = BTreeMap::new();
+        for (i, arg) in prompt.arguments.iter().enumerate() {
+            match words.get(i) {
+                Some(value) => {
+                    values.insert(arg.name.clone(), value.clone());
+                }
+                None if arg.required => {
+                    let usage: Vec<String> = prompt
+                        .arguments
+                        .iter()
+                        .map(|a| if a.required { format!("<{}>", a.name) } else { format!("[{}]", a.name) })
+                        .collect();
+                    self.app.notice(format!("usage: /{}:{} {}", server.name(), prompt.name, usage.join(" ")));
+                    return;
+                }
+                None => {}
+            }
+        }
+        if self.app.streaming {
+            self.app.notice("wait for the current turn to finish before running an MCP prompt");
+            return;
+        }
+        self.app.streaming = true;
+        let tx = self.ui_tx.clone();
+        tokio::spawn(async move {
+            let result = server
+                .client()
+                .get_prompt(&prompt.name, &values)
+                .await
+                .map_err(|e| zarn_config::auth::redact(&format!("{e:#}")));
+            let _ = tx.send(UiEvent::McpPrompt(result)).await;
+        });
+    }
+
     fn submit(&mut self, text: String) {
+        self.submit_with(text, false);
+    }
+
+    fn submit_with(&mut self, text: String, resolved: bool) {
         if self.app.streaming {
             self.app.enqueue(text.clone(), text);
+            return;
+        }
+        let refs = if resolved { Vec::new() } else { self.resource_refs(&text) };
+        if !refs.is_empty() {
+            self.app.streaming = true;
+            let tx = self.ui_tx.clone();
+            tokio::spawn(async move {
+                let mut blocks = Vec::new();
+                let mut notes = Vec::new();
+                for (server, uri) in refs {
+                    match server.client().read_resource(&uri).await {
+                        Ok(body) => blocks.push(format!(
+                            "<resource server=\"{}\" uri=\"{uri}\">\n{}\n</resource>",
+                            server.name(),
+                            body.trim_end()
+                        )),
+                        Err(err) => notes.push(format!("@{}:{uri} could not be read: {}", server.name(), zarn_config::auth::redact(&format!("{err:#}")))),
+                    }
+                }
+                let _ = tx.send(UiEvent::Resolved { text, blocks, notes }).await;
+            });
             return;
         }
         let hooks = self.hooks();
@@ -1765,6 +1956,9 @@ impl Controller {
                 Err(err) => self.app.notice(format!("{name} could not be read: {err}")),
             }
         }
+        if let Some(results) = zarn_core::subagent::deliver(&self.background.take_finished()) {
+            self.pending_context.insert(0, results);
+        }
         if !self.pending_context.is_empty()
             && let Some(zarn_core::types::Content::Text(first)) = content.first_mut()
         {
@@ -1781,7 +1975,7 @@ impl Controller {
         self.checkpoints.begin(text.clone(), self.messages.len());
         self.cap_stopped = false;
         self.reload_if_changed();
-        let Some(agent) = self.agent.clone() else {
+        let Some(mut agent) = self.agent.clone() else {
             let why = self
                 .app
                 .not_ready
@@ -1790,6 +1984,17 @@ impl Controller {
             self.app.notice(format!("cannot send: {why}"));
             return;
         };
+        if let Some(model) = self.turn_model.take()
+            && let Some(rt) = &self.runtime
+        {
+            let (provider, model) = rt.router.for_model(&model);
+            let config = zarn_core::agent::AgentConfig { model, ..rt.agent_config() };
+            let mut one = Agent::new(provider, rt.tools.clone(), self.ctx.clone(), config).with_gate(self.hooked_gate());
+            if let Some(filter) = rt.filter() {
+                one = one.with_filter(filter);
+            }
+            agent = Arc::new(one);
+        }
         let vision = agent.provider().caps().vision;
         let message = self.user_message(&text, vision);
         self.messages.push(message);
@@ -1851,6 +2056,8 @@ impl Controller {
             }
             UiEvent::TurnDone { messages, result } => {
                 self.app.streaming = false;
+                self.gate.clear_turn_rules();
+                self.app.agents.retain(|row| row.background && row.done.is_none());
                 if let Some(started) = self.app.status.turn_started.take() {
                     self.notifier.turn_finished(started.elapsed());
                 }
@@ -1956,9 +2163,18 @@ impl Controller {
                     Ok(server) => format!("running, {} tools", server.tool_names().len()),
                     Err(err) => format!("failed: {err}"),
                 };
+                if let Ok(server) = &result {
+                    let tx = self.ui_tx.clone();
+                    let who = name.clone();
+                    server.on_notification(Arc::new(move |method: &str| {
+                        if method == "notifications/tools/list_changed" {
+                            let _ = tx.try_send(UiEvent::McpChanged(who.clone()));
+                        }
+                    }));
+                }
                 if let Some(state) = self.mcp.get_mut(&name) {
                     state.status = status.clone();
-                    state.server = result.ok().map(Arc::new);
+                    state.server = result.ok().map(|server| Arc::new(*server));
                 }
                 self.panel_mcp_status(&name, &status);
                 if status.starts_with("failed") && matches!(self.app.mode, Mode::Chat) {
@@ -1978,6 +2194,69 @@ impl Controller {
             }
             UiEvent::Title(Err(err)) => tracing::debug!(error = %err, "no session title"),
             UiEvent::Compared(sides) => self.app.blocks.push(Block::Compare(sides)),
+            UiEvent::Task(update) => self.app.task_update(update),
+            UiEvent::McpLoggedIn { name, result } => match result {
+                Ok(()) => {
+                    self.app.notice(format!("logged in to {name}; the token is in the credential store as zarn-mcp:{name}"));
+                    if let Some(config) = self.cfg().mcp.get(&name).cloned() {
+                        self.start_mcp(name, config);
+                    }
+                }
+                Err(err) => self.app.notice(format!("login to {name} failed: {err}")),
+            },
+            UiEvent::McpChanged(name) => {
+                if let Some(server) = self.mcp.get(&name).and_then(|s| s.server.clone()) {
+                    let tx = self.ui_tx.clone();
+                    tokio::spawn(async move {
+                        let result = server.refresh_tools().await.map_err(|e| format!("{e:#}"));
+                        let _ = tx.send(UiEvent::McpRefreshed { name, result }).await;
+                    });
+                }
+            }
+            UiEvent::McpRefreshed { name, result } => match result {
+                Ok(n) => {
+                    let status = format!("running, {n} tools");
+                    if let Some(state) = self.mcp.get_mut(&name) {
+                        state.status = status.clone();
+                    }
+                    self.panel_mcp_status(&name, &status);
+                    self.app.notice(format!("mcp {name} changed its tools; now {n}"));
+                    self.rebuild();
+                }
+                Err(err) => self.app.notice(format!("mcp {name} tool refresh failed: {err}")),
+            },
+            UiEvent::McpPrompt(result) => {
+                self.app.streaming = false;
+                match result {
+                    Ok(text) => self.submit(text),
+                    Err(err) => {
+                        self.app.notice(err);
+                        self.send_next();
+                    }
+                }
+            }
+            UiEvent::Resolved { text, blocks, notes } => {
+                self.app.streaming = false;
+                for note in notes {
+                    self.app.notice(note);
+                }
+                self.pending_context.extend(blocks);
+                self.submit_with(text, true);
+            }
+            UiEvent::Expanded { result, model } => {
+                self.app.streaming = false;
+                match result {
+                    Ok(text) => {
+                        self.turn_model = model;
+                        self.submit(text);
+                    }
+                    Err(err) => {
+                        self.gate.clear_turn_rules();
+                        self.app.notice(err);
+                        self.send_next();
+                    }
+                }
+            }
             UiEvent::Progress { command, line } => self.app.progress(&command, &line),
             UiEvent::HookFailed(text) => self.app.notice(text),
             UiEvent::Shell { id, command, output } => {
@@ -2412,6 +2691,7 @@ impl Controller {
                     todos.clear();
                 }
                 self.app.todos.clear();
+                self.memory.reset();
                 self.app.notice("conversation cleared");
             }
             "compact" => {
@@ -2538,6 +2818,14 @@ impl Controller {
                 });
             }
             "export" => self.export(first),
+            "tasks" => match (first, line.split_whitespace().nth(2)) {
+                (Some("cancel"), Some(id)) => match self.background.cancel(id) {
+                    Ok(text) => self.app.notice(text),
+                    Err(err) => self.app.notice(err),
+                },
+                (Some("cancel"), None) => self.app.notice("usage: /tasks cancel <id>"),
+                _ => self.app.notice(tasks_report(&self.background.list())),
+            },
             "copy" => self.copy_last(),
             "rename" => {
                 let title = line.trim_start().trim_start_matches('/').trim_start_matches("rename").trim();
@@ -2723,6 +3011,9 @@ impl Controller {
                     let _ = tx.send(UiEvent::Doctor(doctor::render(&all))).await;
                 });
             }
+            "plugins" => {
+                self.open_panel(Tab::Plugins);
+            }
             "hooks" => {
                 let text = zarn_config::hooks::describe(&self.hooks());
                 self.app.notice(text);
@@ -2787,9 +3078,13 @@ impl Controller {
                 }
             },
             other => {
+                if let Some((server, prompt)) = self.mcp_prompt(other) {
+                    self.run_mcp_prompt(server, prompt, &args);
+                    return true;
+                }
                 match self.commands.parse(line) {
-                    Some(CoreCommand::Prompt(body)) => {
-                        self.submit(body);
+                    Some(CoreCommand::Custom(invocation)) => {
+                        self.run_custom(line, invocation);
                         return true;
                     }
                     Some(CoreCommand::Unknown(_)) | None => {}
@@ -2817,6 +3112,48 @@ impl Controller {
         match words.first().map(String::as_str) {
             None => {
                 self.open_panel(Tab::Mcp);
+            }
+            Some("login") => {
+                let Some(name) = words.get(1).cloned() else {
+                    self.app.notice("usage: /mcp login <name>");
+                    return;
+                };
+                let Some(config) = self.cfg().mcp.get(&name).cloned() else {
+                    self.app.notice(format!("no MCP server named {name}"));
+                    return;
+                };
+                if config.url.is_none() {
+                    self.app.notice(format!("{name} runs locally; only remote (url) servers log in"));
+                    return;
+                }
+                self.app.notice(format!("starting the device login for {name}…"));
+                let store = self.store.clone();
+                let tx = self.ui_tx.clone();
+                tokio::spawn(async move {
+                    let notice = tx.clone();
+                    let who = name.clone();
+                    let result = zarn_config::mcp_auth::login(&store, &name, &config, move |code| {
+                        let link = code.verification_uri_complete.clone().unwrap_or_else(|| code.verification_uri.clone());
+                        let _ = notice.try_send(UiEvent::Notice(format!(
+                            "to authorize {who}, open {link} and enter the code {}; zarn waits for the approval",
+                            code.user_code
+                        )));
+                    })
+                    .await
+                    .map_err(|e| zarn_config::auth::redact(&format!("{e:#}")));
+                    let _ = tx.send(UiEvent::McpLoggedIn { name, result }).await;
+                });
+            }
+            Some("logout") => {
+                let Some(name) = words.get(1) else {
+                    self.app.notice("usage: /mcp logout <name>");
+                    return;
+                };
+                match zarn_config::mcp_auth::forget(&self.store, name) {
+                    Ok(true) => self.app.notice(format!("removed the stored token for {name}")),
+                    Ok(false) => self.app.notice(format!("no stored token for {name}")),
+                    Err(err) => self.app.notice(format!("{err:#}")),
+                }
             }
             Some("list") => {
                 let cfg = self.cfg();
@@ -2955,6 +3292,37 @@ async fn compare_one(
     }
 }
 
+fn load_commands() -> Commands {
+    let user = paths::user_dir().map(|d| d.join("commands"));
+    let mut commands = Commands::load_all(user.as_deref(), &paths::project_dir().join("commands"));
+    zarn_config::plugins::commands_into(&mut commands, &zarn_config::plugins::installed());
+    commands
+}
+
+fn tasks_report(jobs: &[zarn_core::subagent::Job]) -> String {
+    if jobs.is_empty() {
+        return "no background agents; ask for one with task and background = true".into();
+    }
+    let mut out = vec!["background agents".to_string()];
+    for job in jobs {
+        let secs = job.elapsed.unwrap_or_else(|| job.started.elapsed()).as_secs();
+        let prompt: String = job.prompt.replace('\n', " ").chars().take(60).collect();
+        out.push(format!(
+            "  {}  {}  {}  {}  {prompt}",
+            job.id,
+            job.agent,
+            job.status.label(),
+            crate::render::elapsed_label(secs)
+        ));
+        if !job.result.is_empty() {
+            let result: String = job.result.trim().replace('\n', " ").chars().take(200).collect();
+            out.push(format!("      {result}{}", if job.delivered { "" } else { "  (goes to the model with your next message)" }));
+        }
+    }
+    out.push("/tasks cancel <id> stops a running agent".into());
+    out.join("\n")
+}
+
 fn spawn_turn(
     agent: Arc<Agent>,
     mut messages: Vec<Message>,
@@ -2988,5 +3356,7 @@ fn spawn_turn(
 impl Drop for Controller {
     fn drop(&mut self) {
         zarn_tools::progress::unregister(&self.ctx);
+        self.shells.kill_all();
+        self.background.cancel_all();
     }
 }

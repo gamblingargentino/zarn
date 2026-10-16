@@ -57,6 +57,7 @@ impl Layers {
     pub fn merged(&self) -> Config {
         let mut merged = self.project.clone();
         merged.merge(self.user.clone());
+        crate::plugins::contribute(&mut merged);
         merged
     }
 

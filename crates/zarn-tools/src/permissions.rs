@@ -272,6 +272,7 @@ pub struct Permissions {
     overlay: RwLock<Overlay>,
     rules: RwLock<Vec<(Policy, Rule)>>,
     session_rules: Mutex<Vec<Rule>>,
+    turn_rules: Mutex<Vec<Rule>>,
     cwd: RwLock<PathBuf>,
     safe: RwLock<Option<Vec<String>>>,
     configured: RwLock<HashMap<String, Policy>>,
@@ -291,6 +292,7 @@ impl Permissions {
             overlay: RwLock::new(Overlay::default()),
             rules: RwLock::new(Vec::new()),
             session_rules: Mutex::new(Vec::new()),
+            turn_rules: Mutex::new(Vec::new()),
             cwd: RwLock::new(PathBuf::from(".")),
             safe: RwLock::new(Some(crate::safe_shell::defaults())),
             configured: RwLock::new(HashMap::new()),
@@ -390,6 +392,23 @@ impl Permissions {
         })
     }
 
+    pub fn set_turn_rules(&self, rules: Vec<Rule>) {
+        if let Ok(mut current) = self.turn_rules.lock() {
+            *current = rules;
+        }
+    }
+
+    pub fn clear_turn_rules(&self) {
+        self.set_turn_rules(Vec::new());
+    }
+
+    fn turn_hit(&self, name: &str, args: &Value) -> bool {
+        let cwd = self.cwd();
+        self.turn_rules
+            .lock()
+            .is_ok_and(|rules| rules.iter().any(|r| r.matches(name, args, &cwd, true)))
+    }
+
     fn session_hit(&self, name: &str, args: &Value) -> bool {
         let cwd = self.cwd();
         self.session_rules
@@ -440,6 +459,9 @@ impl Permissions {
         }
         if self.session_hit(name, args) {
             return (Policy::Allow, "allowed for this session".into());
+        }
+        if self.turn_hit(name, args) {
+            return (Policy::Allow, "allowed by the command's allowed-tools".into());
         }
         match overlay.policies.get(name) {
             Some(policy) => return (*policy, format!("{} mode", overlay.name)),

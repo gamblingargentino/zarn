@@ -1,9 +1,191 @@
 use crate::paths;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use zarn_core::tools::Tool;
 use zarn_tools::skill::{self, Skill};
 
 pub const MEMORY_FILE: &str = "ZARN.md";
 pub const DEFAULT_BUDGET: u32 = 8_000;
+pub const IMPORT_DEPTH: usize = 5;
+pub const MEMORY_TOOLS: [&str; 5] = ["read", "edit", "write", "multiedit", "notebook_edit"];
+
+fn import_target(line: &str) -> Option<&str> {
+    let t = line.trim();
+    let rest = t.strip_prefix('@')?;
+    if rest.is_empty() || rest.contains(char::is_whitespace) {
+        return None;
+    }
+    Some(rest)
+}
+
+fn import_path(base: &Path, target: &str) -> PathBuf {
+    if let Some(rest) = target.strip_prefix("~/")
+        && let Some(home) = dirs::home_dir()
+    {
+        return home.join(rest);
+    }
+    let p = Path::new(target);
+    if p.is_absolute() { p.to_path_buf() } else { base.join(p) }
+}
+
+fn expand_in(text: &str, base: &Path, chain: &mut Vec<PathBuf>) -> String {
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Some(target) = import_target(line) else {
+            out.push(line.to_string());
+            continue;
+        };
+        let path = import_path(base, target);
+        let key = path.canonicalize().unwrap_or_else(|_| path.clone());
+        if chain.contains(&key) {
+            out.push(format!("[import @{target} skipped: it would import itself in a cycle]"));
+            continue;
+        }
+        if chain.len() > IMPORT_DEPTH {
+            out.push(format!("[import @{target} skipped: imports nest deeper than {IMPORT_DEPTH}]"));
+            continue;
+        }
+        match std::fs::read_to_string(&path) {
+            Ok(body) => {
+                chain.push(key);
+                let dir = path.parent().map(Path::to_path_buf).unwrap_or_else(|| base.to_path_buf());
+                out.push(expand_in(body.trim_end(), &dir, chain));
+                chain.pop();
+            }
+            Err(_) => out.push(format!("[import @{target} not found]")),
+        }
+    }
+    out.join("\n")
+}
+
+pub fn expand_imports(text: &str, file: &Path) -> String {
+    let base = file.parent().map(Path::to_path_buf).unwrap_or_default();
+    let key = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
+    let mut chain = vec![key];
+    expand_in(text, &base, &mut chain)
+}
+
+#[derive(Debug)]
+pub struct NestedMemory {
+    root: PathBuf,
+    loaded: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
+    left: std::sync::Mutex<usize>,
+}
+
+impl NestedMemory {
+    pub fn new(root: &Path) -> Arc<Self> {
+        Arc::new(NestedMemory {
+            root: root.canonicalize().unwrap_or_else(|_| root.to_path_buf()),
+            loaded: Default::default(),
+            left: std::sync::Mutex::new(DEFAULT_BUDGET as usize),
+        })
+    }
+
+    pub fn set_budget(&self, tokens: usize) {
+        if let Ok(mut left) = self.left.lock() {
+            *left = tokens;
+        }
+    }
+
+    pub fn reset(&self) {
+        if let Ok(mut loaded) = self.loaded.lock() {
+            loaded.clear();
+        }
+    }
+
+    pub fn loaded(&self) -> Vec<PathBuf> {
+        let mut all: Vec<PathBuf> = self.loaded.lock().map(|l| l.iter().cloned().collect()).unwrap_or_default();
+        all.sort();
+        all
+    }
+
+    pub fn reached(&self, file: &Path) -> Option<String> {
+        let file = file.canonicalize().ok()?;
+        let dir = file.parent()?;
+        if !dir.starts_with(&self.root) || dir == self.root {
+            return None;
+        }
+        let mut dirs: Vec<&Path> = dir.ancestors().take_while(|d| *d != self.root.as_path()).collect();
+        dirs.reverse();
+        let mut blocks = Vec::new();
+        for d in dirs {
+            let path = d.join(MEMORY_FILE);
+            if !path.is_file() {
+                continue;
+            }
+            {
+                let Ok(mut loaded) = self.loaded.lock() else { continue };
+                if !loaded.insert(path.clone()) {
+                    continue;
+                }
+            }
+            let Ok(raw) = std::fs::read_to_string(&path) else { continue };
+            let text = expand_imports(raw.trim(), &path);
+            if text.trim().is_empty() {
+                continue;
+            }
+            let rel = path.strip_prefix(&self.root).unwrap_or(&path).display().to_string();
+            let Ok(mut left) = self.left.lock() else { continue };
+            if *left == 0 {
+                blocks.push(format!("[{rel} omitted: the {MEMORY_FILE} token budget is used up]"));
+                continue;
+            }
+            let (kept, clipped) = clip(&text, *left);
+            *left = left.saturating_sub(estimate_tokens(&kept));
+            let scope = d.strip_prefix(&self.root).unwrap_or(d).display().to_string();
+            let mut block = format!(
+                "<memory source=\"nested\" path=\"{rel}\">\n{}\n</memory>\nThese instructions from {rel} apply to files under {scope}/.",
+                kept.trim_end()
+            );
+            if clipped {
+                block.push_str(&format!("\n[{rel} truncated to fit the {MEMORY_FILE} token budget]"));
+            }
+            blocks.push(block);
+        }
+        if blocks.is_empty() { None } else { Some(blocks.join("\n\n")) }
+    }
+}
+
+pub struct WithMemory {
+    inner: Box<dyn Tool>,
+    memory: Arc<NestedMemory>,
+}
+
+impl WithMemory {
+    pub fn wrap(inner: Box<dyn Tool>, memory: Arc<NestedMemory>) -> Box<dyn Tool> {
+        if MEMORY_TOOLS.contains(&inner.spec().name.as_str()) {
+            Box::new(WithMemory { inner, memory })
+        } else {
+            inner
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Tool for WithMemory {
+    fn spec(&self) -> zarn_core::types::ToolSpec {
+        self.inner.spec()
+    }
+
+    fn risk(&self) -> zarn_core::tools::Risk {
+        self.inner.risk()
+    }
+
+    async fn run(&self, args: serde_json::Value, ctx: &zarn_core::tools::Ctx) -> anyhow::Result<zarn_core::tools::ToolOutput> {
+        let mut out = self.inner.run(args.clone(), ctx).await?;
+        if out.is_error {
+            return Ok(out);
+        }
+        let path = args.get("path").or_else(|| args.get("file_path")).and_then(serde_json::Value::as_str);
+        if let Some(path) = path
+            && let Some(extra) = self.memory.reached(&ctx.resolve(path))
+        {
+            out.content.push_str("\n\n");
+            out.content.push_str(&extra);
+        }
+        Ok(out)
+    }
+}
 
 pub fn estimate_tokens(text: &str) -> usize {
     text.chars().count().div_ceil(4)
@@ -35,10 +217,19 @@ pub fn memory_files(project_root: &Path, user_dir: Option<&Path>) -> Vec<MemoryF
         if let Ok(text) = std::fs::read_to_string(&path)
             && !text.trim().is_empty()
         {
+            let text = expand_imports(&text, &path);
             found.push(MemoryFile { label, path, text });
         }
     }
     found
+}
+
+pub fn memory_used(files: &[MemoryFile], budget: u32) -> usize {
+    files
+        .iter()
+        .map(|f| estimate_tokens(f.text.trim()))
+        .sum::<usize>()
+        .min(budget as usize)
 }
 
 pub fn memory_section(files: &[MemoryFile], budget: u32) -> String {
@@ -208,7 +399,9 @@ pub fn skills_roots() -> (Option<PathBuf>, PathBuf) {
 
 pub fn discover_skills() -> Vec<Skill> {
     let (user, project) = skills_roots();
-    skill::discover(user.as_deref(), &project)
+    let mut found = skill::discover(user.as_deref(), &project);
+    found.extend(crate::plugins::skills(&crate::plugins::installed()));
+    found
 }
 
 #[cfg(test)]

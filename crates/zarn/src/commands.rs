@@ -456,3 +456,85 @@ pub fn hooks_list() -> Result<()> {
     println!("{}", zarn_config::hooks::describe(&cfg.hooks));
     Ok(())
 }
+
+fn plugin_store() -> Result<zarn_config::plugins::Store> {
+    zarn_config::plugins::Store::system().ok_or_else(|| anyhow::anyhow!("no user config directory to keep plugins in"))
+}
+
+fn describe_plugin(plugin: &zarn_config::plugins::Plugin) -> String {
+    let mut out = format!(
+        "{}{}  {}\n  contributes {}\n  {}",
+        plugin.name(),
+        plugin.manifest.version.as_deref().map(|v| format!(" {v}")).unwrap_or_default(),
+        plugin.manifest.description.clone().unwrap_or_default(),
+        plugin.contributions(),
+        plugin.status()
+    );
+    for line in plugin.code() {
+        out.push_str(&format!("\n    runs {line}"));
+    }
+    out
+}
+
+pub fn plugin_list() -> Result<()> {
+    let plugins = plugin_store()?.installed();
+    if plugins.is_empty() {
+        println!("no plugins; zarn plugin add <directory or git URL>");
+    }
+    for plugin in plugins {
+        println!("{}", describe_plugin(&plugin));
+    }
+    Ok(())
+}
+
+pub fn plugin_add(source: &str) -> Result<()> {
+    let plugin = plugin_store()?.install(source)?;
+    println!("installed {}\n", plugin.name());
+    println!("{}", describe_plugin(&plugin));
+    if plugin.runs_code() {
+        println!("\nIts hooks and MCP servers run code, so they stay off until you approve them: zarn plugin approve {}", plugin.name());
+    }
+    Ok(())
+}
+
+pub fn plugin_approve(name: &str, yes: bool) -> Result<()> {
+    let store = plugin_store()?;
+    let plugin = store.find(name).ok_or_else(|| anyhow::anyhow!("no plugin named {name}"))?;
+    if !plugin.runs_code() {
+        println!("{name} has no hooks or MCP servers; nothing to approve");
+        return Ok(());
+    }
+    println!("{name} will run:");
+    for line in plugin.code() {
+        println!("  {line}");
+    }
+    if !yes {
+        use std::io::{BufRead, IsTerminal, Write};
+        if !std::io::stdin().is_terminal() {
+            anyhow::bail!("not approving without a terminal; rerun with --yes if you trust it");
+        }
+        print!("allow this? [y/N] ");
+        std::io::stdout().flush()?;
+        let mut answer = String::new();
+        std::io::stdin().lock().read_line(&mut answer)?;
+        if !answer.trim().eq_ignore_ascii_case("y") {
+            println!("not approved");
+            return Ok(());
+        }
+    }
+    store.approve(name)?;
+    println!("approved {name}; its hooks and MCP servers are on");
+    Ok(())
+}
+
+pub fn plugin_revoke(name: &str) -> Result<()> {
+    plugin_store()?.revoke(name)?;
+    println!("{name}'s hooks and MCP servers are off");
+    Ok(())
+}
+
+pub fn plugin_remove(name: &str) -> Result<()> {
+    plugin_store()?.remove(name)?;
+    println!("removed {name}");
+    Ok(())
+}

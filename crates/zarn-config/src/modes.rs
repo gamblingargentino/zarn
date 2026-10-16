@@ -336,7 +336,9 @@ pub fn load_from(user: Option<&Path>, project: &Path) -> Loaded {
 
 pub fn load() -> Loaded {
     let project = dir(Scope::Project).unwrap_or_default();
-    load_from(dir(Scope::User).as_deref(), &project)
+    let mut loaded = load_from(dir(Scope::User).as_deref(), &project);
+    loaded.modes.extend(crate::plugins::modes(&crate::plugins::installed()));
+    loaded
 }
 
 pub fn save_in(dir: &Path, def: &ModeDef) -> Result<PathBuf> {

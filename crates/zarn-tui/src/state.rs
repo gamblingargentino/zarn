@@ -26,6 +26,17 @@ pub struct Vim {
 
 pub const VIM_HELP: &str = "vim input (General → vim input): esc normal mode · i insert · a append · o open line below · h j k l move · w b word · 0 $ line start and end · x delete char · dd delete line · enter sends";
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentRow {
+    pub id: String,
+    pub agent: String,
+    pub tool: Option<String>,
+    pub started: std::time::Instant,
+    pub tokens: u64,
+    pub background: bool,
+    pub done: Option<bool>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Search {
     pub query: String,
@@ -271,6 +282,7 @@ pub struct App {
     pub paste_count: usize,
     pub queue_display: Vec<String>,
     pub focused: Option<bool>,
+    pub agents: Vec<AgentRow>,
     ctrl_c_armed: bool,
     esc_armed: bool,
 }
@@ -689,6 +701,44 @@ impl App {
                     card.output = Some(output.content);
                 }
             }
+        }
+    }
+
+    pub fn task_update(&mut self, update: zarn_core::subagent::TaskUpdate) {
+        use zarn_core::subagent::TaskState;
+        if let TaskState::Started { background, .. } = &update.state {
+            self.agents.retain(|r| r.id != update.id);
+            self.agents.push(AgentRow {
+                id: update.id.clone(),
+                agent: update.agent.clone(),
+                tool: None,
+                started: std::time::Instant::now(),
+                tokens: 0,
+                background: *background,
+                done: None,
+            });
+            return;
+        }
+        let Some(row) = self.agents.iter_mut().find(|r| r.id == update.id) else {
+            return;
+        };
+        match update.state {
+            TaskState::Tool(tool) => row.tool = Some(tool),
+            TaskState::Tokens(n) => row.tokens = n,
+            TaskState::Finished { ok } => {
+                row.done = Some(ok);
+                row.tool = None;
+                if row.background {
+                    let id = row.id.clone();
+                    let agent = row.agent.clone();
+                    self.agents.retain(|r| r.id != id);
+                    self.notice(format!(
+                        "background agent {id} ({agent}) {}; its result goes to the model with your next message (/tasks shows it)",
+                        if ok { "finished" } else { "failed" }
+                    ));
+                }
+            }
+            TaskState::Started { .. } => {}
         }
     }
 

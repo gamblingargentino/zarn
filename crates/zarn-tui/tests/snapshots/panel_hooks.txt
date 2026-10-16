@@ -1,5 +1,5 @@
 ╭ zarn settings · changes save as you go ──────────────────────────────────────────────────────────╮
-│Providers │ Models │ Skills │ MCP │ Agents │ Modes │ Quota │ Permissions │ Hooks │ General        │
+│Providers  Models  Skills  MCP  Agents  Modes  Quota  Permissions  Hooks  Plugins  General        │
 │                                                                                                  │
 │› pre_tool · edit|write  ./scripts/check-paths.sh                                                 │
 │  turn_end · *           notify-send done                                                         │

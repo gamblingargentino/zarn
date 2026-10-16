@@ -49,18 +49,23 @@ pub fn draw(frame: &mut Frame, app: &App) {
     } else {
         app.todos.len().min(MAX_TODO_ROWS) as u16 + 1
     };
+    let agent_rows = app.agents.len().min(MAX_AGENT_ROWS) as u16;
     let layout = Layout::vertical([
         Constraint::Min(1),
+        Constraint::Length(agent_rows),
         Constraint::Length(todo_rows),
         Constraint::Length(1),
         Constraint::Length(input_rows),
     ])
     .split(frame.area());
-    let areas = [layout[0], layout[2], layout[3]];
+    let areas = [layout[0], layout[3], layout[4]];
 
     scrollback(frame, app, areas[0]);
+    if agent_rows > 0 {
+        agent_list(frame, app, layout[1]);
+    }
     if todo_rows > 0 {
-        todo_list(frame, app, layout[1]);
+        todo_list(frame, app, layout[2]);
     }
     status(frame, app, areas[1]);
     input(frame, app, areas[2]);
@@ -97,6 +102,49 @@ pub fn draw(frame: &mut Frame, app: &App) {
     {
         views::draw_plan(frame, areas[0], review, app.theme.accent);
     }
+}
+
+pub const MAX_AGENT_ROWS: usize = 6;
+
+pub fn agent_line(row: &crate::state::AgentRow, tick: usize, accent: Color) -> Line<'static> {
+    let (mark, style) = match row.done {
+        None => (crate::settings::SPINNER[tick % crate::settings::SPINNER.len()].to_string(), Style::default().fg(accent)),
+        Some(true) => ("✓".to_string(), Style::default().fg(theme::ok())),
+        Some(false) => ("✗".to_string(), Style::default().fg(theme::error())),
+    };
+    let doing = match (&row.tool, row.done) {
+        (_, Some(true)) => "done".to_string(),
+        (_, Some(false)) => "failed".to_string(),
+        (Some(tool), None) => tool.clone(),
+        (None, None) => "thinking".to_string(),
+    };
+    let mut spans = vec![
+        Span::styled(format!("{mark} "), style),
+        Span::styled(row.agent.clone(), Style::default().add_modifier(Modifier::BOLD)),
+        Span::styled(format!("  {doing}"), Style::default()),
+        Span::styled(
+            format!(
+                "  ·  {}  ·  ~{} tok",
+                elapsed_label(row.started.elapsed().as_secs()),
+                compact(row.tokens)
+            ),
+            Style::default().fg(theme::dim()),
+        ),
+    ];
+    if row.background {
+        spans.push(Span::styled(format!("  ·  background {}", row.id), Style::default().fg(theme::dim())));
+    }
+    Line::from(spans)
+}
+
+fn agent_list(frame: &mut Frame, app: &App, area: Rect) {
+    let lines: Vec<Line> = app
+        .agents
+        .iter()
+        .take(MAX_AGENT_ROWS)
+        .map(|row| agent_line(row, app.tick, app.theme.accent))
+        .collect();
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn line_text(line: &Line) -> String {
@@ -379,7 +427,19 @@ pub fn card_summary(card: &ToolCard) -> Option<String> {
                 format!("agent {agent} · {}", truncate(prompt, 60))
             })
         }
-        "bash" => Some(format!("$ {}", truncate(arg(&card.args, "command"), 100))),
+        "bash" => Some(format!(
+            "$ {}{}",
+            truncate(arg(&card.args, "command"), 100),
+            if card.args.get("background").and_then(Value::as_bool) == Some(true) { "  (background)" } else { "" }
+        )),
+        "webfetch" => Some(truncate(arg(&card.args, "url"), 100)),
+        "websearch" => Some(format!("'{}'", truncate(arg(&card.args, "query"), 80))),
+        "bash_output" | "bash_kill" => Some(arg(&card.args, "id").to_string()),
+        "notebook_edit" => Some(format!(
+            "{} · {}",
+            arg(&card.args, "path"),
+            card.args.get("edit_mode").and_then(Value::as_str).unwrap_or("replace")
+        )),
         _ => None,
     }
 }

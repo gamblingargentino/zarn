@@ -1,3 +1,4 @@
+pub mod bang;
 pub mod bash;
 pub mod budget;
 pub mod checkpoint;
@@ -7,13 +8,19 @@ pub mod exit_plan;
 pub mod freshness;
 pub mod fsx;
 pub mod mcp;
+pub mod mcp_auth;
+pub mod multiedit;
+pub mod notebook;
 pub mod permissions;
 pub mod progress;
 pub mod read;
 pub mod safe_shell;
 pub mod todo;
+pub mod tool_search;
 pub mod search;
+pub mod shells;
 pub mod skill;
+pub mod web;
 pub mod write;
 
 use zarn_core::tools::{Tool, ToolRegistry};
@@ -28,16 +35,26 @@ pub fn builtin_list() -> Vec<Box<dyn Tool>> {
 }
 
 pub fn builtin_list_with(options: Options) -> Vec<Box<dyn Tool>> {
+    builtin_list_sharing(options, shells::Shells::new())
+}
+
+pub fn builtin_list_sharing(options: Options, shells: std::sync::Arc<shells::Shells>) -> Vec<Box<dyn Tool>> {
+    let bash = if options.sandbox {
+        bash::Bash::sandboxed()
+    } else {
+        bash::Bash::new()
+    };
     vec![
-        Box::new(if options.sandbox {
-            bash::Bash::sandboxed()
-        } else {
-            bash::Bash::new()
-        }),
+        Box::new(bash.with_shells(shells.clone())),
+        Box::new(shells::BashOutput::new(shells.clone())),
+        Box::new(shells::BashKill::new(shells)),
         Box::new(edit::Edit::new()),
+        Box::new(multiedit::MultiEdit::new()),
+        Box::new(notebook::NotebookEdit::new()),
         Box::new(read::Read::new()),
         Box::new(search::Glob::new()),
         Box::new(search::Grep::new()),
+        Box::new(web::WebFetch::new()),
         Box::new(write::Write::new()),
     ]
 }
@@ -57,7 +74,19 @@ mod tests {
         let registry = super::builtins();
         assert_eq!(
             registry.names(),
-            vec!["bash", "edit", "glob", "grep", "read", "write"]
+            vec![
+                "bash",
+                "bash_kill",
+                "bash_output",
+                "edit",
+                "glob",
+                "grep",
+                "multiedit",
+                "notebook_edit",
+                "read",
+                "webfetch",
+                "write"
+            ]
         );
     }
 }

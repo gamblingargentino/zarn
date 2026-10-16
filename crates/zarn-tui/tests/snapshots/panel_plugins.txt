@@ -1,0 +1,10 @@
+╭ zarn settings · changes save as you go ──────────────────────────────────────────────────────────╮
+│Providers  Models  Skills  MCP  Agents  Modes  Quota  Permissions  Hooks  Plugins  General        │
+│                                                                                                  │
+│› kit  enabled; hooks and MCP wait for approval  1 commands, 1 hooks                              │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│↑↓ move · ←→ tab · enter approves or revokes code · d remove · zarn plugin add installs · esc clo…│
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

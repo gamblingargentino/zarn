@@ -11,7 +11,7 @@ use tokio_util::sync::CancellationToken;
 use zarn_config::auth::{KeyStore, redact};
 use zarn_config::guard::RedactingWriter;
 use zarn_config::{Config, modes, runtime};
-use zarn_core::agent::{Agent, AgentEvent};
+use zarn_core::agent::AgentEvent;
 use zarn_core::cost::CostTracker;
 use zarn_core::provider::Event;
 use zarn_core::session;
@@ -119,6 +119,13 @@ async fn run_command(command: &Command) -> Result<()> {
             Some(McpAction::Remove { name }) => commands::mcp_remove(name),
         },
         Command::Hooks { .. } => commands::hooks_list(),
+        Command::Plugin { action } => match action {
+            None | Some(cli::PluginAction::List) => commands::plugin_list(),
+            Some(cli::PluginAction::Add { source }) => commands::plugin_add(source),
+            Some(cli::PluginAction::Approve { name, yes }) => commands::plugin_approve(name, *yes),
+            Some(cli::PluginAction::Revoke { name }) => commands::plugin_revoke(name),
+            Some(cli::PluginAction::Remove { name }) => commands::plugin_remove(name),
+        },
         Command::Models { provider, refresh } => commands::models(provider.as_deref(), *refresh).await,
         Command::Limits { session, day } => commands::limits(session.as_deref(), day.as_deref()),
         Command::Modes { action } => match action {
@@ -176,8 +183,20 @@ async fn run_print(args: &Args, prompt: String) -> Result<()> {
 
     let cwd = std::env::current_dir()?;
     let ctx = Arc::new(Ctx::new(&cwd));
-    let mcp_tools = zarn_tools::mcp::connect_all(&mcp).await;
+    let mut authed = std::collections::BTreeMap::new();
+    for (name, config) in &mcp {
+        authed.insert(name.clone(), zarn_config::mcp_auth::with_auth(&store, name, config).await);
+    }
+    let mcp_tools = zarn_tools::mcp::connect_all(&authed).await;
     let notify: runtime::Notify = Arc::new(|text: String| eprintln!("{}", redact(&text)));
+    let shells = zarn_tools::shells::Shells::new();
+    let gate = Arc::new(Permissions::headless().with_overlay(overlay));
+    for err in cfg.apply_permissions(&gate, &cwd) {
+        eprintln!("permission rule ignored: {err}");
+    }
+    let hooks = Arc::new(std::sync::RwLock::new(cfg.hooks.clone()));
+    let hooked: Arc<dyn zarn_core::agent::ToolGate> =
+        Arc::new(zarn_config::hooks::HookedGate::new(gate, hooks, cwd.clone()));
     let rt = runtime::assemble(
         &cfg,
         plan,
@@ -190,19 +209,17 @@ async fn run_print(args: &Args, prompt: String) -> Result<()> {
             mode: Some(mode),
             approver: Some(Arc::new(zarn_tools::exit_plan::Unattended)),
             todos: Some(Default::default()),
+            shells: Some(shells.clone()),
+            task_gate: Some(hooked.clone()),
+            task_monitor: None,
+            background: None,
+            memory: None,
         },
     )?;
-    let gate = Permissions::headless().with_overlay(overlay);
-    for err in cfg.apply_permissions(&gate, &cwd) {
-        eprintln!("permission rule ignored: {err}");
+    for warning in &rt.warnings {
+        eprintln!("{warning}");
     }
-    let hooks = Arc::new(std::sync::RwLock::new(cfg.hooks.clone()));
-    let agent = Agent::new(rt.provider.clone(), rt.tools.clone(), ctx, rt.agent_config())
-        .with_gate(Arc::new(zarn_config::hooks::HookedGate::new(
-            Arc::new(gate),
-            hooks,
-            cwd.clone(),
-        )));
+    let agent = rt.agent(ctx, hooked);
     let blocked = zarn_config::hooks::fire(
         &cfg.hooks,
         "prompt_submit",
@@ -296,6 +313,7 @@ async fn run_print(args: &Args, prompt: String) -> Result<()> {
 
     let mut messages = vec![Message::System(rt.system.clone()), Message::user(&prompt)];
     let result = agent.run(&mut messages, &tx, &cancel).await;
+    shells.kill_all();
     drop(tx);
     for outcome in zarn_config::hooks::fire(
         &cfg.hooks,

@@ -7,11 +7,14 @@ pub mod guard;
 pub mod health;
 pub mod hooks;
 pub mod layers;
+pub mod mcp_auth;
 pub mod modes;
 pub mod ops;
 pub mod paths;
+pub mod plugins;
 pub mod pricing;
 pub mod quota;
+pub mod refs;
 pub mod runtime;
 pub mod spend;
 pub mod titles;
@@ -72,6 +75,10 @@ pub struct General {
     pub status_line: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mouse: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_parallel_agents: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lazy_tools_threshold: Option<u32>,
 }
 
 impl General {
@@ -92,6 +99,8 @@ impl General {
         self.notifications = self.notifications.or(other.notifications);
         self.status_line = self.status_line.take().or(other.status_line);
         self.mouse = self.mouse.or(other.mouse);
+        self.max_parallel_agents = self.max_parallel_agents.or(other.max_parallel_agents);
+        self.lazy_tools_threshold = self.lazy_tools_threshold.or(other.lazy_tools_threshold);
     }
 
     pub fn vim(&self) -> bool {
@@ -108,6 +117,18 @@ impl General {
 
     pub fn mouse(&self) -> bool {
         self.mouse.unwrap_or(false)
+    }
+
+    pub fn lazy_tools_threshold(&self) -> usize {
+        self.lazy_tools_threshold
+            .map(|n| n as usize)
+            .unwrap_or(zarn_tools::tool_search::DEFAULT_THRESHOLD)
+    }
+
+    pub fn max_parallel_agents(&self) -> usize {
+        self.max_parallel_agents
+            .map(|n| n.max(1) as usize)
+            .unwrap_or(zarn_core::agent::DEFAULT_PARALLEL)
     }
 
     pub fn tool_options(&self) -> zarn_tools::Options {
@@ -262,6 +283,42 @@ pub struct Config {
     pub limits: spend::Limits,
     #[serde(default, skip_serializing_if = "hooks::Hooks::is_empty")]
     pub hooks: hooks::Hooks,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub websearch: Option<WebSearchConfig>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WebSearchConfig {
+    pub url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub header: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+}
+
+impl WebSearchConfig {
+    pub fn backend(&self, store: &auth::KeyStore) -> Result<zarn_tools::web::SearchBackend, String> {
+        if !self.url.contains("{query}") {
+            return Err("websearch.url needs a {query} placeholder".into());
+        }
+        if !(self.url.starts_with("https://") || self.url.starts_with("http://")) {
+            return Err("websearch.url must be an http(s) URL".into());
+        }
+        let key = match &self.key {
+            Some(reference) if reference.starts_with("env:") || reference.starts_with("key:") => {
+                Some(refs::resolve(store, reference)?)
+            }
+            Some(_) => {
+                return Err("websearch.key must be a reference: key:<name> for the credential store or env:<VARIABLE>".into());
+            }
+            None => None,
+        };
+        Ok(zarn_tools::web::SearchBackend {
+            url: self.url.clone(),
+            header: self.header.clone(),
+            key,
+        })
+    }
 }
 
 impl Config {
@@ -299,6 +356,9 @@ impl Config {
         self.routing.fill_from(other.routing);
         self.limits.fill_from(other.limits);
         self.hooks.fill_from(other.hooks);
+        if self.websearch.is_none() {
+            self.websearch = other.websearch;
+        }
     }
 
     pub fn home_path() -> Option<PathBuf> {
@@ -314,7 +374,9 @@ impl Config {
     }
 
     pub fn load() -> Result<Self> {
-        Self::load_from(&Self::sources())
+        let mut config = Self::load_from(&Self::sources())?;
+        plugins::contribute(&mut config);
+        Ok(config)
     }
 
     pub fn load_from(paths: &[PathBuf]) -> Result<Self> {

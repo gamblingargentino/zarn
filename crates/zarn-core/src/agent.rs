@@ -40,7 +40,11 @@ pub struct AgentConfig {
     pub max_tokens: u32,
     pub temperature: f32,
     pub max_iterations: usize,
+    pub parallel: usize,
 }
+
+pub const DEFAULT_PARALLEL: usize = 4;
+pub const PARALLEL_TOOLS: [&str; 1] = ["task"];
 
 impl Default for AgentConfig {
     fn default() -> Self {
@@ -49,8 +53,27 @@ impl Default for AgentConfig {
             max_tokens: 4096,
             temperature: 1.0,
             max_iterations: 32,
+            parallel: DEFAULT_PARALLEL,
         }
     }
+}
+
+pub type ToolFilter = Arc<dyn Fn(&crate::types::ToolSpec) -> bool + Send + Sync>;
+
+fn batches(calls: Vec<ToolCall>) -> Vec<Vec<ToolCall>> {
+    let mut out: Vec<Vec<ToolCall>> = Vec::new();
+    for call in calls {
+        let parallel = PARALLEL_TOOLS.contains(&call.name.as_str());
+        match out.last_mut() {
+            Some(batch)
+                if parallel && batch.first().is_some_and(|c| PARALLEL_TOOLS.contains(&c.name.as_str())) =>
+            {
+                batch.push(call)
+            }
+            _ => out.push(vec![call]),
+        }
+    }
+    out
 }
 
 pub struct Agent {
@@ -59,6 +82,7 @@ pub struct Agent {
     ctx: Arc<Ctx>,
     config: AgentConfig,
     gate: Option<Arc<dyn ToolGate>>,
+    filter: Option<ToolFilter>,
 }
 
 struct Collected {
@@ -80,12 +104,38 @@ impl Agent {
             ctx,
             config,
             gate: None,
+            filter: None,
         }
     }
 
     pub fn with_gate(mut self, gate: Arc<dyn ToolGate>) -> Self {
         self.gate = Some(gate);
         self
+    }
+
+    pub fn with_filter(mut self, filter: ToolFilter) -> Self {
+        self.filter = Some(filter);
+        self
+    }
+
+    pub fn tools(&self) -> &Arc<ToolRegistry> {
+        &self.tools
+    }
+
+    pub fn ctx(&self) -> &Arc<Ctx> {
+        &self.ctx
+    }
+
+    pub fn gate(&self) -> Option<&Arc<dyn ToolGate>> {
+        self.gate.as_ref()
+    }
+
+    fn specs(&self) -> Vec<crate::types::ToolSpec> {
+        let specs = self.tools.specs();
+        match &self.filter {
+            Some(keep) => specs.into_iter().filter(|s| keep(s)).collect(),
+            None => specs,
+        }
     }
 
     pub fn provider(&self) -> &Arc<dyn Provider> {
@@ -105,7 +155,7 @@ impl Agent {
         for _ in 0..self.config.max_iterations {
             let req = Request {
                 messages: messages.clone(),
-                tools: self.tools.specs(),
+                tools: self.specs(),
                 model: self.config.model.clone(),
                 max_tokens: self.config.max_tokens,
                 temperature: self.config.temperature,
@@ -130,13 +180,23 @@ impl Agent {
                 return Ok(collected.stop);
             }
 
-            for call in collected.calls {
-                let output = self.invoke(&call, sink).await;
-                messages.push(Message::ToolResult {
-                    id: call.id,
-                    content: output.content,
-                    is_error: output.is_error,
-                });
+            for batch in batches(collected.calls) {
+                let outputs = if batch.len() == 1 {
+                    vec![self.invoke(&batch[0], sink, cancel).await]
+                } else {
+                    self.invoke_parallel(&batch, sink, cancel).await
+                };
+                for (call, output) in batch.into_iter().zip(outputs) {
+                    messages.push(Message::ToolResult {
+                        id: call.id,
+                        content: output.content,
+                        is_error: output.is_error,
+                    });
+                }
+            }
+
+            if cancel.is_cancelled() {
+                return Ok(StopReason::Cancelled);
             }
         }
 
@@ -215,7 +275,7 @@ impl Agent {
         Ok(Collected { text, calls, stop })
     }
 
-    async fn invoke(&self, call: &ToolCall, sink: &Sender<AgentEvent>) -> ToolOutput {
+    async fn started(&self, call: &ToolCall, sink: &Sender<AgentEvent>) {
         let _ = sink
             .send(AgentEvent::ToolStarted {
                 id: call.id.clone(),
@@ -223,18 +283,9 @@ impl Agent {
                 args: call.args.clone(),
             })
             .await;
+    }
 
-        let output = match self.tools.get(&call.name) {
-            None => ToolOutput::error(format!("unknown tool: {}", call.name)),
-            Some(tool) => match self.permit(&call.name, tool.risk(), &call.args).await {
-                GateDecision::Deny(reason) => ToolOutput::error(reason),
-                GateDecision::Allow => match tool.run(call.args.clone(), &self.ctx).await {
-                    Ok(out) => out,
-                    Err(err) => ToolOutput::error(format!("{err:#}")),
-                },
-            },
-        };
-
+    async fn finished(&self, call: &ToolCall, output: &ToolOutput, sink: &Sender<AgentEvent>) {
         let _ = sink
             .send(AgentEvent::ToolFinished {
                 id: call.id.clone(),
@@ -242,8 +293,74 @@ impl Agent {
                 output: output.clone(),
             })
             .await;
+    }
 
+    async fn admit(&self, call: &ToolCall) -> Result<(), ToolOutput> {
+        let Some(tool) = self.tools.get(&call.name) else {
+            return Err(ToolOutput::error(format!("unknown tool: {}", call.name)));
+        };
+        match self.permit(&call.name, tool.risk(), &call.args).await {
+            GateDecision::Deny(reason) => Err(ToolOutput::error(reason)),
+            GateDecision::Allow => Ok(()),
+        }
+    }
+
+    async fn execute(&self, call: &ToolCall, cancel: &CancellationToken) -> ToolOutput {
+        let Some(tool) = self.tools.get(&call.name) else {
+            return ToolOutput::error(format!("unknown tool: {}", call.name));
+        };
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => ToolOutput::error("cancelled before the tool finished"),
+            result = tool.run(call.args.clone(), &self.ctx) => match result {
+                Ok(out) => out,
+                Err(err) => ToolOutput::error(format!("{err:#}")),
+            },
+        }
+    }
+
+    async fn invoke(&self, call: &ToolCall, sink: &Sender<AgentEvent>, cancel: &CancellationToken) -> ToolOutput {
+        self.started(call, sink).await;
+        let output = match self.admit(call).await {
+            Err(denied) => denied,
+            Ok(()) if cancel.is_cancelled() => ToolOutput::error("cancelled before the tool ran"),
+            Ok(()) => self.execute(call, cancel).await,
+        };
+        self.finished(call, &output, sink).await;
         output
+    }
+
+    async fn invoke_parallel(
+        &self,
+        calls: &[ToolCall],
+        sink: &Sender<AgentEvent>,
+        cancel: &CancellationToken,
+    ) -> Vec<ToolOutput> {
+        let mut admitted = Vec::with_capacity(calls.len());
+        for call in calls {
+            self.started(call, sink).await;
+            admitted.push(self.admit(call).await);
+        }
+        let slots = tokio::sync::Semaphore::new(self.config.parallel.max(1));
+        let slots = &slots;
+        let runs: Vec<std::pin::Pin<Box<dyn std::future::Future<Output = ToolOutput> + Send + '_>>> = calls
+            .iter()
+            .zip(admitted)
+            .map(|(call, admitted)| {
+                Box::pin(async move {
+                    let output = match admitted {
+                        Err(denied) => denied,
+                        Ok(()) => {
+                            let _slot = slots.acquire().await;
+                            self.execute(call, cancel).await
+                        }
+                    };
+                    self.finished(call, &output, sink).await;
+                    output
+                }) as std::pin::Pin<Box<dyn std::future::Future<Output = ToolOutput> + Send + '_>>
+            })
+            .collect();
+        futures::future::join_all(runs).await
     }
 }
 

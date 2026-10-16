@@ -33,6 +33,8 @@ pub const BUILTINS: &[(&str, &str, &str)] = &[
     ("limits", "[session|day <usd|off>]", "show or set the spend caps"),
     ("resume", "[id]", "resume an earlier session in this directory"),
     ("rename", "<title>", "rename this session"),
+    ("tasks", "[cancel <id>]", "list background agents and their results"),
+    ("plugins", "", "list, approve and remove plugins"),
     ("export", "[path]", "write the conversation to Markdown with keys redacted"),
     ("copy", "", "copy the last reply to the clipboard"),
     ("tools", "", "list the registered tools"),
@@ -46,7 +48,7 @@ pub const BUILTINS: &[(&str, &str, &str)] = &[
     ("mode", "[name]", "pick a mode, or switch: default, plan, accept-edits, bypass, custom"),
     ("config", "", "open the settings panel"),
     ("skills", "", "list skills and turn them on or off"),
-    ("mcp", "[list|add|remove|restart]", "manage MCP servers"),
+    ("mcp", "[list|add|remove|restart|login|logout]", "manage MCP servers"),
     ("agents", "[list|create|edit name]", "list, create and edit subagents"),
     ("permissions", "[edit]", "show rules, the mode overlay and what each tool resolves to"),
     ("init", "", "have the model inspect the repo and write ZARN.md"),
@@ -73,16 +75,16 @@ pub fn is_builtin(name: &str) -> bool {
     BUILTINS.iter().any(|(n, _, _)| *n == name)
 }
 
-pub fn entries(custom: &[String], skills: &[(String, String)]) -> Vec<Entry> {
+pub fn entries(custom: &[(String, String, String)], skills: &[(String, String)]) -> Vec<Entry> {
     let mut all = builtin_entries();
-    for name in custom {
+    for (name, usage, description) in custom {
         if all.iter().any(|e| &e.name == name) {
             continue;
         }
         all.push(Entry {
             name: name.clone(),
-            usage: "[args]".into(),
-            description: "custom command".into(),
+            usage: if usage.is_empty() { "[args]".into() } else { usage.clone() },
+            description: if description.is_empty() { "custom command".into() } else { description.clone() },
             origin: Origin::Custom,
         });
     }
@@ -213,14 +215,16 @@ mod tests {
     #[test]
     fn custom_commands_and_skills_join_the_popup_without_shadowing_builtins() {
         let all = entries(
-            &["review".into(), "help".into()],
+            &[
+                ("review".into(), "<ref>".into(), "review a change".into()),
+                ("help".into(), String::new(), String::new()),
+            ],
             &[("pdf".into(), "fill PDFs".into()), ("review".into(), "x".into())],
         );
         assert_eq!(all.iter().filter(|e| e.name == "help").count(), 1);
-        assert_eq!(
-            all.iter().find(|e| e.name == "review").unwrap().origin,
-            Origin::Custom
-        );
+        let review = all.iter().find(|e| e.name == "review").unwrap();
+        assert_eq!(review.origin, Origin::Custom);
+        assert_eq!((review.usage.as_str(), review.description.as_str()), ("<ref>", "review a change"));
         assert_eq!(
             all.iter().find(|e| e.name == "pdf").unwrap().origin,
             Origin::Skill

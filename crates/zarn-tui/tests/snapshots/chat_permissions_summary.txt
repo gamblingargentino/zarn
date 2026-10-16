@@ -5,14 +5,22 @@ rules
   deny  bash(rm -rf:*)  (user)
   allow bash(cargo test:*)  (user)
 tools now
-  bash   ask   default for its risk; read-only commands run without asking
-  edit   allow accept-edits mode
-  glob   allow default for its risk
-  grep   allow default for its risk
-  read   allow default for its risk
-  todo   allow default for its risk
-  write  allow accept-edits mode
+  bash           ask   default for its risk; read-only commands run without asking
+  bash_kill      allow default for its risk
+  bash_output    allow default for its risk
+  edit           allow accept-edits mode
+  glob           allow default for its risk
+  grep           allow default for its risk
+  multiedit      allow accept-edits mode
+  notebook_edit  allow accept-edits mode
+  read           allow default for its risk
+  todo           allow default for its risk
+  webfetch       ask   default for its risk
+  write          allow accept-edits mode
 /permissions edit opens the settings tab
+
+
+
 
 
 
