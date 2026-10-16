@@ -143,6 +143,16 @@ pub fn redact_message(message: &Message) -> Message {
     }
 }
 
+pub fn append_redacted(
+    session: &mut zarn_core::session::Session,
+    messages: &[Message],
+) -> anyhow::Result<()> {
+    for message in messages {
+        session.append(&redact_message(message))?;
+    }
+    Ok(())
+}
+
 pub struct RedactingWriter<W: Write> {
     inner: W,
     pending: Vec<u8>,

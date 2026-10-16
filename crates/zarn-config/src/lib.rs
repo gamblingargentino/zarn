@@ -2,6 +2,7 @@ pub mod agents;
 pub mod auth;
 pub mod catalog;
 pub mod context;
+pub mod doctor;
 pub mod guard;
 pub mod layers;
 pub mod ops;

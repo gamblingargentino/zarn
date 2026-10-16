@@ -347,9 +347,9 @@ impl KeyStore {
         Self::new(Arc::new(OsKeyring), file)
     }
 
-    pub fn shared() -> &'static KeyStore {
-        static SHARED: OnceLock<KeyStore> = OnceLock::new();
-        SHARED.get_or_init(KeyStore::system)
+    pub fn shared() -> Arc<KeyStore> {
+        static SHARED: OnceLock<Arc<KeyStore>> = OnceLock::new();
+        SHARED.get_or_init(|| Arc::new(KeyStore::system())).clone()
     }
 
     pub fn backend_label(&self) -> String {

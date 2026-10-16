@@ -1,0 +1,14 @@
+╭ zarn settings · changes save as you go ──────────────────────────────────────────────────────────╮
+│Providers │ Models │ Skills │ MCP │ Agents │ Permissions │ General                                │
+│                                                                                                  │
+│› claude (default)  anthropic · key in credential store · user                                    │
+│  local             ollama · no key needed · user                                                 │
+│  + add provider                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│↑↓ move · ←→ tab · enter edit · a add · k key · t test · d delete · esc close                     │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

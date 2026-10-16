@@ -1,6 +1,8 @@
 use crate::brand;
 use crate::markdown;
-use crate::state::{App, Block, CardStatus, COLLAPSED_LINES, ToolCard};
+use crate::popup;
+use crate::state::{App, Block, CardStatus, COLLAPSED_LINES, Mode, Overlay, ToolCard};
+use crate::views;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -11,6 +13,11 @@ use serde_json::Value;
 const MAX_INPUT_ROWS: u16 = 8;
 
 pub fn draw(frame: &mut Frame, app: &App) {
+    match &app.mode {
+        Mode::Panel(panel) => return views::draw_panel(frame, panel, app.theme.accent),
+        Mode::Onboarding(flow) => return views::draw_onboarding(frame, flow, app.theme.accent),
+        Mode::Chat => {}
+    }
     let input_rows = (app.input.split('\n').count() as u16 + 2).clamp(3, MAX_INPUT_ROWS);
     let areas = Layout::vertical([
         Constraint::Min(1),
@@ -22,20 +29,49 @@ pub fn draw(frame: &mut Frame, app: &App) {
     scrollback(frame, app, areas[0]);
     status(frame, app, areas[1]);
     input(frame, app, areas[2]);
+
+    if app.popup_visible() {
+        let shown = app.popup_matches();
+        let selected = app.popup_selected.min(shown.len().saturating_sub(1));
+        popup::draw(frame, areas[0], &shown, selected, app.theme.accent);
+    }
+
+    match &app.overlay {
+        Some(Overlay::Pick(picker, _)) => {
+            views::draw_picker(frame, areas[0], picker, app.theme.accent)
+        }
+        Some(Overlay::Secret { input, provider }) => views::draw_secret(
+            frame,
+            areas[0],
+            &format!("API key for {provider}"),
+            input,
+            "Paste the key and press enter; characters are not shown. It goes to your OS credential store (or an owner-only fallback file), never to a config file. esc cancels.",
+            app.theme.accent,
+        ),
+        None => {}
+    }
 }
 
 fn scrollback(frame: &mut Frame, app: &App, area: Rect) {
-    let mut lines = brand::header(&app.status.model);
-    lines.push(Line::raw(""));
+    let mut lines = Vec::new();
+    if app.theme.banner {
+        lines = brand::header_in(&app.status.model, app.theme.accent);
+        lines.push(Line::raw(""));
+    }
     for block in &app.blocks {
-        lines.extend(block_lines(block));
+        lines.extend(block_lines(block, app.theme.accent));
         lines.push(Line::raw(""));
     }
     if let Some(request) = &app.pending {
         lines.extend(permission_lines(&request.tool, &request.args));
     }
 
-    let total = lines.len() as u16;
+    let width = area.width.max(1) as usize;
+    let total = lines
+        .iter()
+        .map(|line| line.width().max(1).div_ceil(width))
+        .sum::<usize>()
+        .min(u16::MAX as usize) as u16;
     let bottom = total.saturating_sub(area.height);
     let offset = bottom.saturating_sub(app.scroll_up);
 
@@ -47,13 +83,13 @@ fn scrollback(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn block_lines(block: &Block) -> Vec<Line<'static>> {
+fn block_lines(block: &Block, accent: Color) -> Vec<Line<'static>> {
     match block {
         Block::User(text) => text
             .split('\n')
             .map(|l| {
                 Line::from(vec![
-                    Span::styled("› ", Style::default().fg(Color::Blue)),
+                    Span::styled("› ", Style::default().fg(accent)),
                     Span::styled(
                         l.to_string(),
                         Style::default().add_modifier(Modifier::BOLD),
@@ -62,10 +98,10 @@ fn block_lines(block: &Block) -> Vec<Line<'static>> {
             })
             .collect(),
         Block::Assistant(text) => markdown::render(text),
-        Block::Notice(text) => vec![Line::styled(
-            text.clone(),
-            Style::default().fg(Color::DarkGray),
-        )],
+        Block::Notice(text) => text
+            .split('\n')
+            .map(|l| Line::styled(l.to_string(), Style::default().fg(Color::DarkGray)))
+            .collect(),
         Block::Tool(card) => card_lines(card),
     }
 }
@@ -181,10 +217,15 @@ fn status(frame: &mut Frame, app: &App, area: Rect) {
             compact(app.status.input_tokens),
             compact(app.status.output_tokens)
         ),
-        format!("${:.4}", app.status.cost),
     ];
     if app.status.cached_tokens > 0 {
-        parts.insert(2, format!("{} cached", compact(app.status.cached_tokens)));
+        parts.push(format!("{} cached", compact(app.status.cached_tokens)));
+    }
+    if app.theme.show_cost {
+        parts.push(format!("${:.4}", app.status.cost));
+    }
+    if let Some(reason) = &app.not_ready {
+        parts.push(format!("not ready: {reason}"));
     }
     if app.streaming {
         parts.push("esc to cancel".to_string());
@@ -195,7 +236,7 @@ fn status(frame: &mut Frame, app: &App, area: Rect) {
 
     let mut spans = Vec::new();
     if app.streaming {
-        spans.push(brand::frame(app.tick));
+        spans.push(brand::frame_in(app.tick, app.theme.accent));
         spans.push(Span::raw(" "));
     }
     spans.push(Span::styled(
@@ -227,7 +268,7 @@ fn input(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(border, area);
     frame.render_widget(Paragraph::new(app.input.clone()), inner);
 
-    if app.pending.is_none() {
+    if app.pending.is_none() && app.overlay.is_none() {
         let before: String = app.input.chars().take(app.cursor).collect();
         let row = before.matches('\n').count() as u16;
         let col = before.split('\n').next_back().unwrap_or("").chars().count() as u16;

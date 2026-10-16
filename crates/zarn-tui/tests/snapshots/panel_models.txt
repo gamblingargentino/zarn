@@ -1,0 +1,14 @@
+╭ zarn settings · changes save as you go ──────────────────────────────────────────────────────────╮
+│Providers │ Models │ Skills │ MCP │ Agents │ Permissions │ General                                │
+│                                                                                                  │
+│› default profile           default                                                               │
+│  default · provider        claude                                                                │
+│  default · model           claude-sonnet-5-5                                                     │
+│  default · fallback 1      local                                                                 │
+│  default · + add fallback                                                                        │
+│  + new profile                                                                                   │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│↑↓ move · ←→ tab · enter change · [ ] or shift+↑↓ reorder fallback · d remove fallback · esc close│
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

@@ -23,7 +23,7 @@ use std::sync::Arc;
 use zarn_core::prompted::PromptedProvider;
 use zarn_core::provider::{Caps, Provider, ProviderError, ToolSupport};
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ProviderSpec {
     pub kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -43,6 +43,22 @@ pub struct ProviderSpec {
     #[serde(flatten)]
     #[serde(default)]
     pub extra: std::collections::BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for ProviderSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderSpec")
+            .field("kind", &self.kind)
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
+            .field("api_key_env", &self.api_key_env)
+            .field("context_window", &self.context_window)
+            .field("max_output", &self.max_output)
+            .field("vision", &self.vision)
+            .field("tools", &self.tools)
+            .field("extra", &self.extra)
+            .finish()
+    }
 }
 
 impl ProviderSpec {
@@ -212,6 +228,16 @@ mod tests {
     #[test]
     fn anthropic_reports_caching_so_cost_tracking_sees_cached_tokens() {
         assert!(build(&spec("anthropic")).unwrap().caps().caching);
+    }
+
+    #[test]
+    fn debug_output_never_shows_the_key() {
+        let spec = ProviderSpec {
+            kind: "openai".into(),
+            api_key: Some("test-key-not-real-debug".into()),
+            ..ProviderSpec::default()
+        };
+        assert!(!format!("{spec:?}").contains("test-key-not-real-debug"));
     }
 
     #[test]

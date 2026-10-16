@@ -1,0 +1,26 @@
+╭ welcome to zarn ───────────────────────────────────────────────────────────────────────╮
+│ ██████▌                                                                                │
+│    ▄█▀                                                                                 │
+│  ▄█▀                                                                                   │
+│ ▐██████                                                                                │
+│                                                                                        │
+│No model provider is configured yet. Connect one to start; your API key stays on this   │
+│machine.                                                                                │
+│Pick a provider                                                                         │
+│                                                                                        │
+│                                                                                        │
+│            ╭ Which provider do you want to use? ──────────────────────────╮            │
+│            │filter                                                        │            │
+│            │› Anthropic (Claude)                                          │            │
+│            │  OpenAI                                                      │            │
+│            │  Google (Gemini)                                             │            │
+│            │  OpenAI-compatible (Groq, OpenRouter, Together, vLLM, LM Stu…│            │
+│            │  Ollama (local)                                              │            │
+│            │  Skip setup for now                                          │            │
+│            │                                                              │            │
+│            ╰──────────────────────────────────────────────────────────────╯            │
+│                                                                                        │
+│                                                                                        │
+│                                                                                        │
+│↑↓ choose · enter select                                                                │
+╰────────────────────────────────────────────────────────────────────────────────────────╯

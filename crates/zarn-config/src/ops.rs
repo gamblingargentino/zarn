@@ -309,6 +309,28 @@ pub async fn test_provider(spec: &ProviderSpec, model: &str) -> Result<String, S
     }
 }
 
+pub async fn list_models(spec: &ProviderSpec) -> Vec<String> {
+    let mut models: Vec<String> = catalog::suggested_models(&spec.kind)
+        .iter()
+        .map(|m| m.to_string())
+        .collect();
+    if spec.kind == "ollama" {
+        let base = spec
+            .base_url
+            .clone()
+            .unwrap_or_else(|| "http://localhost:11434".to_string());
+        let probe = zarn_providers::OllamaProvider::new(base);
+        if let Ok(Ok(found)) = tokio::time::timeout(Duration::from_secs(5), probe.models()).await {
+            for model in found {
+                if !models.contains(&model) {
+                    models.push(model);
+                }
+            }
+        }
+    }
+    models
+}
+
 pub async fn test_named(layers: &Layers, store: &KeyStore, name: &str) -> Result<String, String> {
     let cfg = layers.merged();
     let spec = spec_with_key(&cfg, store, name).map_err(|e| e.to_string())?;

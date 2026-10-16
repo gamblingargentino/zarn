@@ -6,6 +6,8 @@ version.workspace = true
 [dependencies]
 zarn-core.workspace = true
 zarn-tools.workspace = true
+zarn-config.workspace = true
+zarn-providers.workspace = true
 anyhow.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true

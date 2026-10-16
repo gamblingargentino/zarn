@@ -1,0 +1,16 @@
+╭ zarn settings · changes save as you go ──────────────────────────────────────────────────────────╮
+│Providers │ Models │ Skills │ MCP │ Agents │ Permissions │ General                                │
+│                                                                                                  │
+│› claude (default)  anthropic · NO KEY · user                                                     │
+│  local      ╭ API key for claude ──────────────────────────────────────────────────╮             │
+│  + add provi│key ••••••••••••••••••••••••••                                        │             │
+│             │                                                                      │             │
+│             │Paste the key and press enter. It goes to the in-memory store, never  │             │
+│             │to a config file.                                                     │             │
+│             │                                                                      │             │
+│             ╰──────────────────────────────────────────────────────────────────────╯             │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│↑↓ move · ←→ tab · enter edit · a add · k key · t test · d delete · esc close                     │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

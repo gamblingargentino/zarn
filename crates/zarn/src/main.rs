@@ -42,26 +42,31 @@ async fn main() -> Result<()> {
         None => {}
     }
 
-    run_agent(&args).await
+    match args.run_mode() {
+        RunMode::OneShot(prompt) => run_print(&args, prompt).await,
+        RunMode::Interactive => interactive(&args, None).await,
+        RunMode::ContinueLast => interactive(&args, Some(session_path(None)?)).await,
+        RunMode::ResumeSession(id) => interactive(&args, Some(session_path(Some(&id))?)).await,
+    }
 }
 
-fn resume_messages(id: Option<&str>) -> Result<Vec<Message>> {
+fn session_path(id: Option<&str>) -> Result<PathBuf> {
     let root = session::data_root();
     let cwd = std::env::current_dir()?;
-
-    let path = match id {
-        None => session::newest(&root, &cwd)
-            .context("no previous session for this directory")?,
+    match id {
+        None => session::newest(&root, &cwd).context("no previous session for this directory"),
         Some(id) => session::find(&root, &cwd, id)
-            .with_context(|| format!("no session matching '{id}' in this directory"))?,
-    };
+            .with_context(|| format!("no session matching '{id}' in this directory")),
+    }
+}
 
-    let (meta, messages) = session::read(&path)?;
-    eprintln!(
-        "resuming {} ({} messages, {} in / {} out)",
-        meta.id, messages.len(), meta.input_tokens, meta.output_tokens
-    );
-    Ok(messages)
+async fn interactive(args: &Args, resume: Option<PathBuf>) -> Result<()> {
+    zarn_tui::run(zarn_tui::Options {
+        profile: args.profile.clone(),
+        model: args.model.clone(),
+        resume,
+    })
+    .await
 }
 
 fn config_target() -> Result<PathBuf> {
@@ -208,12 +213,12 @@ async fn cmd_providers() -> Result<()> {
     Ok(())
 }
 
-async fn run_agent(args: &Args) -> Result<()> {
+async fn run_print(args: &Args, prompt: String) -> Result<()> {
     let mut cfg = Config::load()?;
     let mcp = std::mem::take(&mut cfg.mcp);
     let store = zarn_config::auth::KeyStore::shared();
     let profile_name = runtime::active_profile(&cfg, args.profile.as_deref());
-    let plan = runtime::plan(&cfg, store, &profile_name, args.model.as_deref())?;
+    let plan = runtime::plan(&cfg, &store, &profile_name, args.model.as_deref())?;
     if let Some(notice) = store.fallback_notice() {
         eprintln!("{notice}");
     }
@@ -227,25 +232,8 @@ async fn run_agent(args: &Args) -> Result<()> {
     let tools = rt.tools.clone();
     let system = Message::System(rt.system.clone());
 
-    let run_mode = args.run_mode();
-
-    match run_mode {
-        RunMode::Interactive | RunMode::ContinueLast | RunMode::ResumeSession(_) => {
-            let history = match &run_mode {
-                RunMode::ContinueLast => resume_messages(None)?,
-                RunMode::ResumeSession(id) => resume_messages(Some(id))?,
-                _ => vec![system],
-            };
-            let (prompt_sink, permissions) = zarn_tui::permission_channel();
-            let mut perms = Permissions::new(prompt_sink);
-            perms = perms.with_tools(cfg.permissions.clone());
-            let gate = Arc::new(perms);
-            let agent = Arc::new(
-                Agent::new(provider, tools, ctx, config).with_gate(gate),
-            );
-            zarn_tui::run(agent, history, permissions).await?;
-        }
-        RunMode::OneShot(prompt) => {
+    {
+        {
             let agent = Agent::new(provider, tools, ctx, config)
                 .with_gate(Arc::new(Permissions::headless().with_tools(cfg.permissions.clone())));
 

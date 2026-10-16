@@ -1,0 +1,12 @@
+╭ zarn settings · changes save as you go ──────────────────────────────────────────────────────────╮
+│Providers │ Models │ Skills │ MCP │ Agents │ Permissions │ General                                │
+│                                                                                                  │
+│› accent color          violet                                                                    │
+│  banner                on                                                                        │
+│  cost display          on                                                                        │
+│  ZARN.md token budget  8000                                                                      │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│↑↓ move · ←→ tab · enter change · esc close                                                       │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

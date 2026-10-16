@@ -4433,6 +4433,7 @@ dependencies = [
  "futures",
  "keyring",
  "regex",
+ "reqwest",
  "serde",
  "serde_json",
  "tempfile",
@@ -4521,7 +4522,9 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "zarn-config",
  "zarn-core",
+ "zarn-providers",
  "zarn-tools",
 ]
 

@@ -17,7 +17,42 @@ fn cwd() -> &'static str {
     })
 }
 
+pub const ACCENTS: &[(&str, Color)] = &[
+    ("violet", ACCENT),
+    ("blue", Color::Rgb(66, 135, 245)),
+    ("cyan", Color::Rgb(0, 200, 210)),
+    ("green", Color::Rgb(46, 204, 113)),
+    ("yellow", Color::Rgb(241, 196, 15)),
+    ("orange", Color::Rgb(255, 140, 0)),
+    ("red", Color::Rgb(231, 76, 60)),
+    ("magenta", Color::Rgb(232, 62, 140)),
+    ("white", Color::Rgb(230, 230, 230)),
+];
+
+pub fn accent(name: Option<&str>) -> Color {
+    let Some(name) = name.map(str::trim) else {
+        return ACCENT;
+    };
+    if let Some((_, color)) = ACCENTS.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
+        return *color;
+    }
+    parse_hex(name).unwrap_or(ACCENT)
+}
+
+pub fn parse_hex(text: &str) -> Option<Color> {
+    let hex = text.strip_prefix('#')?;
+    if hex.len() != 6 {
+        return None;
+    }
+    let channel = |i: usize| u8::from_str_radix(&hex[i..i + 2], 16).ok();
+    Some(Color::Rgb(channel(0)?, channel(2)?, channel(4)?))
+}
+
 pub fn header(model: &str) -> Vec<Line<'static>> {
+    header_in(model, ACCENT)
+}
+
+pub fn header_in(model: &str, accent: Color) -> Vec<Line<'static>> {
     let right = [
         format!("zarn {}", env!("CARGO_PKG_VERSION")),
         model.to_string(),
@@ -31,7 +66,7 @@ pub fn header(model: &str) -> Vec<Line<'static>> {
             Line::from(vec![
                 Span::styled(
                     (*art).to_string(),
-                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                    Style::default().fg(accent).add_modifier(Modifier::BOLD),
                 ),
                 Span::raw("   "),
                 Span::styled(text, Style::default().fg(Color::DarkGray)),
@@ -41,7 +76,11 @@ pub fn header(model: &str) -> Vec<Line<'static>> {
 }
 
 pub fn frame(tick: usize) -> Span<'static> {
-    Span::styled(FRAMES[tick % FRAMES.len()], Style::default().fg(ACCENT))
+    frame_in(tick, ACCENT)
+}
+
+pub fn frame_in(tick: usize, accent: Color) -> Span<'static> {
+    Span::styled(FRAMES[tick % FRAMES.len()], Style::default().fg(accent))
 }
 
 #[cfg(test)]
@@ -92,6 +131,14 @@ mod tests {
         let lines = header("m");
         assert_eq!(lines[0].spans[0].style.fg, Some(ACCENT));
         assert_ne!(lines[0].spans[2].style.fg, Some(ACCENT));
+    }
+
+    #[test]
+    fn accents_resolve_by_name_or_hex_and_default_to_violet() {
+        assert_eq!(accent(None), ACCENT);
+        assert_eq!(accent(Some("Cyan")), Color::Rgb(0, 200, 210));
+        assert_eq!(accent(Some("#0a0b0c")), Color::Rgb(10, 11, 12));
+        assert_eq!(accent(Some("nonsense")), ACCENT);
     }
 
     #[test]

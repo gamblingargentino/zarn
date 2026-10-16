@@ -1,4 +1,10 @@
+use crate::brand;
+use crate::onboarding::{self, Onboarding};
+use crate::popup::{self, Entry};
+use crate::settings::{self, Panel};
+use crate::widgets::{Edit, MaskedInput, Pick, Picker, Secret};
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::style::Color;
 use serde_json::Value;
 use tokio::sync::oneshot;
 use zarn_core::agent::AgentEvent;
@@ -62,11 +68,60 @@ pub struct Status {
     pub cost: f64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ChatPick {
+    Model,
+    Theme,
+    SwitchProvider,
+    Resume,
+    Login,
+    Logout,
+}
+
+#[derive(Debug)]
+pub enum Overlay {
+    Pick(Picker, ChatPick),
+    Secret {
+        input: MaskedInput,
+        provider: String,
+    },
+}
+
+#[derive(Default)]
+pub enum Mode {
+    #[default]
+    Chat,
+    Panel(Box<Panel>),
+    Onboarding(Box<Onboarding>),
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
     Submit(String),
+    Command(String),
     Cancel,
     Quit,
+    Panel(settings::Effect),
+    Onboard(onboarding::Effect),
+    Picked(ChatPick, String),
+    Login(String, Secret),
+}
+
+#[derive(Clone, Debug)]
+pub struct Theme {
+    pub accent: Color,
+    pub banner: bool,
+    pub show_cost: bool,
+}
+
+impl Default for Theme {
+    fn default() -> Self {
+        Theme {
+            accent: brand::ACCENT,
+            banner: true,
+            show_cost: true,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -81,6 +136,13 @@ pub struct App {
     pub tick: usize,
     pub pending: Option<PermissionRequest>,
     pub status: Status,
+    pub mode: Mode,
+    pub overlay: Option<Overlay>,
+    pub entries: Vec<Entry>,
+    pub popup_selected: usize,
+    pub popup_hidden: bool,
+    pub theme: Theme,
+    pub not_ready: Option<String>,
     ctrl_c_armed: bool,
 }
 
@@ -91,7 +153,140 @@ impl App {
                 model: model.into(),
                 ..Status::default()
             },
+            entries: popup::builtin_entries(),
             ..App::default()
+        }
+    }
+
+    pub fn popup_matches(&self) -> Vec<&Entry> {
+        match popup::query(&self.input) {
+            Some(q) => popup::filter(&self.entries, q),
+            None => Vec::new(),
+        }
+    }
+
+    pub fn popup_visible(&self) -> bool {
+        matches!(self.mode, Mode::Chat)
+            && self.overlay.is_none()
+            && self.pending.is_none()
+            && !self.popup_hidden
+            && !self.popup_matches().is_empty()
+    }
+
+    fn input_changed(&mut self) {
+        self.popup_selected = 0;
+        self.popup_hidden = false;
+    }
+
+    pub fn set_input(&mut self, text: impl Into<String>) {
+        self.input = text.into();
+        self.cursor = self.len();
+        self.input_changed();
+    }
+
+    pub fn paste(&mut self, text: &str) {
+        match &mut self.mode {
+            Mode::Panel(panel) => return panel.paste(text),
+            Mode::Onboarding(flow) => return flow.paste(text),
+            Mode::Chat => {}
+        }
+        match &mut self.overlay {
+            Some(Overlay::Secret { input, .. }) => input.paste(text),
+            Some(Overlay::Pick(picker, _)) => picker.filter.paste(text),
+            None if self.pending.is_none() => {
+                for c in text.chars().filter(|c| *c != '\r') {
+                    self.insert(c);
+                }
+            }
+            None => {}
+        }
+    }
+
+    fn on_overlay_key(&mut self, overlay: Overlay, key: KeyEvent) -> Option<Action> {
+        match overlay {
+            Overlay::Pick(mut picker, purpose) => match picker.on_key(key) {
+                Pick::Cancel => None,
+                Pick::Pending => {
+                    self.overlay = Some(Overlay::Pick(picker, purpose));
+                    None
+                }
+                Pick::Chosen(value) | Pick::Custom(value) => Some(Action::Picked(purpose, value)),
+            },
+            Overlay::Secret {
+                mut input,
+                provider,
+            } => match input.on_key(key) {
+                Edit::Cancel => {
+                    self.notice("login cancelled; no key was changed");
+                    None
+                }
+                Edit::Submit => {
+                    let value = input.take();
+                    if value.is_empty() {
+                        self.overlay = Some(Overlay::Secret { input, provider });
+                        return None;
+                    }
+                    Some(Action::Login(provider, Secret::new(value)))
+                }
+                _ => {
+                    self.overlay = Some(Overlay::Secret { input, provider });
+                    None
+                }
+            },
+        }
+    }
+
+    fn on_popup_key(&mut self, key: KeyEvent) -> Option<Option<Action>> {
+        if !self.popup_visible() {
+            return None;
+        }
+        let shown = self.popup_matches().len();
+        let chosen = self
+            .popup_matches()
+            .get(self.popup_selected.min(shown.saturating_sub(1)))
+            .map(|e| e.name.clone());
+        match key.code {
+            KeyCode::Up => {
+                self.popup_selected = self.popup_selected.saturating_sub(1);
+                Some(None)
+            }
+            KeyCode::Down => {
+                self.popup_selected = (self.popup_selected + 1).min(shown.saturating_sub(1));
+                Some(None)
+            }
+            KeyCode::Esc => {
+                self.popup_hidden = true;
+                Some(None)
+            }
+            KeyCode::Tab => {
+                if let Some(name) = chosen {
+                    self.set_input(format!("/{name} "));
+                    self.popup_hidden = true;
+                }
+                Some(None)
+            }
+            KeyCode::Enter if !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
+                let name = chosen?;
+                let line = format!("/{name}");
+                self.set_input("");
+                Some(self.submit_line(line))
+            }
+            _ => None,
+        }
+    }
+
+    fn submit_line(&mut self, text: String) -> Option<Action> {
+        self.history.push(text.clone());
+        self.history_pos = None;
+        self.input.clear();
+        self.cursor = 0;
+        self.input_changed();
+        self.blocks.push(Block::User(text.clone()));
+        self.scroll_up = 0;
+        if text.starts_with('/') && popup::split(&text).is_some() {
+            Some(Action::Command(text))
+        } else {
+            Some(Action::Submit(text))
         }
     }
 
@@ -176,18 +371,38 @@ impl App {
             self.ctrl_c_armed = false;
         }
 
+        if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if self.ctrl_c_armed {
+                return Some(Action::Quit);
+            }
+            self.ctrl_c_armed = true;
+            match &mut self.mode {
+                Mode::Panel(_) => return Some(Action::Panel(settings::Effect::Close)),
+                Mode::Onboarding(_) => {}
+                Mode::Chat => self.notice("press ctrl+c again to exit"),
+            }
+            return None;
+        }
+
         if self.pending.is_some() {
             return self.on_permission_key(key);
         }
 
+        match &mut self.mode {
+            Mode::Panel(panel) => return panel.on_key(key).map(Action::Panel),
+            Mode::Onboarding(flow) => return flow.on_key(key).map(Action::Onboard),
+            Mode::Chat => {}
+        }
+
+        if let Some(overlay) = self.overlay.take() {
+            return self.on_overlay_key(overlay, key);
+        }
+
+        if let Some(action) = self.on_popup_key(key) {
+            return action;
+        }
+
         match (key.code, key.modifiers) {
-            (KeyCode::Char('c'), m) if m.contains(KeyModifiers::CONTROL) => {
-                if self.ctrl_c_armed {
-                    return Some(Action::Quit);
-                }
-                self.ctrl_c_armed = true;
-                self.notice("press ctrl+c again to exit");
-            }
             (KeyCode::Char('r'), m) if m.contains(KeyModifiers::CONTROL) => {
                 self.expand_last_output()
             }
@@ -204,13 +419,7 @@ impl App {
             (KeyCode::Enter, _) => {
                 let text = self.input.trim().to_string();
                 if !text.is_empty() {
-                    self.history.push(text.clone());
-                    self.history_pos = None;
-                    self.input.clear();
-                    self.cursor = 0;
-                    self.blocks.push(Block::User(text.clone()));
-                    self.scroll_up = 0;
-                    return Some(Action::Submit(text));
+                    return self.submit_line(text);
                 }
             }
             (KeyCode::Backspace, _) => {
@@ -218,12 +427,14 @@ impl App {
                     let at = self.byte_at(self.cursor - 1);
                     self.input.remove(at);
                     self.cursor -= 1;
+                    self.input_changed();
                 }
             }
             (KeyCode::Delete, _) => {
                 if self.cursor < self.len() {
                     let at = self.byte_at(self.cursor);
                     self.input.remove(at);
+                    self.input_changed();
                 }
             }
             (KeyCode::Left, _) => self.cursor = self.cursor.saturating_sub(1),
@@ -269,6 +480,7 @@ impl App {
         let at = self.byte_at(self.cursor);
         self.input.insert(at, c);
         self.cursor += 1;
+        self.input_changed();
     }
 
     fn recall(&mut self, delta: i32) {
@@ -287,6 +499,7 @@ impl App {
         self.history_pos = next;
         self.input = next.map(|i| self.history[i].clone()).unwrap_or_default();
         self.cursor = self.len();
+        self.popup_hidden = true;
     }
 }
 
