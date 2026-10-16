@@ -509,10 +509,10 @@ fn key_shapes() -> &'static Regex {
     static SHAPES: OnceLock<Regex> = OnceLock::new();
     SHAPES.get_or_init(|| {
         Regex::new(concat!(
-            r"sk-ant-[A-Za-z0-9_\-]{16,}",
-            r"|sk-[A-Za-z0-9_\-]{20,}",
-            r"|AIza[0-9A-Za-z_\-]{30,}",
-            r"|gsk_[A-Za-z0-9]{20,}",
+            r"\bsk-ant-[A-Za-z0-9_\-]{16,}",
+            r"|\bsk-[A-Za-z0-9_\-]{20,}",
+            r"|\bAIza[0-9A-Za-z_\-]{30,}",
+            r"|\bgsk_[A-Za-z0-9]{20,}",
             r"|(?i:bearer)\s+[A-Za-z0-9._\-]{20,}",
         ))
         .expect("static redaction pattern")
@@ -549,6 +549,12 @@ mod tests {
         assert!(!out.contains("test-key-not-real-redact-me"));
         assert!(!out.contains("sk-test-key-not-real-abcdefgh"));
         assert_eq!(out.matches(REDACTED).count(), 2);
+    }
+
+    #[test]
+    fn ordinary_words_ending_in_sk_are_left_alone() {
+        let text = "a risk-based-permission-defaults-policy and a disk-cache-eviction-strategy";
+        assert_eq!(redact(text), text);
     }
 
     #[test]
