@@ -7,34 +7,38 @@ pub struct Args {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    #[arg(long, value_name = "PROMPT")]
+    #[arg(long, value_name = "PROMPT", help = "Run one turn and print to stdout")]
     pub print: Option<String>,
 
-    #[arg(long)]
+    #[arg(long = "continue", help = "Resume the most recent session for this directory")]
     pub continue_session: bool,
 
-    #[arg(long, value_name = "ID")]
+    #[arg(long, value_name = "ID", help = "Resume a specific session by id")]
     pub resume: Option<String>,
 
-    #[arg(long, value_name = "MODEL")]
+    #[arg(long, value_name = "MODEL", help = "Override the profile's model")]
     pub model: Option<String>,
 
-    #[arg(long, value_name = "PROFILE")]
+    #[arg(long, value_name = "PROFILE", help = "Use this profile instead of 'default'")]
     pub profile: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Create or inspect the configuration
     Config {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// List configured providers and whether they are reachable
     Providers,
 }
 
 #[derive(Subcommand, Debug)]
 pub enum ConfigAction {
+    /// Write a starter config
     Init,
+    /// Validate the config and show the resolved values
     Check,
 }
 
