@@ -16,6 +16,8 @@ use zarn_core::tools::Risk;
 use zarn_core::types::{Message, StopReason};
 use zarn_tools::permissions::{Answer, PermissionPrompt};
 
+const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(140);
+
 pub struct TuiPrompt {
     tx: mpsc::Sender<PermissionRequest>,
 }
@@ -79,11 +81,13 @@ async fn event_loop(
     let (ui_tx, mut ui_rx) = mpsc::channel::<UiEvent>(256);
     let mut keys = EventStream::new();
     let mut cancel = CancellationToken::new();
+    let mut frames = tokio::time::interval(FRAME_INTERVAL);
 
     loop {
         terminal.draw(|frame| render::draw(frame, &app))?;
 
         tokio::select! {
+            _ = frames.tick(), if app.streaming => app.advance_frame(),
             key = keys.next() => {
                 let Some(Ok(event)) = key else { continue };
                 let TermEvent::Key(key) = event else { continue };

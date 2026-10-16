@@ -1,3 +1,4 @@
+pub mod brand;
 pub mod markdown;
 pub mod render;
 pub mod run;

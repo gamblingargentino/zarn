@@ -1,3 +1,4 @@
+use crate::brand;
 use crate::markdown;
 use crate::state::{App, Block, CardStatus, COLLAPSED_LINES, ToolCard};
 use ratatui::Frame;
@@ -24,7 +25,8 @@ pub fn draw(frame: &mut Frame, app: &App) {
 }
 
 fn scrollback(frame: &mut Frame, app: &App, area: Rect) {
-    let mut lines = Vec::new();
+    let mut lines = brand::header(&app.status.model);
+    lines.push(Line::raw(""));
     for block in &app.blocks {
         lines.extend(block_lines(block));
         lines.push(Line::raw(""));
@@ -185,19 +187,23 @@ fn status(frame: &mut Frame, app: &App, area: Rect) {
         parts.insert(2, format!("{} cached", compact(app.status.cached_tokens)));
     }
     if app.streaming {
-        parts.push("streaming — esc to cancel".to_string());
+        parts.push("esc to cancel".to_string());
     }
     if app.scroll_up > 0 {
         parts.push(format!("scrolled {}", app.scroll_up));
     }
 
-    frame.render_widget(
-        Paragraph::new(Line::styled(
-            parts.join("  ·  "),
-            Style::default().fg(Color::DarkGray),
-        )),
-        area,
-    );
+    let mut spans = Vec::new();
+    if app.streaming {
+        spans.push(brand::frame(app.tick));
+        spans.push(Span::raw(" "));
+    }
+    spans.push(Span::styled(
+        parts.join("  ·  "),
+        Style::default().fg(Color::DarkGray),
+    ));
+
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
 fn compact(n: u64) -> String {

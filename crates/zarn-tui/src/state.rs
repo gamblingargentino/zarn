@@ -78,6 +78,7 @@ pub struct App {
     pub history_pos: Option<usize>,
     pub scroll_up: u16,
     pub streaming: bool,
+    pub tick: usize,
     pub pending: Option<PermissionRequest>,
     pub status: Status,
     ctrl_c_armed: bool,
@@ -92,6 +93,10 @@ impl App {
             },
             ..App::default()
         }
+    }
+
+    pub fn advance_frame(&mut self) {
+        self.tick = self.tick.wrapping_add(1);
     }
 
     pub fn notice(&mut self, text: impl Into<String>) {

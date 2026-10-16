@@ -353,3 +353,36 @@ fn narrow_width_with_multiline_user_message() {
     assert!(text.contains("First line"));
     assert!(text.contains("Second line"));
 }
+
+#[test]
+fn the_banner_is_painted_on_a_fresh_session() {
+    let app = App::new("claude-sonnet-5");
+    let output = render_app(80, 24, &app);
+    let joined = output.join("\n");
+
+    for row in zarn_tui::brand::MARK {
+        assert!(joined.contains(row.trim_end()), "missing mark row {row:?}");
+    }
+    assert!(joined.contains("claude-sonnet-5"));
+    assert!(joined.contains(env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
+fn the_status_icon_only_appears_while_streaming_and_changes_per_tick() {
+    let mut app = App::new("m");
+    let idle = render_app(80, 24, &app);
+    let status_row = idle.len() - 4;
+    assert!(!idle[status_row].starts_with(zarn_tui::brand::FRAMES[0]));
+
+    app.streaming = true;
+    let first = render_app(80, 24, &app);
+    assert!(
+        first[status_row].starts_with(zarn_tui::brand::FRAMES[0]),
+        "{:?}",
+        first[status_row]
+    );
+
+    app.advance_frame();
+    let second = render_app(80, 24, &app);
+    assert_ne!(first[status_row], second[status_row]);
+}
