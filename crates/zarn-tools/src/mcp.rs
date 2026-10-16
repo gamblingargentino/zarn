@@ -4,7 +4,7 @@ use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,16 +21,16 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct ServerConfig {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    #[serde(default)]
-    pub headers: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
 }
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
@@ -71,7 +71,7 @@ enum Transport {
     Http {
         client: reqwest::Client,
         url: String,
-        headers: HashMap<String, String>,
+        headers: BTreeMap<String, String>,
     },
 }
 
@@ -357,37 +357,71 @@ fn render_result(result: &Value) -> ToolOutput {
     }
 }
 
-pub async fn connect_all(servers: &HashMap<String, ServerConfig>) -> Vec<Box<dyn Tool>> {
+pub struct McpServer {
+    name: String,
+    client: Arc<McpClient>,
+    specs: Vec<ToolSpec>,
+}
+
+impl McpServer {
+    pub async fn start(name: &str, config: &ServerConfig) -> Result<Self> {
+        let client = McpClient::connect(name, config).await?;
+        match client.list_tools().await {
+            Ok(specs) => Ok(McpServer {
+                name: name.to_string(),
+                client,
+                specs,
+            }),
+            Err(err) => {
+                client.shutdown().await;
+                Err(err)
+            }
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn tool_names(&self) -> Vec<String> {
+        self.specs
+            .iter()
+            .map(|spec| namespaced(&self.name, &spec.name))
+            .collect()
+    }
+
+    pub fn tools(&self) -> Vec<Box<dyn Tool>> {
+        self.specs
+            .iter()
+            .map(|spec| {
+                Box::new(McpTool {
+                    client: self.client.clone(),
+                    remote_name: spec.name.clone(),
+                    spec: ToolSpec {
+                        name: namespaced(&self.name, &spec.name),
+                        ..spec.clone()
+                    },
+                }) as Box<dyn Tool>
+            })
+            .collect()
+    }
+
+    pub async fn shutdown(&self) {
+        self.client.shutdown().await;
+    }
+}
+
+pub async fn connect_all<'a>(
+    servers: impl IntoIterator<Item = (&'a String, &'a ServerConfig)>,
+) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = Vec::new();
 
     for (name, config) in servers {
-        let client = match McpClient::connect(name, config).await {
-            Ok(client) => client,
+        match McpServer::start(name, config).await {
+            Ok(server) => tools.extend(server.tools()),
             Err(err) => {
                 tracing::warn!(server = %name, %err, "mcp server unavailable, skipping");
-                continue;
             }
-        };
-
-        let listed = match client.list_tools().await {
-            Ok(listed) => listed,
-            Err(err) => {
-                tracing::warn!(server = %name, %err, "mcp server listed no tools, skipping");
-                client.shutdown().await;
-                continue;
-            }
-        };
-
-        for spec in listed {
-            let remote_name = spec.name.clone();
-            tools.push(Box::new(McpTool {
-                client: client.clone(),
-                remote_name: remote_name.clone(),
-                spec: ToolSpec {
-                    name: namespaced(name, &remote_name),
-                    ..spec
-                },
-            }));
         }
     }
 

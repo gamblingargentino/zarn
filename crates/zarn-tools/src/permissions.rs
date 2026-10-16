@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use zarn_core::agent::{GateDecision, ToolGate};
 use zarn_core::tools::Risk;
 
@@ -37,7 +37,7 @@ impl PermissionPrompt for DenyAll {
 }
 
 pub struct Permissions {
-    configured: HashMap<String, Policy>,
+    configured: RwLock<HashMap<String, Policy>>,
     by_risk: HashMap<Risk, Policy>,
     session: Mutex<HashMap<String, Policy>>,
     prompt: Arc<dyn PermissionPrompt>,
@@ -51,7 +51,7 @@ impl Permissions {
             (Risk::Execute, Policy::Ask),
         ]);
         Permissions {
-            configured: HashMap::new(),
+            configured: RwLock::new(HashMap::new()),
             by_risk,
             session: Mutex::new(HashMap::new()),
             prompt,
@@ -62,14 +62,24 @@ impl Permissions {
         Self::new(Arc::new(DenyAll))
     }
 
-    pub fn with_tool(mut self, name: impl Into<String>, policy: Policy) -> Self {
-        self.configured.insert(name.into(), policy);
+    pub fn with_tool(self, name: impl Into<String>, policy: Policy) -> Self {
+        if let Ok(mut configured) = self.configured.write() {
+            configured.insert(name.into(), policy);
+        }
         self
     }
 
-    pub fn with_tools(mut self, policies: HashMap<String, Policy>) -> Self {
-        self.configured.extend(policies);
+    pub fn with_tools(self, policies: impl IntoIterator<Item = (String, Policy)>) -> Self {
+        if let Ok(mut configured) = self.configured.write() {
+            configured.extend(policies);
+        }
         self
+    }
+
+    pub fn set_policies(&self, policies: impl IntoIterator<Item = (String, Policy)>) {
+        if let Ok(mut configured) = self.configured.write() {
+            *configured = policies.into_iter().collect();
+        }
     }
 
     pub fn with_risk(mut self, risk: Risk, policy: Policy) -> Self {
@@ -84,13 +94,21 @@ impl Permissions {
     }
 
     pub fn policy_for(&self, name: &str, risk: Risk) -> Policy {
+        let configured = self
+            .configured
+            .read()
+            .ok()
+            .and_then(|c| c.get(name).copied());
+        if configured == Some(Policy::Deny) {
+            return Policy::Deny;
+        }
         if let Ok(session) = self.session.lock()
             && let Some(policy) = session.get(name)
         {
             return *policy;
         }
-        if let Some(policy) = self.configured.get(name) {
-            return *policy;
+        if let Some(policy) = configured {
+            return policy;
         }
         self.by_risk.get(&risk).copied().unwrap_or(Policy::Ask)
     }
@@ -134,6 +152,21 @@ mod tests {
         let perms = Permissions::headless();
         assert_eq!(perms.policy_for("read", Risk::Safe), Policy::Allow);
         assert_eq!(perms.policy_for("bash", Risk::Execute), Policy::Ask);
+    }
+
+    #[test]
+    fn policies_can_be_replaced_while_running() {
+        let perms = Permissions::headless().with_tool("bash", Policy::Deny);
+        perms.set_policies([("bash".to_string(), Policy::Allow)]);
+        assert_eq!(perms.policy_for("bash", Risk::Execute), Policy::Allow);
+    }
+
+    #[tokio::test]
+    async fn a_later_deny_beats_an_earlier_always() {
+        let perms = Permissions::new(Arc::new(AlwaysYes));
+        perms.check("bash", Risk::Execute, &Value::Null).await;
+        perms.set_policies([("bash".to_string(), Policy::Deny)]);
+        assert_eq!(perms.policy_for("bash", Risk::Execute), Policy::Deny);
     }
 
     #[test]

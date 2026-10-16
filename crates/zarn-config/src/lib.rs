@@ -1,11 +1,15 @@
+pub mod agents;
 pub mod auth;
+pub mod catalog;
 pub mod guard;
+pub mod layers;
+pub mod ops;
 pub mod paths;
 
 use anyhow::{Context, Result, bail};
 use auth::{KeySource, KeyStore};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use zarn_providers::ProviderSpec;
 use zarn_tools::mcp::ServerConfig;
@@ -15,12 +19,48 @@ pub const LOCAL_PATH: &str = ".zarn/config.toml";
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ProfileSpec {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct General {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accent: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banner: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub show_cost: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_budget: Option<u32>,
+}
+
+impl General {
+    fn fill_from(&mut self, other: General) {
+        self.default_profile = self.default_profile.take().or(other.default_profile);
+        self.accent = self.accent.take().or(other.accent);
+        self.banner = self.banner.or(other.banner);
+        self.show_cost = self.show_cost.or(other.show_cost);
+        self.context_budget = self.context_budget.or(other.context_budget);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        *self == General::default()
+    }
+
+    pub fn banner(&self) -> bool {
+        self.banner.unwrap_or(true)
+    }
+
+    pub fn show_cost(&self) -> bool {
+        self.show_cost.unwrap_or(true)
+    }
 }
 
 impl ProfileSpec {
@@ -49,18 +89,26 @@ fn fill_provider(into: &mut ProviderSpec, from: ProviderSpec) {
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Config {
-    #[serde(default)]
-    pub providers: HashMap<String, ProviderSpec>,
-    #[serde(default)]
-    pub profiles: HashMap<String, ProfileSpec>,
-    #[serde(default)]
-    pub permissions: HashMap<String, Policy>,
-    #[serde(default)]
-    pub mcp: HashMap<String, ServerConfig>,
+    #[serde(default, skip_serializing_if = "General::is_empty")]
+    pub general: General,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, ProviderSpec>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub profiles: BTreeMap<String, ProfileSpec>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub permissions: BTreeMap<String, Policy>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub skills: BTreeMap<String, bool>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub mcp: BTreeMap<String, ServerConfig>,
 }
 
 impl Config {
     pub fn merge(&mut self, other: Config) {
+        self.general.fill_from(other.general);
+        for (name, enabled) in other.skills {
+            self.skills.entry(name).or_insert(enabled);
+        }
         for (name, spec) in other.providers {
             match self.providers.get_mut(&name) {
                 Some(existing) => fill_provider(existing, spec),
@@ -176,6 +224,29 @@ impl Config {
                 Ok(resolved)
             })
             .collect()
+    }
+
+    pub fn skill_enabled(&self, name: &str) -> bool {
+        self.skills.get(name).copied().unwrap_or(true)
+    }
+
+    pub fn default_profile(&self) -> String {
+        self.general
+            .default_profile
+            .clone()
+            .unwrap_or_else(|| "default".to_string())
+    }
+
+    pub fn has_provider(&self) -> bool {
+        !self.providers.is_empty()
+    }
+
+    pub fn to_toml(&self) -> Result<String> {
+        let mut clean = self.clone();
+        for spec in clean.providers.values_mut() {
+            spec.api_key = None;
+        }
+        Ok(toml::to_string_pretty(&clean)?)
     }
 
     pub fn starter() -> &'static str {

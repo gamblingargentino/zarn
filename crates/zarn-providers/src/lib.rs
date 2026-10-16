@@ -19,7 +19,6 @@ pub use exec::ExecProvider;
 pub use llamacpp::LlamaCppProvider;
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 use zarn_core::prompted::PromptedProvider;
 use zarn_core::provider::{Caps, Provider, ProviderError, ToolSupport};
@@ -27,23 +26,23 @@ use zarn_core::provider::{Caps, Provider, ProviderError, ToolSupport};
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct ProviderSpec {
     pub kind: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub api_key: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output: Option<u32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<String>,
     #[serde(flatten)]
     #[serde(default)]
-    pub extra: HashMap<String, String>,
+    pub extra: std::collections::BTreeMap<String, String>,
 }
 
 impl ProviderSpec {
