@@ -6,8 +6,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
-use zarn_config::Config;
-use zarn_core::agent::{Agent, AgentConfig, AgentEvent};
+use zarn_config::{Config, runtime};
+use zarn_core::agent::{Agent, AgentEvent};
 use zarn_core::provider::Event;
 use zarn_core::session;
 use zarn_core::tools::Ctx;
@@ -212,38 +212,20 @@ async fn run_agent(args: &Args) -> Result<()> {
     let mut cfg = Config::load()?;
     let mcp = std::mem::take(&mut cfg.mcp);
     let store = zarn_config::auth::KeyStore::shared();
-
-    let profile_name = args.profile
-        .clone()
-        .or_else(|| std::env::var("ZARN_PROFILE").ok())
-        .unwrap_or_else(|| "default".to_string());
-
-    if !cfg.profiles.contains_key(&profile_name) {
-        bail!("no provider is configured for profile '{profile_name}'. Run `zarn` for guided setup, or `zarn providers add`.");
-    }
-    let specs = cfg.chain_for(store, &profile_name)?;
+    let profile_name = runtime::active_profile(&cfg, args.profile.as_deref());
+    let plan = runtime::plan(&cfg, store, &profile_name, args.model.as_deref())?;
     if let Some(notice) = store.fallback_notice() {
         eprintln!("{notice}");
     }
-    let provider = zarn_config::guard::guarded_chain(&specs)?;
-    let model = args.model
-        .clone()
-        .or_else(|| cfg.profiles[&profile_name].model.clone())
-        .or_else(|| std::env::var("ZARN_MODEL").ok())
-        .context("no model is set for this profile; pass --model or run `zarn` to pick one")?;
 
-    let mut tools: Vec<Box<dyn zarn_core::tools::Tool>> = Vec::new();
-    tools.extend(zarn_tools::mcp::connect_all(&mcp).await);
-    let mut registry = zarn_config::guard::guard_registry(tools);
-    for tool in zarn_tools::builtin_list() {
-        registry.register(zarn_config::guard::redacting(tool));
-    }
-    let tools = Arc::new(registry);
-    let ctx = Arc::new(Ctx::new(std::env::current_dir()?));
-    let config = AgentConfig {
-        model,
-        ..AgentConfig::default()
-    };
+    let cwd = std::env::current_dir()?;
+    let ctx = Arc::new(Ctx::new(&cwd));
+    let mcp_tools = zarn_tools::mcp::connect_all(&mcp).await;
+    let rt = runtime::assemble(&cfg, plan, &cwd, ctx.clone(), mcp_tools)?;
+    let config = rt.agent_config();
+    let provider = rt.provider.clone();
+    let tools = rt.tools.clone();
+    let system = Message::System(rt.system.clone());
 
     let run_mode = args.run_mode();
 
@@ -252,11 +234,11 @@ async fn run_agent(args: &Args) -> Result<()> {
             let history = match &run_mode {
                 RunMode::ContinueLast => resume_messages(None)?,
                 RunMode::ResumeSession(id) => resume_messages(Some(id))?,
-                _ => Vec::new(),
+                _ => vec![system],
             };
             let (prompt_sink, permissions) = zarn_tui::permission_channel();
             let mut perms = Permissions::new(prompt_sink);
-            perms = perms.with_tools(cfg.permissions);
+            perms = perms.with_tools(cfg.permissions.clone());
             let gate = Arc::new(perms);
             let agent = Arc::new(
                 Agent::new(provider, tools, ctx, config).with_gate(gate),
@@ -265,7 +247,7 @@ async fn run_agent(args: &Args) -> Result<()> {
         }
         RunMode::OneShot(prompt) => {
             let agent = Agent::new(provider, tools, ctx, config)
-                .with_gate(Arc::new(Permissions::headless().with_tools(cfg.permissions)));
+                .with_gate(Arc::new(Permissions::headless().with_tools(cfg.permissions.clone())));
 
             let (tx, mut rx) = tokio::sync::mpsc::channel(256);
             let printer = tokio::spawn(async move {
@@ -291,7 +273,7 @@ async fn run_agent(args: &Args) -> Result<()> {
             });
 
             let cancel = CancellationToken::new();
-            let mut messages = vec![Message::user(&prompt)];
+            let mut messages = vec![system, Message::user(&prompt)];
             let result = agent.run(&mut messages, &tx, &cancel).await;
             drop(tx);
             let _ = printer.await;

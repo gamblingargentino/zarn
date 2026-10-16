@@ -1,10 +1,12 @@
 pub mod agents;
 pub mod auth;
 pub mod catalog;
+pub mod context;
 pub mod guard;
 pub mod layers;
 pub mod ops;
 pub mod paths;
+pub mod runtime;
 
 use anyhow::{Context, Result, bail};
 use auth::{KeySource, KeyStore};

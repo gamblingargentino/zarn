@@ -6,6 +6,7 @@ pub mod mcp;
 pub mod permissions;
 pub mod read;
 pub mod search;
+pub mod skill;
 pub mod write;
 
 use zarn_core::tools::{Tool, ToolRegistry};
