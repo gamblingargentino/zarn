@@ -70,7 +70,7 @@ fn scrollback(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::raw(""));
     }
     if let Some(request) = &app.pending {
-        lines.extend(permission_lines(&request.tool, &request.args));
+        lines.extend(permission_lines(request, app.pending_expanded));
     }
 
     let width = area.width.max(1) as usize;
@@ -280,22 +280,82 @@ fn truncate(text: &str, max: usize) -> String {
     format!("{kept}…")
 }
 
-fn permission_lines(tool: &str, args: &Value) -> Vec<Line<'static>> {
+pub const PREVIEW_LINES: usize = 30;
+
+fn diff_lines(preview: &zarn_tools::diff::Preview, expanded: bool) -> Vec<Line<'static>> {
+    use zarn_tools::diff::DiffLine;
+    let width = preview
+        .lines
+        .iter()
+        .map(|l| match l {
+            DiffLine::Context { old, new, .. } => (*old).max(*new),
+            DiffLine::Added { new, .. } => *new,
+            DiffLine::Removed { old, .. } => *old,
+            DiffLine::Hunk(_) => 0,
+        })
+        .max()
+        .unwrap_or(0)
+        .to_string()
+        .len();
+    let total = preview.lines.len();
+    let shown = if expanded { total } else { total.min(PREVIEW_LINES) };
+    let mut lines: Vec<Line<'static>> = preview.lines[..shown]
+        .iter()
+        .map(|line| match line {
+            DiffLine::Hunk(text) => Line::styled(format!("  {text}"), Style::default().fg(Color::Cyan)),
+            DiffLine::Context { new, text, .. } => Line::styled(
+                format!("  {new:>width$}   {text}"),
+                Style::default().fg(Color::DarkGray),
+            ),
+            DiffLine::Added { new, text } => Line::styled(
+                format!("  {new:>width$} + {text}"),
+                Style::default().fg(Color::Green),
+            ),
+            DiffLine::Removed { old, text } => Line::styled(
+                format!("  {old:>width$} - {text}"),
+                Style::default().fg(Color::Red),
+            ),
+        })
+        .collect();
+    if shown < total {
+        lines.push(Line::styled(
+            format!("  … {} more diff lines ([e] expands)", total - shown),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
+    lines
+}
+
+fn permission_lines(request: &crate::state::PermissionRequest, expanded: bool) -> Vec<Line<'static>> {
+    let warn = Style::default().fg(Color::Yellow);
+    let title = match &request.preview {
+        Some(p) if p.new_file => format!("new file {} ({})", p.path, p.summary()),
+        Some(p) => format!("{} ({})", p.path, p.summary()),
+        None => "wants to run".to_string(),
+    };
     let mut lines = vec![Line::from(vec![
         Span::styled(
-            format!("{tool} "),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
+            format!("{} ", request.tool),
+            warn.add_modifier(Modifier::BOLD),
         ),
-        Span::styled("wants to run", Style::default().fg(Color::Yellow)),
+        Span::styled(title, warn),
     ])];
-    for (key, value) in key_args(args) {
-        lines.push(Line::raw(format!("  {key}: {value}")));
+    match &request.preview {
+        Some(preview) => lines.extend(diff_lines(preview, expanded)),
+        None => {
+            for (key, value) in key_args(&request.args) {
+                lines.push(Line::raw(format!("  {key}: {value}")));
+            }
+        }
     }
     lines.push(Line::styled(
-        "  [y] once   [a] always   [n] no",
-        Style::default().fg(Color::Yellow),
+        format!("  [y] once   [a] allow {} for this session", request.pattern),
+        warn,
+    ));
+    let expand = if request.preview.is_some() { "   [e] expand" } else { "" };
+    lines.push(Line::styled(
+        format!("  [p] save that rule to the project   [u] save it to the user config{expand}   [n] no"),
+        warn,
     ));
     lines
 }

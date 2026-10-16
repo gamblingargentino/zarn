@@ -118,6 +118,7 @@ async fn run_command(command: &Command) -> Result<()> {
             }) => commands::mcp_add(name, *project, target),
             Some(McpAction::Remove { name }) => commands::mcp_remove(name),
         },
+        Command::Hooks { .. } => commands::hooks_list(),
         Command::Models { provider, refresh } => commands::models(provider.as_deref(), *refresh).await,
         Command::Limits { session, day } => commands::limits(session.as_deref(), day.as_deref()),
         Command::Modes { action } => match action {
@@ -190,11 +191,28 @@ async fn run_print(args: &Args, prompt: String) -> Result<()> {
             approver: Some(Arc::new(zarn_tools::exit_plan::Unattended)),
         },
     )?;
-    let gate = Permissions::headless()
-        .with_tools(cfg.permissions.clone())
-        .with_overlay(overlay);
+    let gate = Permissions::headless().with_overlay(overlay);
+    for err in cfg.apply_permissions(&gate, &cwd) {
+        eprintln!("permission rule ignored: {err}");
+    }
+    let hooks = Arc::new(std::sync::RwLock::new(cfg.hooks.clone()));
     let agent = Agent::new(rt.provider.clone(), rt.tools.clone(), ctx, rt.agent_config())
-        .with_gate(Arc::new(gate));
+        .with_gate(Arc::new(zarn_config::hooks::HookedGate::new(
+            Arc::new(gate),
+            hooks,
+            cwd.clone(),
+        )));
+    let blocked = zarn_config::hooks::fire(
+        &cfg.hooks,
+        "prompt_submit",
+        None,
+        serde_json::json!({ "prompt": prompt }),
+        &cwd,
+    )
+    .await;
+    if let Some(outcome) = blocked.iter().find(|o| !o.ok()) {
+        bail!("prompt blocked by a prompt_submit hook: {}", outcome.reason());
+    }
 
     let limits = cfg.limits;
     let ledger = zarn_config::spend::Ledger::system();
@@ -211,11 +229,31 @@ async fn run_print(args: &Args, prompt: String) -> Result<()> {
 
     let cancel = CancellationToken::new();
     let stop = cancel.clone();
+    let post_hooks = cfg.hooks.clone();
+    let hook_cwd = cwd.clone();
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
     let printer = tokio::spawn(async move {
         let mut out = std::io::stdout();
         let mut stopped = false;
+        let mut started: std::collections::HashMap<String, serde_json::Value> = Default::default();
         while let Some(event) = rx.recv().await {
+            if let AgentEvent::ToolStarted { id, args, .. } = &event {
+                started.insert(id.clone(), args.clone());
+            }
+            if let AgentEvent::ToolFinished { id, name, output } = &event
+                && !post_hooks.post_tool.is_empty()
+            {
+                let payload = serde_json::json!({
+                    "args": started.get(id).cloned().unwrap_or_default(),
+                    "output": output.content,
+                    "is_error": output.is_error
+                });
+                for outcome in zarn_config::hooks::fire(&post_hooks, "post_tool", Some(name), payload, &hook_cwd).await {
+                    if !outcome.ok() {
+                        eprintln!("post_tool hook: {}", outcome.reason());
+                    }
+                }
+            }
             if let AgentEvent::Provider(event) = &event {
                 tracker.observe(event);
                 if priced && !stopped && matches!(event, Event::Usage { .. }) {
@@ -258,6 +296,19 @@ async fn run_print(args: &Args, prompt: String) -> Result<()> {
     let mut messages = vec![Message::System(rt.system.clone()), Message::user(&prompt)];
     let result = agent.run(&mut messages, &tx, &cancel).await;
     drop(tx);
+    for outcome in zarn_config::hooks::fire(
+        &cfg.hooks,
+        "turn_end",
+        None,
+        serde_json::json!({ "messages": messages.len() }),
+        &cwd,
+    )
+    .await
+    {
+        if !outcome.ok() {
+            eprintln!("turn_end hook: {}", outcome.reason());
+        }
+    }
     if let Ok(tracker) = printer.await
         && let Some(usd) = tracker.total().usd
         && let Err(err) = ledger.add(usd)

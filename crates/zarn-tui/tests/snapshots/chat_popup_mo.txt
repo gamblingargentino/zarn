@@ -1,12 +1,12 @@
 
-
 ╭──────────────────────────────────────────────────────────────────────╮
-│› /model  pick a model, or set one directly                           │
-│  /models list each provider's models, rate limits and credit         │
-│  /mode   pick a mode, or switch: default, plan, accept-edits, bypass,│
-│  /logout remove a provider's API key                                 │
-│  /init   have the model inspect the repo and write ZARN.md           │
-│  /status show profile, model, provider, cwd and session              │
+│› /model       pick a model, or set one directly                      │
+│  /models      list each provider's models, rate limits and credit    │
+│  /mode        pick a mode, or switch: default, plan, accept-edits, by│
+│  /logout      remove a provider's API key                            │
+│  /permissions show rules, the mode overlay and what each tool resolve│
+│  /init        have the model inspect the repo and write ZARN.md      │
+│  /status      show profile, model, provider, cwd and session         │
 ╰──────────────────────────────────────────────────────────────────────╯
 default mode  ·  m  ·  0 in / 0 out  ·  no rate configured
 ╭────────────────────────────────────────────────────────────────────────────────────────╮

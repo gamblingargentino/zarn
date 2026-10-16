@@ -1,5 +1,5 @@
 ╭ zarn settings · changes save as you go ────────────────────────────────────────────────────────────────────╮
-│Providers │ Models │ Skills │ MCP │ Agents │ Modes │ Quota │ Permissions │ General                          │
+│Providers │ Models │ Skills │ MCP │ Agents │ Modes │ Quota │ Permissions │ Hooks │ General                  │
 │                                                                                                            │
 │› claude     anthropic  fetched 2m ago                                                                      │
 │    models   claude-sonnet-5-5 (1M ctx), claude-haiku-5-5                                                   │

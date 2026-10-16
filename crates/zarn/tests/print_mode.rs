@@ -115,3 +115,40 @@ fn print_in_accept_edits_writes_without_a_prompt_and_default_does_not() {
         assert_eq!(home.project().join("made.txt").exists(), expect, "{mode}");
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn hooks_list_and_a_blocking_pre_tool_hook_work_in_print_mode() {
+    let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = calls.clone();
+    let mock = Mock::start(std::sync::Arc::new(move |_| {
+        let body = if counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            tool_call_sse("w", "write", &serde_json::json!({ "path": "x.txt", "content": "x" }))
+        } else {
+            sse("done")
+        };
+        (200, "text/event-stream".into(), body)
+    }));
+    let home = Home::new();
+    let script = home.root().join("deny.sh");
+    std::fs::write(&script, "echo 'writes are frozen' >&2\nexit 1\n").unwrap();
+    home.config(&format!(
+        "[providers.mock]\nkind = \"openai-compat\"\nbase_url = \"{}\"\n\n[profiles.default]\nprovider = \"mock\"\nmodel = \"m\"\n\n[[hooks.pre_tool]]\nmatch = \"write\"\ncommand = \"sh {}\"\n",
+        mock.base(),
+        script.display()
+    ));
+    let listed = home.run(&["hooks", "list"], "");
+    assert!(stdout(&listed).contains("pre_tool"));
+    assert!(stdout(&listed).contains("write"));
+    let out = home.run(&["--print", "write x", "--permission-mode", "bypass"], "");
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(!home.project().join("x.txt").exists());
+    let second: serde_json::Value = serde_json::from_str(&mock.requests()[1].body).unwrap();
+    let result = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["role"] == "tool")
+        .unwrap();
+    assert!(result["content"].as_str().unwrap().contains("writes are frozen"));
+}

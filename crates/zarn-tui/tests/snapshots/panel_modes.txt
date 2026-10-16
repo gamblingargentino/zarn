@@ -1,5 +1,5 @@
 ╭ zarn settings · changes save as you go ──────────────────────────────────────────────────────────╮
-│Providers │ Models │ Skills │ MCP │ Agents │ Modes │ Quota │ Permissions │ General                │
+│Providers │ Models │ Skills │ MCP │ Agents │ Modes │ Quota │ Permissions │ Hooks │ General        │
 │                                                                                                  │
 │› active mode    plan                                                                             │
 │  default        built-in  ask before edits and commands, as configured                           │

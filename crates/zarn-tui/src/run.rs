@@ -48,12 +48,7 @@ pub struct TuiPrompt {
 impl PermissionPrompt for TuiPrompt {
     async fn ask(&self, tool: &str, risk: Risk, args: &Value) -> Answer {
         let (reply, answer) = oneshot::channel();
-        let request = PermissionRequest {
-            tool: tool.to_string(),
-            risk,
-            args: args.clone(),
-            reply,
-        };
+        let request = PermissionRequest::new(tool, risk, args.clone(), reply);
         if self.tx.send(request).await.is_err() {
             return Answer::No;
         }
@@ -130,6 +125,11 @@ enum UiEvent {
         chat: bool,
     },
     Compared(Vec<crate::state::CompareSide>),
+    Prompted {
+        text: String,
+        blocked: Option<String>,
+    },
+    HookFailed(String),
     Window { model: String, window: u32 },
 }
 
@@ -199,6 +199,9 @@ pub struct Controller {
     cap_stopped: bool,
     parse_failures: u32,
     window: Option<(String, u32)>,
+    hooks: Arc<std::sync::RwLock<zarn_config::hooks::Hooks>>,
+    checkpoints: Arc<zarn_tools::checkpoint::Checkpoints>,
+    checkpoint_notes: Arc<std::sync::Mutex<Vec<String>>>,
 }
 
 fn flatten_messages(messages: &[Message]) -> Vec<Block> {
@@ -222,6 +225,7 @@ impl Controller {
     pub fn new(options: Options) -> Result<Self> {
         let cwd = std::env::current_dir()?;
         let ctx = Arc::new(Ctx::new(&cwd));
+        let cwd_for_checkpoints = cwd.clone();
         let (prompt, permissions) = permission_channel();
         let gate = Arc::new(Permissions::new(prompt));
         let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>(256);
@@ -266,6 +270,16 @@ impl Controller {
             cap_stopped: false,
             parse_failures: 0,
             window: None,
+            hooks: Arc::default(),
+            checkpoints: Arc::new(zarn_tools::checkpoint::Checkpoints::new(
+                paths::data_dir().join("checkpoints").join(format!(
+                    "{}-{}",
+                    std::process::id(),
+                    zarn_config::quota::now()
+                )),
+                cwd_for_checkpoints,
+            )),
+            checkpoint_notes: Arc::default(),
         };
 
         if let Some(path) = controller.options.resume.clone() {
@@ -543,7 +557,12 @@ impl Controller {
         self.app.theme.accent = brand::accent(cfg.general.accent.as_deref());
         self.app.theme.banner = cfg.general.banner();
         self.app.theme.show_cost = cfg.general.show_cost();
-        self.gate.set_policies(cfg.permissions.clone());
+        if let Ok(mut hooks) = self.hooks.write() {
+            *hooks = cfg.hooks.clone();
+        }
+        for err in cfg.apply_permissions(&self.gate, &self.cwd) {
+            self.app.notice(format!("permission rule ignored: {err}"));
+        }
         self.sync_mcp(&cfg);
         self.refresh_entries(&cfg);
 
@@ -612,7 +631,7 @@ impl Controller {
                     self.ctx.clone(),
                     rt.agent_config(),
                 )
-                .with_gate(self.gate.clone());
+                .with_gate(self.hooked_gate());
                 self.agent = Some(Arc::new(agent));
                 self.system = rt.system.clone();
                 self.set_system();
@@ -839,7 +858,7 @@ impl Controller {
                 }
                 request = self.permissions.recv() => {
                     if let Some(request) = request {
-                        self.app.pending = Some(request);
+                        self.show_permission(request);
                     }
                 }
                 ask = self.plans.recv() => {
@@ -920,7 +939,7 @@ impl Controller {
             },
             request = self.permissions.recv() => match request {
                 Some(request) => {
-                    self.app.pending = Some(request);
+                    self.show_permission(request);
                     true
                 }
                 None => false,
@@ -949,6 +968,90 @@ impl Controller {
         }
     }
 
+    fn show_permission(&mut self, mut request: PermissionRequest) {
+        request.pattern = zarn_tools::permissions::suggest(&request.tool, &request.args, &self.cwd);
+        request.preview = zarn_tools::diff::preview(&request.tool, &request.args, &self.cwd);
+        self.app.pending_expanded = false;
+        self.app.pending = Some(request);
+    }
+
+    fn permission_summary(&self) -> String {
+        let cfg = self.cfg();
+        let mut out = Vec::new();
+        let overlay = self.gate.overlay();
+        let mode = self.mode_def();
+        let mut mode_line = format!("mode     {}", self.mode);
+        if overlay.allow_all {
+            mode_line.push_str(" · every tool allowed except deny rules");
+        } else if overlay.safe_only {
+            mode_line.push_str(" · read-only tools and exit_plan only");
+        }
+        if !overlay.policies.is_empty() {
+            let mut entries: Vec<String> = overlay
+                .policies
+                .iter()
+                .map(|(t, p)| format!("{t}={}", zarn_tools::permissions::policy_word(*p)))
+                .collect();
+            entries.sort();
+            mode_line.push_str(&format!(" · overlay {}", entries.join(", ")));
+        }
+        if let Some(def) = mode
+            && !def.tools.is_empty()
+        {
+            mode_line.push_str(&format!(" · tools {}", def.tools.join(", ")));
+        }
+        out.push(mode_line);
+        let rules = cfg.permissions.rules.list();
+        let session = self.gate.session_patterns();
+        if rules.is_empty() && session.is_empty() {
+            out.push("rules    none; [a] or [p] in a prompt adds one".into());
+        } else {
+            out.push("rules".into());
+            let layers = self.layers.clone();
+            for (policy, rule) in rules {
+                let scope = layers
+                    .as_ref()
+                    .map(|l| ops::rule_scope(l, &rule).label())
+                    .unwrap_or("config");
+                out.push(format!(
+                    "  {:<5} {rule}  ({scope})",
+                    zarn_tools::permissions::policy_word(policy)
+                ));
+            }
+            for rule in session {
+                out.push(format!("  allow {rule}  (this session)"));
+            }
+        }
+        out.push("tools now".into());
+        let tools: Vec<(String, Risk)> = match &self.runtime {
+            Some(rt) => rt
+                .tools
+                .names()
+                .into_iter()
+                .filter_map(|n| rt.tools.get(&n).map(|t| (n.clone(), t.risk())))
+                .collect(),
+            None => zarn_tools::builtin_list()
+                .into_iter()
+                .map(|t| (t.spec().name, t.risk()))
+                .collect(),
+        };
+        let width = tools.iter().map(|(n, _)| n.len()).max().unwrap_or(4);
+        for (name, risk) in tools {
+            let (policy, why) = self.gate.decide(&name, risk, &Value::Null);
+            let extra = if name == "bash" && policy == Policy::Ask && cfg.general.safe_commands().is_some() {
+                "; read-only commands run without asking"
+            } else {
+                ""
+            };
+            out.push(format!(
+                "  {name:<width$}  {:<5} {why}{extra}",
+                zarn_tools::permissions::policy_word(policy)
+            ));
+        }
+        out.push("/permissions edit opens the settings tab".into());
+        out.join("\n")
+    }
+
     fn busy(&self) -> bool {
         self.app.streaming
     }
@@ -965,6 +1068,7 @@ impl Controller {
             Action::SendQueued => self.send_next(),
             Action::CycleMode => self.cycle_mode(),
             Action::Confirmed(ConfirmFor::Bypass) => self.set_mode("bypass", true),
+            Action::Confirmed(ConfirmFor::Rewind(turn)) => self.rewind(turn),
             Action::Confirmed(ConfirmFor::Prompted(provider)) => {
                 let result = match self.layers() {
                     Some(layers) => ops::update_provider(layers, &provider, |spec| {
@@ -985,6 +1089,19 @@ impl Controller {
                 }
             }
             Action::Plan(verdict) => self.decide_plan(verdict),
+            Action::SaveRule(pattern, scope) => {
+                let result = match self.layers() {
+                    Some(layers) => ops::add_permission_rule(layers, scope, Policy::Allow, &pattern),
+                    None => return true,
+                };
+                match result {
+                    Ok(()) => self.app.notice(format!(
+                        "allow rule {pattern} saved to the {} config",
+                        scope.label()
+                    )),
+                    Err(err) => self.app.notice(format!("rule not saved: {err:#}")),
+                }
+            }
             Action::Login(provider, secret) => {
                 let store = self.store.clone();
                 let result = match self.layers() {
@@ -1139,7 +1256,8 @@ impl Controller {
                 ..Default::default()
             },
         )
-        .with_gate(self.gate.clone());
+        .with_gate(self.hooked_gate());
+        self.checkpoints.begin(text.clone(), self.messages.len());
         self.messages.push(Message::user(text));
         self.cancel = CancellationToken::new();
         self.app.streaming = true;
@@ -1202,15 +1320,134 @@ impl Controller {
         }
     }
 
+    fn hooked_gate(&self) -> Arc<dyn zarn_core::agent::ToolGate> {
+        let hooked = Arc::new(zarn_config::hooks::HookedGate::new(
+            self.gate.clone(),
+            self.hooks.clone(),
+            self.cwd.clone(),
+        ));
+        Arc::new(
+            zarn_tools::checkpoint::CheckpointGate::new(hooked, self.checkpoints.clone())
+                .with_notes(self.checkpoint_notes.clone()),
+        )
+    }
+
+    fn rewind_picker(&mut self) {
+        if self.app.streaming {
+            self.app.notice("wait for the turn to finish, or press esc to cancel it, before rewinding");
+            return;
+        }
+        let turns = self.checkpoints.turns();
+        if turns.is_empty() {
+            self.app.notice("nothing to rewind yet");
+            return;
+        }
+        let choices: Vec<Choice> = turns
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(i, t)| {
+                let label: String = t.label.replace('\n', " ").chars().take(70).collect();
+                Choice::new(i.to_string(), format!("turn {}: {label}", i + 1)).with_detail(format!(
+                    "{} file{}",
+                    t.files.len(),
+                    if t.files.len() == 1 { "" } else { "s" }
+                ))
+            })
+            .collect();
+        let picker = Picker::new("Rewind to before which turn?", choices);
+        self.app.overlay = Some(Overlay::Pick(picker, ChatPick::Rewind));
+    }
+
+    fn confirm_rewind(&mut self, value: &str) {
+        let Some(plan) = value.parse::<usize>().ok().and_then(|i| self.checkpoints.plan(i)) else {
+            self.app.notice("that turn is no longer available");
+            return;
+        };
+        let dropped = self.messages.len().saturating_sub(plan.message_index);
+        self.app.overlay = Some(Overlay::Confirm(
+            format!(
+                "Rewind to before turn {}? This drops {dropped} messages and:\n{}",
+                plan.turn + 1,
+                plan.describe(&self.cwd)
+            ),
+            ConfirmFor::Rewind(plan.turn),
+        ));
+    }
+
+    fn rewind(&mut self, turn: usize) {
+        let Some(plan) = self.checkpoints.plan(turn) else {
+            self.app.notice("that turn is no longer available");
+            return;
+        };
+        let errors = self.checkpoints.apply(&plan);
+        self.messages.truncate(plan.message_index.max(1));
+        self.set_system();
+        self.app.blocks = flatten_messages(&self.messages);
+        self.session = None;
+        self.persisted = 1;
+        let mut text = format!("rewound to before turn {}\n{}", plan.turn + 1, plan.describe(&self.cwd));
+        for err in errors {
+            text.push_str(&format!("\nfailed: {err}"));
+        }
+        self.update_meter();
+        self.app.notice(text);
+    }
+
+    fn hooks(&self) -> zarn_config::hooks::Hooks {
+        self.hooks.read().map(|h| h.clone()).unwrap_or_default()
+    }
+
+    fn fire_hooks(&self, event: &'static str, tool: Option<String>, payload: Value) {
+        let hooks = self.hooks();
+        if hooks.list(event).is_empty() {
+            return;
+        }
+        let cwd = self.cwd.clone();
+        let tx = self.ui_tx.clone();
+        tokio::spawn(async move {
+            let outcomes = zarn_config::hooks::fire(&hooks, event, tool.as_deref(), payload, &cwd).await;
+            for outcome in outcomes.iter().filter(|o| !o.ok()) {
+                let _ = tx
+                    .send(UiEvent::HookFailed(format!("{event} hook: {}", outcome.reason())))
+                    .await;
+            }
+        });
+    }
+
     fn submit(&mut self, text: String) {
         if self.app.streaming {
             self.app.queue.push(text.clone());
             self.app.blocks.push(Block::Queued(text));
             return;
         }
+        let hooks = self.hooks();
+        if !hooks.prompt_submit.is_empty() {
+            self.app.streaming = true;
+            let cwd = self.cwd.clone();
+            let tx = self.ui_tx.clone();
+            tokio::spawn(async move {
+                let outcomes = zarn_config::hooks::fire(
+                    &hooks,
+                    "prompt_submit",
+                    None,
+                    serde_json::json!({ "prompt": text }),
+                    &cwd,
+                )
+                .await;
+                let blocked = outcomes.iter().find(|o| !o.ok()).map(|o| o.reason());
+                let _ = tx.send(UiEvent::Prompted { text, blocked }).await;
+            });
+            return;
+        }
+        self.submit_checked(text);
+    }
+
+    fn submit_checked(&mut self, text: String) {
         if !self.check_caps(true) {
             return;
         }
+        self.checkpoints.begin(text.clone(), self.messages.len());
         self.cap_stopped = false;
         self.reload_if_changed();
         let Some(agent) = self.agent.clone() else {
@@ -1235,6 +1472,23 @@ impl Controller {
                 if let AgentEvent::ToolStarted { args, .. } = &event {
                     self.note_tool_call(args);
                 }
+                if let AgentEvent::ToolFinished { id, name, output } = &event {
+                    let args = self
+                        .app
+                        .blocks
+                        .iter()
+                        .rev()
+                        .find_map(|b| match b {
+                            Block::Tool(card) if card.id == *id => Some(card.args.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or(Value::Null);
+                    self.fire_hooks(
+                        "post_tool",
+                        Some(name.clone()),
+                        serde_json::json!({ "args": args, "output": output.content, "is_error": output.is_error }),
+                    );
+                }
                 if let AgentEvent::Provider(provider_event) = &event {
                     self.cost.observe(provider_event);
                 }
@@ -1247,6 +1501,15 @@ impl Controller {
             }
             UiEvent::TurnDone { messages, result } => {
                 self.app.streaming = false;
+                self.checkpoints.end();
+                let notes: Vec<String> = self
+                    .checkpoint_notes
+                    .lock()
+                    .map(|mut n| std::mem::take(&mut *n))
+                    .unwrap_or_default();
+                for note in notes {
+                    self.app.notice(note);
+                }
                 self.messages = messages;
                 self.set_system();
                 self.cost.end_turn();
@@ -1264,6 +1527,11 @@ impl Controller {
                     Err(err) => self.app.notice(format!("error: {err}")),
                 }
                 self.maybe_title();
+                self.fire_hooks(
+                    "turn_end",
+                    None,
+                    serde_json::json!({ "messages": self.messages.len() }),
+                );
                 if self.needs_auto_compact() {
                     self.start_compaction(true);
                 } else {
@@ -1356,6 +1624,17 @@ impl Controller {
             }
             UiEvent::Title(Err(err)) => tracing::debug!(error = %err, "no session title"),
             UiEvent::Compared(sides) => self.app.blocks.push(Block::Compare(sides)),
+            UiEvent::HookFailed(text) => self.app.notice(text),
+            UiEvent::Prompted { text, blocked } => {
+                self.app.streaming = false;
+                match blocked {
+                    Some(reason) => {
+                        self.app.notice(format!("prompt blocked by a prompt_submit hook: {reason}"));
+                        self.send_next();
+                    }
+                    None => self.submit_checked(text),
+                }
+            }
             UiEvent::Window { model, window } => {
                 self.window = Some((model, window));
                 self.update_meter();
@@ -1552,6 +1831,7 @@ impl Controller {
             ChatPick::Login => self.ask_login(&value),
             ChatPick::Logout => self.logout(&value),
             ChatPick::Profile => self.use_profile(&value),
+            ChatPick::Rewind => self.confirm_rewind(&value),
             ChatPick::Mode if value == "bypass" => self.ask_bypass(),
             ChatPick::Mode => self.set_mode(&value, true),
         }
@@ -1746,6 +2026,7 @@ impl Controller {
                 }
                 self.start_compaction(false);
             }
+            "rewind" => self.rewind_picker(),
             "profile" => match first {
                 Some(name) => self.use_profile(name),
                 None => self.profile_picker(),
@@ -1949,9 +2230,15 @@ impl Controller {
                     self.open_panel(Tab::Skills);
                 }
             },
-            "permissions" => {
-                self.open_panel(Tab::Permissions);
-            }
+            "permissions" => match first {
+                Some("edit") => {
+                    self.open_panel(Tab::Permissions);
+                }
+                _ => {
+                    let text = self.permission_summary();
+                    self.app.notice(text);
+                }
+            },
             "mcp" => self.mcp_command(&words),
             "agents" => match first {
                 Some("list") => {
@@ -2004,6 +2291,10 @@ impl Controller {
                     all.append(&mut checks);
                     let _ = tx.send(UiEvent::Doctor(doctor::render(&all))).await;
                 });
+            }
+            "hooks" => {
+                let text = zarn_config::hooks::describe(&self.hooks());
+                self.app.notice(text);
             }
             "status" => {
                 let cfg = self.cfg();

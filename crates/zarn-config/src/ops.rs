@@ -450,6 +450,53 @@ pub fn add_profile(layers: &mut Layers, profile: &str) -> Result<()> {
     Ok(())
 }
 
+pub fn add_permission_rule(
+    layers: &mut Layers,
+    scope: Scope,
+    policy: Policy,
+    rule: &str,
+) -> Result<()> {
+    zarn_tools::permissions::parse_rule(rule).map_err(anyhow::Error::msg)?;
+    let rules = &mut layers.layer_mut(scope).permissions.rules;
+    let list = match policy {
+        Policy::Allow => &mut rules.allow,
+        Policy::Ask => &mut rules.ask,
+        Policy::Deny => &mut rules.deny,
+    };
+    if !list.iter().any(|r| r == rule) {
+        list.push(rule.to_string());
+    }
+    layers.save(scope)?;
+    Ok(())
+}
+
+pub fn remove_permission_rule(layers: &mut Layers, policy: Policy, rule: &str) -> Result<()> {
+    let mut found = false;
+    for scope in [Scope::Project, Scope::User] {
+        let rules = &mut layers.layer_mut(scope).permissions.rules;
+        let list = match policy {
+            Policy::Allow => &mut rules.allow,
+            Policy::Ask => &mut rules.ask,
+            Policy::Deny => &mut rules.deny,
+        };
+        let before = list.len();
+        list.retain(|r| r != rule);
+        if list.len() != before {
+            found = true;
+            layers.save(scope)?;
+        }
+    }
+    if !found {
+        bail!("no rule {rule}");
+    }
+    Ok(())
+}
+
+pub fn rule_scope(layers: &Layers, rule: &str) -> Scope {
+    let has = |c: &Config| c.permissions.rules.list().iter().any(|(_, r)| r == rule);
+    if has(&layers.project) { Scope::Project } else { Scope::User }
+}
+
 pub fn set_permission(layers: &mut Layers, tool: &str, policy: Policy) -> Result<Scope> {
     let scope = layers.permission_scope(tool);
     layers
@@ -770,6 +817,20 @@ mod tests {
         assert_eq!(cfg.routing.roles["compact"].model.as_deref(), Some("project-small"));
         assert_eq!(cfg.routing.roles["compact"].provider.as_deref(), Some("b"));
         assert_eq!(cfg.routing.roles["title"].provider.as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn rules_are_saved_to_the_chosen_scope_and_removed_from_wherever_they_live() {
+        let (d, mut layers, _store) = fixture();
+        add_permission_rule(&mut layers, Scope::Project, Policy::Allow, "bash(git diff:*)").unwrap();
+        add_permission_rule(&mut layers, Scope::User, Policy::Deny, "bash(rm -rf:*)").unwrap();
+        let project = std::fs::read_to_string(d.path().join("p/config.toml")).unwrap();
+        assert!(project.contains("allow = [\"bash(git diff:*)\"]"), "{project}");
+        assert_eq!(rule_scope(&layers, "bash(rm -rf:*)"), Scope::User);
+        assert!(add_permission_rule(&mut layers, Scope::User, Policy::Allow, "bash(oops").is_err());
+        remove_permission_rule(&mut layers, Policy::Allow, "bash(git diff:*)").unwrap();
+        assert!(layers.merged().permissions.rules.allow.is_empty());
+        assert!(remove_permission_rule(&mut layers, Policy::Allow, "bash(git diff:*)").is_err());
     }
 
     #[tokio::test]

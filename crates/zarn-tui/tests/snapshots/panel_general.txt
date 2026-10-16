@@ -1,14 +1,14 @@
 ╭ zarn settings · changes save as you go ──────────────────────────────────────────────────────────╮
-│Providers │ Models │ Skills │ MCP │ Agents │ Modes │ Quota │ Permissions │ General                │
+│Providers │ Models │ Skills │ MCP │ Agents │ Modes │ Quota │ Permissions │ Hooks │ General        │
 │                                                                                                  │
 │› accent color          violet                                                                    │
 │  banner                on                                                                        │
 │  cost display          on                                                                        │
 │  auto-compact          on  compact when the context is 80% full                                  │
+│  read-only commands    on  ls, git status and the like run without asking                        │
+│  bash sandbox          off  scrubbed environment only; not OS isolation, see /doctor             │
 │  session spend cap     off                                                                       │
 │  daily spend cap       off                                                                       │
-│  ZARN.md token budget  8000                                                                      │
-│                                                                                                  │
 │                                                                                                  │
 │↑↓ move · ←→ tab · enter change · esc close                                                       │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

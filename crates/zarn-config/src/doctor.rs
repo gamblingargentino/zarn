@@ -211,7 +211,85 @@ pub async fn run(store: &KeyStore, project: PathBuf, user: Option<PathBuf>, prob
         },
     ));
 
+    checks.push(sandbox_check(&cfg));
+    checks.push(hooks_check(&cfg));
+
     checks
+}
+
+pub fn on_path(program: &str) -> bool {
+    let Some(paths) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&paths).any(|dir| {
+        let candidate = dir.join(program);
+        candidate.is_file() || (cfg!(windows) && dir.join(format!("{program}.exe")).is_file())
+    })
+}
+
+pub fn sandbox_check(cfg: &Config) -> Check {
+    let os_tool = if cfg!(target_os = "linux") {
+        Some("bwrap")
+    } else if cfg!(target_os = "macos") {
+        Some("sandbox-exec")
+    } else {
+        None
+    };
+    let os = match os_tool {
+        Some(tool) if on_path(tool) => format!("{tool} is installed, but zarn does not use it, so no OS sandbox is applied"),
+        Some(tool) => format!("no OS sandbox is applied ({tool} is not installed and zarn would not use it yet)"),
+        None => "no OS sandbox is available on this platform".to_string(),
+    };
+    if cfg.general.sandbox() {
+        Check::new(
+            "sandbox",
+            Status::Warn,
+            format!(
+                "on: bash runs in the project directory with keys and tokens removed from its environment. This is not isolation; commands can still read and write anything your user can. {os}."
+            ),
+        )
+    } else {
+        Check::new(
+            "sandbox",
+            Status::Ok,
+            format!(
+                "off: bash runs with your full environment. Turn on with /config → General → bash sandbox, or general.sandbox = true. {os}."
+            ),
+        )
+    }
+}
+
+pub fn hooks_check(cfg: &Config) -> Check {
+    let all = cfg.hooks.all();
+    if all.is_empty() {
+        return Check::new("hooks", Status::Ok, "none configured");
+    }
+    let missing: Vec<String> = all
+        .iter()
+        .filter_map(|(event, hook)| {
+            let program = crate::auth::split_command(&hook.command).into_iter().next()?;
+            let path = Path::new(&program);
+            let found = if path.components().count() > 1 {
+                path.exists()
+            } else {
+                on_path(&program) || matches!(program.as_str(), "sh" | "cd" | "echo" | "exit" | "true" | "false")
+            };
+            (!found).then(|| format!("{event} hook `{}` runs {program}, which was not found", hook.command))
+        })
+        .collect();
+    if missing.is_empty() {
+        Check::new(
+            "hooks",
+            Status::Ok,
+            format!("{} configured, timeout {} s; zarn hooks list shows them", all.len(), cfg.hooks.timeout().as_secs()),
+        )
+    } else {
+        Check::new(
+            "hooks",
+            Status::Warn,
+            format!("{}; fix the command under [hooks] in config.toml", missing.join("; ")),
+        )
+    }
 }
 
 #[cfg(test)]
@@ -241,6 +319,18 @@ mod tests {
         assert_eq!(provider.status, Status::Fail);
         assert!(provider.detail.contains("zarn login a"));
         assert!(render(&checks).contains("failed"));
+    }
+
+    #[test]
+    fn the_sandbox_check_never_claims_isolation() {
+        let mut cfg = Config::default();
+        let off = sandbox_check(&cfg);
+        assert!(off.detail.starts_with("off"));
+        cfg.general.sandbox = Some(true);
+        let on = sandbox_check(&cfg);
+        assert_eq!(on.status, Status::Warn);
+        assert!(on.detail.contains("This is not isolation"));
+        assert!(on.detail.contains("no OS sandbox"));
     }
 
     #[tokio::test]

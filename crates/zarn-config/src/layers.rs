@@ -137,6 +137,8 @@ impl Layers {
             GeneralField::ContextBudget => g.context_budget.is_some(),
             GeneralField::AutoCompact => g.auto_compact.is_some(),
             GeneralField::Mode => g.mode.is_some(),
+            GeneralField::ReadOnly => g.auto_allow_read_only.is_some(),
+            GeneralField::Sandbox => g.sandbox.is_some(),
         })
     }
 
@@ -163,6 +165,8 @@ pub enum GeneralField {
     ContextBudget,
     AutoCompact,
     Mode,
+    ReadOnly,
+    Sandbox,
 }
 
 #[cfg(test)]

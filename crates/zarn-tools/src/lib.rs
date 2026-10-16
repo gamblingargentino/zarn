@@ -1,5 +1,7 @@
 pub mod bash;
 pub mod budget;
+pub mod checkpoint;
+pub mod diff;
 pub mod edit;
 pub mod exit_plan;
 pub mod freshness;
@@ -7,15 +9,29 @@ pub mod fsx;
 pub mod mcp;
 pub mod permissions;
 pub mod read;
+pub mod safe_shell;
 pub mod search;
 pub mod skill;
 pub mod write;
 
 use zarn_core::tools::{Tool, ToolRegistry};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Options {
+    pub sandbox: bool,
+}
+
 pub fn builtin_list() -> Vec<Box<dyn Tool>> {
+    builtin_list_with(Options::default())
+}
+
+pub fn builtin_list_with(options: Options) -> Vec<Box<dyn Tool>> {
     vec![
-        Box::new(bash::Bash::new()),
+        Box::new(if options.sandbox {
+            bash::Bash::sandboxed()
+        } else {
+            bash::Bash::new()
+        }),
         Box::new(edit::Edit::new()),
         Box::new(read::Read::new()),
         Box::new(search::Glob::new()),

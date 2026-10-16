@@ -61,6 +61,11 @@ pub enum Command {
         #[command(subcommand)]
         action: Option<McpAction>,
     },
+    #[command(about = "List the hooks that run before and after tools, prompts and turns")]
+    Hooks {
+        #[command(subcommand)]
+        action: Option<HooksAction>,
+    },
     #[command(about = "List each provider's models, rate limits and credit balance")]
     Models {
         #[arg(long, value_name = "NAME", help = "Only this provider")]
@@ -85,6 +90,12 @@ pub enum Command {
         #[arg(long, help = "Skip network probes and MCP server starts")]
         offline: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum HooksAction {
+    #[command(about = "List hooks by event, with their match pattern and command")]
+    List,
 }
 
 #[derive(Subcommand, Debug)]

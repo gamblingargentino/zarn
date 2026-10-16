@@ -2,11 +2,11 @@
 │› /help        list the commands                                      │
 │  /clear       drop the conversation and start over                   │
 │  /compact     summarize the conversation to free context             │
+│  /rewind      undo the file changes and messages of recent turns (esc│
 │  /cost        show token usage and cost for this session             │
 │  /context     show what fills the context window                     │
 │  /limits      show or set the spend caps                             │
 │  /resume      resume an earlier session in this directory            │
-│  /tools       list the registered tools                              │
 ╰──────────────────────────────────────────────────────────────────────╯
 default mode  ·  m  ·  0 in / 0 out  ·  no rate configured
 ╭────────────────────────────────────────────────────────────────────────────────────────╮

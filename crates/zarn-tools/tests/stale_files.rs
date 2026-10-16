@@ -84,3 +84,35 @@ async fn a_file_the_agent_created_can_be_written_again() {
     }
     assert_eq!(std::fs::read_to_string(dir.path().join("new.txt")).unwrap(), "second");
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn the_sandbox_scrubs_keys_from_the_environment_of_bash() {
+    use zarn_tools::bash::Bash;
+    unsafe {
+        std::env::set_var("ZARN_TEST_PROVIDER_API_KEY", "test-key-not-real-sandbox-env");
+        std::env::set_var("ZARN_TEST_PLAIN_SETTING", "visible-value");
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = Ctx::new(dir.path());
+    let open = Bash::new().run(json!({ "command": "env" }), &ctx).await.unwrap();
+    assert!(open.content.contains("test-key-not-real-sandbox-env"));
+    let closed = Bash::sandboxed().run(json!({ "command": "env" }), &ctx).await.unwrap();
+    assert!(!closed.content.contains("test-key-not-real-sandbox-env"));
+    assert!(!closed.content.contains("ZARN_TEST_PROVIDER_API_KEY"));
+    assert!(closed.content.contains("visible-value"));
+    assert!(closed.content.contains("ZARN_SANDBOX=1"));
+    let pwd = Bash::sandboxed().run(json!({ "command": "pwd" }), &ctx).await.unwrap();
+    assert_eq!(
+        std::path::Path::new(pwd.content.trim()).canonicalize().unwrap(),
+        dir.path().canonicalize().unwrap()
+    );
+}
+
+#[test]
+fn secret_looking_values_are_scrubbed_even_under_innocent_names() {
+    assert!(zarn_tools::bash::looks_secret("OPENAI_API_KEY", "x"));
+    assert!(zarn_tools::bash::looks_secret("GH_TOKEN", "x"));
+    assert!(zarn_tools::bash::looks_secret("MY_VAR", "sk-test-key-not-real-0123456789"));
+    assert!(!zarn_tools::bash::looks_secret("PATH", "/usr/bin"));
+}

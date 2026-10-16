@@ -157,12 +157,12 @@ fn pending_permission_prompt_renders_options() {
     let mut app = App::new("model");
     let (tx, _rx) = tokio::sync::oneshot::channel();
 
-    app.pending = Some(PermissionRequest {
-        tool: "bash".into(),
-        risk: Risk::Execute,
-        args: json!({ "command": "rm -rf /" }),
-        reply: tx,
-    });
+    app.pending = Some(PermissionRequest::new(
+        "bash",
+        Risk::Execute,
+        json!({ "command": "rm -rf /" }),
+        tx,
+    ));
 
     let output = render_app(80, 24, &app);
     let text = output.join("\n");

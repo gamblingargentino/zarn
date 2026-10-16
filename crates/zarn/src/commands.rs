@@ -79,7 +79,7 @@ pub fn config_check() -> Result<()> {
     if cfg.permissions.is_empty() {
         println!("  none set; risk defaults apply");
     }
-    for (tool, policy) in &cfg.permissions {
+    for (tool, policy) in cfg.permissions.iter() {
         println!("  {tool:<8} {policy:?}");
     }
 
@@ -446,5 +446,11 @@ pub fn limits(session: Option<&str>, day: Option<&str>) -> Result<()> {
         show(limits.day_usd),
         zarn_config::spend::Ledger::system().today()
     );
+    Ok(())
+}
+
+pub fn hooks_list() -> Result<()> {
+    let cfg = Config::load()?;
+    println!("{}", zarn_config::hooks::describe(&cfg.hooks));
     Ok(())
 }

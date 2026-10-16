@@ -610,3 +610,41 @@ fn model_pickers_merge_discovered_models_with_their_context_window() {
     assert_eq!(panel.on_key(key(KeyCode::Enter)), Some(Effect::Reload));
     assert!(fx.user_config().contains("model = \"a-model-nobody-listed\""));
 }
+
+#[test]
+fn the_permissions_tab_lists_rules_and_deletes_them() {
+    let fx = Fixture::new(&format!(
+        "{TWO_PROVIDERS}allow = [\"bash(git diff:*)\"]\ndeny = [\"bash(rm -rf:*)\"]\n"
+    ));
+    let mut panel = fx.panel().open_at(Tab::Permissions);
+    let rows = panel.rows();
+    let deny = rows.iter().position(|r| r.value == "bash(rm -rf:*)").unwrap();
+    assert_eq!(rows[deny].label, "rule · deny");
+    assert_eq!(rows[deny].note, "user");
+    let app = app_with_panel(fx.panel().open_at(Tab::Permissions));
+    snapshot("panel_permission_rules", &rows_of(&app));
+    let allow = rows.iter().position(|r| r.value == "bash(git diff:*)").unwrap();
+    panel.cursor[Tab::Permissions.index()] = allow;
+    assert_eq!(panel.on_key(key(KeyCode::Char('d'))), Some(Effect::Reload));
+    let saved = fx.user_config();
+    assert!(!saved.contains("git diff"), "{saved}");
+    assert!(saved.contains("rm -rf"));
+}
+
+fn rows_of(app: &App) -> Vec<String> {
+    rows(100, 14, app)
+}
+
+#[test]
+fn snapshot_the_hooks_tab() {
+    let fx = Fixture::new(&format!(
+        "{TWO_PROVIDERS}\n[hooks]\ntimeout_secs = 10\n\n[[hooks.pre_tool]]\nmatch = \"edit|write\"\ncommand = \"./scripts/check-paths.sh\"\n\n[[hooks.turn_end]]\ncommand = \"notify-send done\"\n"
+    ));
+    let app = app_with_panel(fx.panel().open_at(Tab::Hooks));
+    let out = rows(100, 10, &app);
+    snapshot("panel_hooks", &out);
+    let text = out.join("\n");
+    assert!(text.contains("pre_tool · edit|write"));
+    assert!(text.contains("./scripts/check-paths.sh"));
+    assert!(text.contains("10 seconds"));
+}

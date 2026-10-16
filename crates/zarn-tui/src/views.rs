@@ -95,6 +95,8 @@ pub fn draw_panel(frame: &mut Frame, panel: &Panel, accent: Color) {
                 crate::settings::Tab::Skills => {
                     "no skills found in ~/.config/zarn/skills or ./.zarn/skills"
                 }
+                crate::settings::Tab::Hooks => "no hooks; add them under [hooks] in config.toml",
+                crate::settings::Tab::Quota => "no provider with a key to query",
                 _ => "nothing here yet",
             },
             dim(),
@@ -462,13 +464,20 @@ pub fn draw_onboarding(frame: &mut Frame, onboarding: &Onboarding, accent: Color
 }
 
 pub fn draw_confirm(frame: &mut Frame, area: Rect, text: &str, accent: Color) {
-    let rect = centered(area, 72, 7);
+    let wrapped: usize = text
+        .lines()
+        .map(|l| l.chars().count().div_ceil(68).max(1))
+        .sum();
+    let rect = centered(area, 72, wrapped as u16 + 5);
     frame.render_widget(Clear, rect);
     let block = frame_block("confirm", Color::Yellow);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
-    let lines = vec![
-        Line::styled(text.to_string(), Style::default().fg(Color::Yellow)),
+    let mut lines: Vec<Line> = text
+        .lines()
+        .map(|l| Line::styled(l.to_string(), Style::default().fg(Color::Yellow)))
+        .collect();
+    lines.extend([
         Line::raw(""),
         Line::from(vec![
             Span::styled("[y] ", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
@@ -476,7 +485,7 @@ pub fn draw_confirm(frame: &mut Frame, area: Rect, text: &str, accent: Color) {
             Span::styled("[n] ", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
             Span::raw("no"),
         ]),
-    ];
+    ]);
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 

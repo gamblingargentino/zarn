@@ -11,12 +11,41 @@ use zarn_core::types::ToolSpec;
 
 const DEFAULT_TIMEOUT_SECS: u64 = 120;
 
-pub struct Bash;
+pub struct Bash {
+    sandbox: bool,
+}
 
 impl Bash {
     pub fn new() -> Self {
-        Bash
+        Bash { sandbox: false }
     }
+
+    pub fn sandboxed() -> Self {
+        Bash { sandbox: true }
+    }
+}
+
+const SECRET_NAMES: &[&str] = &[
+    "KEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL", "AUTH", "COOKIE", "SESSION",
+    "PRIVATE",
+];
+
+pub fn looks_secret(name: &str, value: &str) -> bool {
+    let upper = name.to_uppercase();
+    if SECRET_NAMES.iter().any(|s| upper.contains(s)) {
+        return true;
+    }
+    let v = value.trim();
+    ["sk-", "sk_", "gsk_", "AIza", "ghp_", "gho_", "github_pat_", "xox", "glpat-"]
+        .iter()
+        .any(|prefix| v.starts_with(prefix) && v.len() >= 20)
+}
+
+pub fn scrubbed_names() -> Vec<String> {
+    std::env::vars()
+        .filter(|(name, value)| looks_secret(name, value))
+        .map(|(name, _)| name)
+        .collect()
 }
 
 impl Default for Bash {
@@ -114,6 +143,13 @@ impl Tool for Bash {
         #[cfg(unix)]
         builder.process_group(0);
 
+        if self.sandbox {
+            for name in scrubbed_names() {
+                builder.env_remove(name);
+            }
+            builder.env("ZARN_SANDBOX", "1");
+        }
+
         let mut child = match builder.spawn() {
             Ok(child) => child,
             Err(err) => return Ok(ToolOutput::error(format!("cannot run {program}: {err}"))),
@@ -209,7 +245,7 @@ mod tests {
 
     #[tokio::test]
     async fn it_returns_stdout() {
-        let out = Bash
+        let out = Bash::new()
             .run(json!({ "command": "echo hello" }), &ctx())
             .await
             .unwrap();
@@ -224,13 +260,13 @@ mod tests {
         } else {
             "echo oops >&2"
         };
-        let out = Bash.run(json!({ "command": command }), &ctx()).await.unwrap();
+        let out = Bash::new().run(json!({ "command": command }), &ctx()).await.unwrap();
         assert!(out.content.contains("oops"));
     }
 
     #[tokio::test]
     async fn a_failing_command_reports_its_exit_code() {
-        let out = Bash.run(json!({ "command": "exit 3" }), &ctx()).await.unwrap();
+        let out = Bash::new().run(json!({ "command": "exit 3" }), &ctx()).await.unwrap();
         assert!(out.is_error);
         assert!(out.content.contains("exit code 3"));
     }
@@ -243,7 +279,7 @@ mod tests {
             "sleep 30"
         };
         let started = std::time::Instant::now();
-        let out = Bash
+        let out = Bash::new()
             .run(json!({ "command": command, "timeout": 1 }), &ctx())
             .await
             .unwrap();
@@ -255,6 +291,6 @@ mod tests {
 
     #[tokio::test]
     async fn a_missing_command_argument_is_an_error() {
-        assert!(Bash.run(json!({}), &ctx()).await.is_err());
+        assert!(Bash::new().run(json!({}), &ctx()).await.is_err());
     }
 }

@@ -5,6 +5,7 @@ pub mod context;
 pub mod doctor;
 pub mod guard;
 pub mod health;
+pub mod hooks;
 pub mod layers;
 pub mod modes;
 pub mod ops;
@@ -23,7 +24,7 @@ use std::path::{Path, PathBuf};
 use zarn_core::cost::Rates;
 use zarn_providers::ProviderSpec;
 use zarn_tools::mcp::ServerConfig;
-use zarn_tools::permissions::Policy;
+use zarn_tools::permissions::{Policy, Rules};
 
 pub const LOCAL_PATH: &str = ".zarn/config.toml";
 
@@ -55,6 +56,12 @@ pub struct General {
     pub mode: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub discovery_cache_minutes: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_only_commands: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_allow_read_only: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sandbox: Option<bool>,
 }
 
 impl General {
@@ -67,6 +74,30 @@ impl General {
         self.auto_compact = self.auto_compact.or(other.auto_compact);
         self.mode = self.mode.take().or(other.mode);
         self.discovery_cache_minutes = self.discovery_cache_minutes.or(other.discovery_cache_minutes);
+        self.read_only_commands = self.read_only_commands.take().or(other.read_only_commands);
+        self.auto_allow_read_only = self.auto_allow_read_only.or(other.auto_allow_read_only);
+        self.sandbox = self.sandbox.or(other.sandbox);
+    }
+
+    pub fn sandbox(&self) -> bool {
+        self.sandbox.unwrap_or(false)
+    }
+
+    pub fn tool_options(&self) -> zarn_tools::Options {
+        zarn_tools::Options {
+            sandbox: self.sandbox(),
+        }
+    }
+
+    pub fn safe_commands(&self) -> Option<Vec<String>> {
+        if !self.auto_allow_read_only.unwrap_or(true) {
+            return None;
+        }
+        Some(
+            self.read_only_commands
+                .clone()
+                .unwrap_or_else(zarn_tools::safe_shell::defaults),
+        )
     }
 
     pub fn is_empty(&self) -> bool {
@@ -87,6 +118,34 @@ impl General {
 
     pub fn mode(&self) -> String {
         self.mode.clone().unwrap_or_else(|| "default".to_string())
+    }
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct PermissionTable {
+    #[serde(flatten)]
+    pub rules: Rules,
+    #[serde(flatten)]
+    pub tools: BTreeMap<String, Policy>,
+}
+
+impl PermissionTable {
+    pub fn is_empty(&self) -> bool {
+        self.tools.is_empty() && self.rules.is_empty()
+    }
+}
+
+impl std::ops::Deref for PermissionTable {
+    type Target = BTreeMap<String, Policy>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.tools
+    }
+}
+
+impl std::ops::DerefMut for PermissionTable {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.tools
     }
 }
 
@@ -162,8 +221,8 @@ pub struct Config {
     pub providers: BTreeMap<String, ProviderSpec>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub profiles: BTreeMap<String, ProfileSpec>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub permissions: BTreeMap<String, Policy>,
+    #[serde(default, skip_serializing_if = "PermissionTable::is_empty")]
+    pub permissions: PermissionTable,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub skills: BTreeMap<String, bool>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -174,6 +233,8 @@ pub struct Config {
     pub routing: Routing,
     #[serde(default, skip_serializing_if = "spend::Limits::is_empty")]
     pub limits: spend::Limits,
+    #[serde(default, skip_serializing_if = "hooks::Hooks::is_empty")]
+    pub hooks: hooks::Hooks,
 }
 
 impl Config {
@@ -198,9 +259,10 @@ impl Config {
                 }
             }
         }
-        for (name, policy) in other.permissions {
+        for (name, policy) in other.permissions.tools {
             self.permissions.entry(name).or_insert(policy);
         }
+        self.permissions.rules.extend(&other.permissions.rules);
         for (name, server) in other.mcp {
             self.mcp.entry(name).or_insert(server);
         }
@@ -209,6 +271,7 @@ impl Config {
         }
         self.routing.fill_from(other.routing);
         self.limits.fill_from(other.limits);
+        self.hooks.fill_from(other.hooks);
     }
 
     pub fn home_path() -> Option<PathBuf> {
@@ -255,6 +318,10 @@ impl Config {
             }
         }
         spend::validate(self)?;
+        self.hooks.validate()?;
+        for (_, rule) in self.permissions.rules.list() {
+            zarn_tools::permissions::parse_rule(&rule).map_err(anyhow::Error::msg)?;
+        }
         for (role, spec) in &self.routing.roles {
             if !ROLES.contains(&role.as_str()) {
                 bail!(
@@ -331,6 +398,17 @@ impl Config {
                 Ok(resolved)
             })
             .collect()
+    }
+
+    pub fn apply_permissions(
+        &self,
+        gate: &zarn_tools::permissions::Permissions,
+        cwd: &Path,
+    ) -> Vec<String> {
+        gate.set_policies(self.permissions.tools.clone());
+        gate.set_cwd(cwd);
+        gate.set_safe_commands(self.general.safe_commands());
+        gate.set_rules(&self.permissions.rules)
     }
 
     pub fn skill_enabled(&self, name: &str) -> bool {
@@ -491,6 +569,23 @@ mod tests {
         let parsed: Config = toml::from_str(Config::starter()).unwrap();
         assert!(parsed.validate().is_ok());
         assert!(parsed.providers.is_empty());
+    }
+
+    #[test]
+    fn permission_rules_and_tool_policies_share_one_table() {
+        let cfg: Config = toml::from_str(
+            "[permissions]\nbash = \"ask\"\nread = \"allow\"\nallow = [\"bash(git diff:*)\", \"edit(src/**)\"]\ndeny = [\"bash(rm -rf:*)\"]\n",
+        )
+        .unwrap();
+        assert_eq!(cfg.permissions.get("bash"), Some(&Policy::Ask));
+        assert_eq!(cfg.permissions.rules.allow.len(), 2);
+        assert_eq!(cfg.permissions.rules.deny, vec!["bash(rm -rf:*)"]);
+        assert!(!cfg.permissions.contains_key("allow"));
+        let text = cfg.to_toml().unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.permissions, cfg.permissions);
+        let bad: Config = toml::from_str("[permissions]\ndeny = [\"bash(oops\"]\n").unwrap();
+        assert!(bad.validate().is_err());
     }
 
     #[test]

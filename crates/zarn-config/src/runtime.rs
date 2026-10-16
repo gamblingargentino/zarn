@@ -334,11 +334,11 @@ impl Runtime {
     }
 }
 
-fn subagent_tools() -> ToolFactory {
-    Arc::new(|names: &[String]| {
+fn subagent_tools(options: zarn_tools::Options) -> ToolFactory {
+    Arc::new(move |names: &[String]| {
         let wanted: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
         let mut registry = ToolRegistry::new();
-        for tool in zarn_tools::builtin_list() {
+        for tool in zarn_tools::builtin_list_with(options) {
             let name = tool.spec().name;
             if wanted.is_empty() || wanted.contains(&name) {
                 registry.register(redacting(tool));
@@ -395,7 +395,8 @@ pub fn assemble(
     parts.mode = modes::prompt_section(&mode);
     let system = parts.join();
 
-    let mut tools: Vec<Box<dyn Tool>> = zarn_tools::builtin_list();
+    let options = cfg.general.tool_options();
+    let mut tools: Vec<Box<dyn Tool>> = zarn_tools::builtin_list_with(options);
     if !skills.is_empty() {
         tools.push(Box::new(SkillTool::new(skills.clone())));
     }
@@ -403,7 +404,7 @@ pub fn assemble(
         tools.push(Box::new(TaskTool::new(
             agents.iter().map(|a| a.def.clone()).collect(),
             router.factory(),
-            subagent_tools(),
+            subagent_tools(options),
             ctx,
             AgentConfig {
                 model: main.model.clone(),

@@ -21,6 +21,22 @@ pub struct PermissionRequest {
     pub risk: Risk,
     pub args: Value,
     pub reply: oneshot::Sender<Answer>,
+    pub pattern: String,
+    pub preview: Option<zarn_tools::diff::Preview>,
+}
+
+impl PermissionRequest {
+    pub fn new(tool: impl Into<String>, risk: Risk, args: Value, reply: oneshot::Sender<Answer>) -> Self {
+        let tool = tool.into();
+        PermissionRequest {
+            pattern: tool.clone(),
+            tool,
+            risk,
+            args,
+            reply,
+            preview: None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -110,12 +126,14 @@ pub enum ChatPick {
     Logout,
     Mode,
     Profile,
+    Rewind,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfirmFor {
     Bypass,
     Prompted(String),
+    Rewind(usize),
 }
 
 #[derive(Debug)]
@@ -150,6 +168,7 @@ pub enum Action {
     CycleMode,
     Confirmed(ConfirmFor),
     Plan(PlanVerdict),
+    SaveRule(String, zarn_config::layers::Scope),
 }
 
 #[derive(Clone, Debug)]
@@ -191,7 +210,9 @@ pub struct App {
     pub queue: Vec<String>,
     pub queue_paused: bool,
     pub plan_review: Option<PlanReview>,
+    pub pending_expanded: bool,
     ctrl_c_armed: bool,
+    esc_armed: bool,
 }
 
 impl App {
@@ -461,6 +482,7 @@ impl App {
     }
 
     pub fn answer_permission(&mut self, answer: Answer) {
+        self.pending_expanded = false;
         if let Some(request) = self.pending.take() {
             let _ = request.reply.send(answer);
         }
@@ -473,6 +495,10 @@ impl App {
 
         if key.code != KeyCode::Char('c') || !key.modifiers.contains(KeyModifiers::CONTROL) {
             self.ctrl_c_armed = false;
+        }
+        let esc_was_armed = self.esc_armed;
+        if key.code != KeyCode::Esc {
+            self.esc_armed = false;
         }
 
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
@@ -525,6 +551,14 @@ impl App {
                 }
                 if !self.queue.is_empty() {
                     self.clear_queue();
+                    return None;
+                }
+                if self.input.is_empty() {
+                    if esc_was_armed {
+                        self.esc_armed = false;
+                        return Some(Action::Command("/rewind".into()));
+                    }
+                    self.esc_armed = true;
                 }
             }
             (KeyCode::Enter, m)
@@ -616,9 +650,25 @@ impl App {
     }
 
     fn on_permission_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let pattern = self.pending.as_ref().map(|p| p.pattern.clone()).unwrap_or_default();
+        let save = |scope| Some(Action::SaveRule(pattern.clone(), scope));
         match key.code {
             KeyCode::Char('y') | KeyCode::Char('Y') => self.answer_permission(Answer::Once),
-            KeyCode::Char('a') | KeyCode::Char('A') => self.answer_permission(Answer::Always),
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                self.answer_permission(Answer::Pattern(pattern.clone()))
+            }
+            KeyCode::Char('p') | KeyCode::Char('P') => {
+                self.answer_permission(Answer::Pattern(pattern.clone()));
+                return save(zarn_config::layers::Scope::Project);
+            }
+            KeyCode::Char('u') | KeyCode::Char('U') => {
+                self.answer_permission(Answer::Pattern(pattern.clone()));
+                return save(zarn_config::layers::Scope::User);
+            }
+            KeyCode::Char('e') | KeyCode::Char('E') => self.pending_expanded = !self.pending_expanded,
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.pending_expanded = !self.pending_expanded
+            }
             KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
                 self.answer_permission(Answer::No)
             }
@@ -758,6 +808,31 @@ mod tests {
     }
 
     #[test]
+    fn saving_a_pattern_answers_the_call_and_asks_to_persist_it() {
+        let (tx, rx) = oneshot::channel();
+        let mut app = App::new("m");
+        let mut request = PermissionRequest::new("edit", Risk::Write, Value::Null, tx);
+        request.pattern = "edit(src/a.rs)".into();
+        app.pending = Some(request);
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('p'))),
+            Some(Action::SaveRule("edit(src/a.rs)".into(), zarn_config::layers::Scope::Project))
+        );
+        assert_eq!(rx.blocking_recv().unwrap(), Answer::Pattern("edit(src/a.rs)".into()));
+    }
+
+    #[test]
+    fn esc_esc_on_an_empty_line_asks_to_rewind() {
+        let mut app = App::new("m");
+        assert_eq!(app.on_key(key(KeyCode::Esc)), None);
+        assert_eq!(app.on_key(key(KeyCode::Esc)), Some(Action::Command("/rewind".into())));
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('x')));
+        app.on_key(key(KeyCode::Backspace));
+        assert_eq!(app.on_key(key(KeyCode::Esc)), None);
+    }
+
+    #[test]
     fn shift_tab_asks_to_cycle_the_mode() {
         let mut app = App::new("m");
         assert_eq!(
@@ -866,16 +941,13 @@ mod tests {
     fn a_permission_prompt_swallows_ordinary_typing() {
         let (tx, rx) = oneshot::channel();
         let mut app = App::new("m");
-        app.pending = Some(PermissionRequest {
-            tool: "bash".into(),
-            risk: Risk::Execute,
-            args: Value::Null,
-            reply: tx,
-        });
+        let mut request = PermissionRequest::new("bash", Risk::Execute, Value::Null, tx);
+        request.pattern = "bash(cargo test:*)".into();
+        app.pending = Some(request);
         app.on_key(key(KeyCode::Char('x')));
         assert!(app.input.is_empty());
         app.on_key(key(KeyCode::Char('a')));
         assert!(app.pending.is_none());
-        assert_eq!(rx.blocking_recv().unwrap(), Answer::Always);
+        assert_eq!(rx.blocking_recv().unwrap(), Answer::Pattern("bash(cargo test:*)".into()));
     }
 }

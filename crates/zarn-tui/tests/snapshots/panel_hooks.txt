@@ -1,0 +1,10 @@
+╭ zarn settings · changes save as you go ──────────────────────────────────────────────────────────╮
+│Providers │ Models │ Skills │ MCP │ Agents │ Modes │ Quota │ Permissions │ Hooks │ General        │
+│                                                                                                  │
+│› pre_tool · edit|write  ./scripts/check-paths.sh                                                 │
+│  turn_end · *           notify-send done                                                         │
+│  timeout                10 seconds                                                               │
+│                                                                                                  │
+│                                                                                                  │
+│↑↓ move · ←→ tab · hooks are edited under [hooks] in config.toml · esc close                      │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

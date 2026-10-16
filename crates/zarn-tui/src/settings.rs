@@ -23,6 +23,7 @@ pub enum Tab {
     Modes,
     Quota,
     Permissions,
+    Hooks,
     General,
 }
 
@@ -35,7 +36,7 @@ pub enum QuotaState {
     Failed(String),
 }
 
-pub const TABS: [Tab; 9] = [
+pub const TABS: [Tab; 10] = [
     Tab::Providers,
     Tab::Models,
     Tab::Skills,
@@ -44,6 +45,7 @@ pub const TABS: [Tab; 9] = [
     Tab::Modes,
     Tab::Quota,
     Tab::Permissions,
+    Tab::Hooks,
     Tab::General,
 ];
 
@@ -58,6 +60,7 @@ impl Tab {
             Tab::Modes => "Modes",
             Tab::Quota => "Quota",
             Tab::Permissions => "Permissions",
+            Tab::Hooks => "Hooks",
             Tab::General => "General",
         }
     }
@@ -75,7 +78,8 @@ impl Tab {
             Tab::Agents => "enter edit · a create · d delete",
             Tab::Modes => "enter edit or switch · a create · d delete",
             Tab::Quota => "r refresh this provider · R refresh all",
-            Tab::Permissions => "enter cycles · a allow · s ask · d deny",
+            Tab::Permissions => "enter cycles · a allow · s ask · d deny, or delete a rule",
+            Tab::Hooks => "hooks are edited under [hooks] in config.toml",
             Tab::General => "enter change",
         }
     }
@@ -138,6 +142,7 @@ pub enum RowKind {
     QuotaProvider(String),
     Info,
     Permission(String),
+    Rule(Policy, String),
     Accent,
     Banner,
     ShowCost,
@@ -145,6 +150,8 @@ pub enum RowKind {
     AutoCompact,
     SessionCap,
     DayCap,
+    ReadOnly,
+    Sandbox,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -624,6 +631,25 @@ impl Panel {
                 }
                 rows
             }
+            Tab::Hooks => {
+                let mut rows: Vec<Row> = cfg
+                    .hooks
+                    .all()
+                    .into_iter()
+                    .map(|(event, hook)| {
+                        let matcher = if hook.matcher.is_empty() { "*" } else { hook.matcher.as_str() };
+                        Row::new(format!("{event} · {matcher}"), hook.command.clone(), RowKind::Info)
+                    })
+                    .collect();
+                if !rows.is_empty() {
+                    rows.push(Row::new(
+                        "timeout",
+                        format!("{} seconds", cfg.hooks.timeout().as_secs()),
+                        RowKind::Info,
+                    ));
+                }
+                rows
+            }
             Tab::Modes => {
                 let mut rows = vec![Row::new("active mode", self.active_mode.clone(), RowKind::ActiveMode)];
                 for (i, m) in self.modes.iter().enumerate() {
@@ -707,6 +733,15 @@ impl Panel {
                         };
                         Row::new(name.clone(), value, RowKind::Permission(name)).note(note)
                     })
+                    .chain(cfg.permissions.rules.list().into_iter().map(|(policy, rule)| {
+                        let scope = ops::rule_scope(&self.layers, &rule).label();
+                        Row::new(
+                            format!("rule · {}", policy_label(policy)),
+                            rule.clone(),
+                            RowKind::Rule(policy, rule),
+                        )
+                        .note(scope)
+                    }))
                     .collect()
             }
             Tab::General => vec![
@@ -719,6 +754,14 @@ impl Panel {
                 Row::new("cost display", on_off(cfg.general.show_cost()), RowKind::ShowCost),
                 Row::new("auto-compact", on_off(cfg.general.auto_compact()), RowKind::AutoCompact)
                     .note("compact when the context is 80% full"),
+                Row::new(
+                    "read-only commands",
+                    on_off(cfg.general.safe_commands().is_some()),
+                    RowKind::ReadOnly,
+                )
+                .note("ls, git status and the like run without asking"),
+                Row::new("bash sandbox", on_off(cfg.general.sandbox()), RowKind::Sandbox)
+                    .note("scrubbed environment only; not OS isolation, see /doctor"),
                 Row::new(
                     "session spend cap",
                     cfg.limits.session_usd.map(|v| format!("${v:.2}")).unwrap_or_else(|| "off".into()),
@@ -932,6 +975,10 @@ impl Panel {
             }
             (Tab::Permissions, 's', Some(RowKind::Permission(tool))) => {
                 self.set_policy(&tool, Policy::Ask)
+            }
+            (Tab::Permissions, 'd', Some(RowKind::Rule(policy, rule))) => {
+                let result = ops::remove_permission_rule(&mut self.layers, policy, &rule);
+                self.saved(format!("rule {rule} deleted"), result)
             }
             (Tab::Permissions, 'd', Some(RowKind::Permission(tool))) => {
                 self.set_policy(&tool, Policy::Deny)
@@ -1148,6 +1195,10 @@ impl Panel {
                 ));
                 None
             }
+            RowKind::Rule(_, rule) => {
+                self.say(format!("{rule}: press d to delete it"));
+                None
+            }
             RowKind::QuotaProvider(name) => {
                 self.data.quota.insert(name.clone(), QuotaState::Loading);
                 Some(Effect::RefreshQuota(Some(name)))
@@ -1255,6 +1306,20 @@ impl Panel {
                     g.auto_compact = Some(value)
                 });
                 self.saved(format!("auto-compact {}", on_off(value)), result)
+            }
+            RowKind::ReadOnly => {
+                let value = cfg.general.safe_commands().is_none();
+                let result = ops::set_general(&mut self.layers, GeneralField::ReadOnly, |g| {
+                    g.auto_allow_read_only = Some(value)
+                });
+                self.saved(format!("read-only commands without asking: {}", on_off(value)), result)
+            }
+            RowKind::Sandbox => {
+                let value = !cfg.general.sandbox();
+                let result = ops::set_general(&mut self.layers, GeneralField::Sandbox, |g| {
+                    g.sandbox = Some(value)
+                });
+                self.saved(format!("bash sandbox {}", on_off(value)), result)
             }
             RowKind::SessionCap | RowKind::DayCap => {
                 let day = kind == RowKind::DayCap;
