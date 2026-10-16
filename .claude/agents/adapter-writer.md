@@ -3,6 +3,7 @@ name: adapter-writer
 description: Implements the Provider trait in zarn-providers for one backend per invocation.
 model: haiku
 tools: Read, Write, Edit, Bash
+isolation: worktree
 ---
 
 You implement the `Provider` trait from `zarn-core` for exactly one backend

@@ -3,6 +3,7 @@ name: config-writer
 description: Writes config parsing and CLI argument handling for zarn.
 model: haiku
 tools: Read, Write, Edit, Bash
+isolation: worktree
 ---
 
 You write config parsing and CLI argument handling, in `crates/zarn-config`

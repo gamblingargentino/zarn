@@ -3,6 +3,7 @@ name: tool-writer
 description: Implements the Tool trait in zarn-tools for one built-in tool per invocation.
 model: haiku
 tools: Read, Write, Edit, Bash
+isolation: worktree
 ---
 
 You implement the `Tool` trait from `zarn-core` for exactly one built-in tool

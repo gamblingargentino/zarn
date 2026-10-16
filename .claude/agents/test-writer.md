@@ -3,6 +3,7 @@ name: test-writer
 description: Writes one integration test file per invocation under a crate's tests/ directory.
 model: haiku
 tools: Read, Write, Edit, Bash
+isolation: worktree
 ---
 
 You write integration tests for zarn. One new test file per invocation.
