@@ -33,6 +33,7 @@ pub const BUILTINS: &[(&str, &str, &str)] = &[
     ("logout", "[provider]", "remove a provider's API key"),
     ("provider", "[list|add|switch [name]]", "list, add or switch providers"),
     ("model", "[name]", "pick a model, or set one directly"),
+    ("mode", "[name]", "pick a mode, or switch: default, plan, accept-edits, bypass, custom"),
     ("config", "", "open the settings panel"),
     ("skills", "", "list skills and turn them on or off"),
     ("mcp", "[list|add|remove|restart]", "manage MCP servers"),
@@ -98,11 +99,14 @@ pub fn query(input: &str) -> Option<&str> {
 
 pub fn filter<'a>(entries: &'a [Entry], query: &str) -> Vec<&'a Entry> {
     let needle = query.to_lowercase();
+    let mut exact: Vec<&Entry> = Vec::new();
     let mut starts: Vec<&Entry> = Vec::new();
     let mut contains: Vec<&Entry> = Vec::new();
     for entry in entries {
         let name = entry.name.to_lowercase();
-        if name.starts_with(&needle) {
+        if !needle.is_empty() && name == needle {
+            exact.push(entry);
+        } else if name.starts_with(&needle) {
             starts.push(entry);
         } else if !needle.is_empty()
             && (name.contains(&needle) || entry.description.to_lowercase().contains(&needle))
@@ -110,8 +114,9 @@ pub fn filter<'a>(entries: &'a [Entry], query: &str) -> Vec<&'a Entry> {
             contains.push(entry);
         }
     }
-    starts.extend(contains);
-    starts
+    exact.extend(starts);
+    exact.extend(contains);
+    exact
 }
 
 pub fn split(line: &str) -> Option<(String, String)> {
@@ -198,6 +203,13 @@ mod tests {
             all.iter().find(|e| e.name == "pdf").unwrap().origin,
             Origin::Skill
         );
+    }
+
+    #[test]
+    fn an_exact_name_ranks_above_longer_names_that_share_its_prefix() {
+        let all = entries(&[], &[]);
+        let names: Vec<&str> = filter(&all, "mode").iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(&names[..2], &["mode", "model"]);
     }
 
     #[test]

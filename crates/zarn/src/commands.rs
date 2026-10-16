@@ -379,3 +379,33 @@ pub async fn doctor(offline: bool) -> Result<()> {
     }
     Ok(())
 }
+
+pub fn modes_list() -> Result<()> {
+    let loaded = zarn_config::modes::load();
+    let current = Config::load().map(|c| c.general.mode()).unwrap_or_else(|_| "default".into());
+    for file in &loaded.modes {
+        let mark = if file.def.name == current { "*" } else { " " };
+        println!(
+            "{mark} {:<16} {:<9} {}",
+            file.def.name,
+            file.source.label(),
+            file.def.description
+        );
+    }
+    for warning in &loaded.warnings {
+        eprintln!("warning: {warning}");
+    }
+    Ok(())
+}
+
+pub fn modes_show(name: &str) -> Result<()> {
+    let loaded = zarn_config::modes::load();
+    let Some(file) = loaded.find(name) else {
+        bail!(
+            "no mode named '{name}'; modes: {}",
+            loaded.names().join(", ")
+        );
+    };
+    println!("{}", zarn_config::modes::describe(file));
+    Ok(())
+}

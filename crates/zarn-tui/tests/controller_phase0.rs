@@ -8,6 +8,9 @@ use zarn_tui::state::Block;
 #[tokio::test]
 async fn messages_sent_while_streaming_are_queued_and_sent_in_order() {
     let mock = server(|body| {
+        if system_text(body).starts_with("Write a title") {
+            return (sse("Title"), 0);
+        }
         let last = body["messages"].as_array().unwrap().last().unwrap()["content"]
             .as_str()
             .unwrap_or_default()
@@ -28,7 +31,7 @@ async fn messages_sent_while_streaming_are_queued_and_sent_in_order() {
     c.settle(Duration::from_secs(10)).await;
     assert_eq!(assistant(&c), vec!["re: one", "re: two", "re: three"]);
     assert!(c.app().queue.is_empty());
-    let users: Vec<String> = bodies(&mock)
+    let users: Vec<String> = chat_bodies(&mock)
         .await
         .iter()
         .map(|b| b["messages"].as_array().unwrap().last().unwrap()["content"].as_str().unwrap().to_string())
@@ -49,12 +52,12 @@ async fn esc_cancels_the_turn_but_keeps_the_queue_until_a_second_esc() {
     assert!(!c.app().streaming);
     assert_eq!(c.app().queue, vec!["two"]);
     assert!(notices(&c).iter().any(|n| n.contains("1 queued message kept")));
-    assert_eq!(bodies(&mock).await.len(), 1);
+    assert_eq!(chat_bodies(&mock).await.len(), 1);
 
     c.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
     assert!(c.app().queue.is_empty());
     c.settle(Duration::from_millis(300)).await;
-    assert_eq!(bodies(&mock).await.len(), 1);
+    assert_eq!(chat_bodies(&mock).await.len(), 1);
 }
 
 #[tokio::test]
@@ -80,11 +83,11 @@ async fn a_full_context_is_compacted_before_the_next_turn_and_said_so() {
             .filter(|b| system_text(b).starts_with("Summarize the conversation"))
             .count()
     };
-    assert_eq!(summaries(&bodies(&mock).await), 0, "too short to split, so left alone");
+    assert_eq!(summaries(&chat_bodies(&mock).await), 0, "too short to split, so left alone");
     assert!(!notices(&c).iter().any(|n| n.contains("compacted")));
 
     turn(&mut c, &format!("question number 4 {}", "padding ".repeat(20))).await;
-    assert_eq!(summaries(&bodies(&mock).await), 1);
+    assert_eq!(summaries(&chat_bodies(&mock).await), 1);
     let said = notices(&c);
     assert!(said.iter().any(|n| n.contains("full; compacting before the next turn")), "{said:?}");
     assert!(said.iter().any(|n| n.starts_with("compacted")));
@@ -104,7 +107,7 @@ async fn auto_compaction_can_be_turned_off() {
         turn(&mut c, &format!("q{i} {}", "padding ".repeat(20))).await;
     }
     assert!(!notices(&c).iter().any(|n| n.contains("compact")));
-    assert_eq!(bodies(&mock).await.len(), 6);
+    assert_eq!(chat_bodies(&mock).await.len(), 6);
 }
 
 #[tokio::test]
@@ -139,7 +142,7 @@ async fn a_changed_zarn_md_is_used_on_the_next_turn_without_a_restart() {
     )
     .unwrap();
     turn(&mut c, "second").await;
-    let sent = bodies(&mock).await;
+    let sent = chat_bodies(&mock).await;
     assert!(system_text(&sent[0]).contains("use tabs"));
     assert!(system_text(&sent[1]).contains("use spaces"));
     assert!(system_text(&sent[1]).contains("lint: run the linter"));

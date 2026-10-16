@@ -17,6 +17,8 @@ pub struct Meta {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -137,6 +139,13 @@ impl Session {
         Ok(())
     }
 
+    pub fn set_title(&mut self, title: &str) -> Result<()> {
+        self.meta.title = Some(title.to_string());
+        self.meta.updated = now();
+        let record = Record::Meta(self.meta.clone());
+        self.write(&record)
+    }
+
     pub fn record_usage(&mut self, input: u64, output: u64, cached: u64) -> Result<()> {
         self.meta.input_tokens += input;
         self.meta.output_tokens += output;
@@ -237,6 +246,20 @@ mod tests {
         assert_eq!(meta.input_tokens, 11);
         assert_eq!(meta.output_tokens, 6);
         assert_eq!(meta.cached_tokens, 2);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn a_title_is_stored_in_the_latest_meta_record() {
+        let root = temp();
+        let cwd = Path::new("/project/titled");
+        let mut session = Session::create(&root, cwd, "m", None).unwrap();
+        session.append(&Message::user("fix the parser")).unwrap();
+        session.set_title("Fix the parser").unwrap();
+        session.record_usage(1, 1, 0).unwrap();
+        let (meta, messages) = read(session.path()).unwrap();
+        assert_eq!(meta.title.as_deref(), Some("Fix the parser"));
+        assert_eq!(messages.len(), 1);
         std::fs::remove_dir_all(root).ok();
     }
 

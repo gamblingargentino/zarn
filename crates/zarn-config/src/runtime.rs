@@ -8,9 +8,13 @@ use std::path::Path;
 use std::sync::Arc;
 use zarn_core::agent::AgentConfig;
 use zarn_core::provider::Provider;
-use zarn_core::subagent::{ProviderFactory, TaskTool, ToolFactory};
+use crate::modes::{self, ModeDef};
+use std::collections::HashSet;
+use std::sync::Mutex;
+use zarn_core::subagent::{AgentDef, ProviderFactory, TaskTool, ToolFactory};
 use zarn_core::tools::{Ctx, Tool, ToolRegistry};
-use zarn_providers::{PinnedModel, ProviderSpec, Switch, SwitchSink};
+use zarn_providers::{FallbackProvider, PinnedModel, ProviderSpec, Switch, SwitchSink};
+use zarn_tools::exit_plan::{ExitPlan, PlanApprover};
 use zarn_tools::skill::{Skill, SkillTool};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -174,30 +178,154 @@ impl Providers {
         }
     }
 
+}
+
+pub const AGENT_ROLES: [&str; 3] = ["explore", "plan", "review"];
+
+#[derive(Clone)]
+pub struct Router {
+    pub providers: Providers,
+    pub main_name: String,
+    warned: Arc<Mutex<HashSet<String>>>,
+}
+
+#[derive(Clone)]
+pub struct Routed {
+    pub provider: Arc<dyn Provider>,
+    pub model: String,
+    pub provider_name: String,
+}
+
+impl Router {
+    pub fn new(providers: Providers, main_name: impl Into<String>) -> Self {
+        Router {
+            providers,
+            main_name: main_name.into(),
+            warned: Arc::default(),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.providers.cfg.routing.enabled()
+    }
+
+    pub fn configured(&self, role: &str) -> bool {
+        self.enabled()
+            && self
+                .providers
+                .cfg
+                .routing
+                .roles
+                .get(role)
+                .is_some_and(|r| r.provider.is_some() || r.model.is_some())
+    }
+
+    fn main(&self) -> Routed {
+        Routed {
+            provider: self.providers.main.clone(),
+            model: self.providers.main_model.clone(),
+            provider_name: self.main_name.clone(),
+        }
+    }
+
+    fn warn_once(&self, role: &str, text: String) {
+        let first = self
+            .warned
+            .lock()
+            .map(|mut w| w.insert(role.to_string()))
+            .unwrap_or(true);
+        if first {
+            self.providers.say(text);
+        }
+    }
+
+    pub fn for_role(&self, role: &str) -> Routed {
+        if !self.configured(role) {
+            return self.main();
+        }
+        let spec = self.providers.cfg.routing.roles[role].clone();
+        let name = spec.provider.clone().unwrap_or_else(|| self.main_name.clone());
+        let model = spec
+            .model
+            .clone()
+            .or_else(|| crate::ops::model_for(&self.providers.cfg, &name))
+            .unwrap_or_else(|| self.providers.main_model.clone());
+        if name == self.main_name {
+            return Routed {
+                provider: PinnedModel::wrap(self.providers.main.clone(), model.clone()),
+                model,
+                provider_name: name,
+            };
+        }
+        match self.providers.chain(std::slice::from_ref(&name)) {
+            Err(why) => {
+                self.warn_once(
+                    role,
+                    format!(
+                        "routing role {role}: {why}, answered by {} with {}",
+                        self.main_name, self.providers.main_model
+                    ),
+                );
+                self.main()
+            }
+            Ok(provider) => {
+                let chain = FallbackProvider::named(vec![
+                    (name.clone(), PinnedModel::wrap(provider, model.clone())),
+                    (
+                        self.main_name.clone(),
+                        PinnedModel::wrap(self.providers.main.clone(), self.providers.main_model.clone()),
+                    ),
+                ]);
+                let chain = match switch_sink(&self.providers.notify) {
+                    Some(sink) => chain.with_sink(sink),
+                    None => chain,
+                };
+                Routed {
+                    provider: Arc::new(chain),
+                    model,
+                    provider_name: name,
+                }
+            }
+        }
+    }
+
+    pub fn for_agent(&self, def: &AgentDef) -> Arc<dyn Provider> {
+        if let Some(model) = def.model.as_deref().filter(|m| !m.trim().is_empty()) {
+            let (provider, model) = self.providers.for_model(Some(model));
+            return PinnedModel::wrap(provider, model);
+        }
+        let role = if AGENT_ROLES.contains(&def.name.as_str()) && self.configured(&def.name) {
+            def.name.as_str()
+        } else {
+            "subagent"
+        };
+        let routed = self.for_role(role);
+        PinnedModel::wrap(routed.provider, routed.model)
+    }
+
     pub fn factory(&self) -> ProviderFactory {
         let me = self.clone();
-        Arc::new(move |model: Option<&str>| {
-            let (provider, model) = me.for_model(model);
-            PinnedModel::wrap(provider, model)
-        })
+        Arc::new(move |def: &AgentDef| me.for_agent(def))
     }
 }
 
 pub struct Runtime {
     pub plan: Plan,
+    pub model: String,
+    pub mode: ModeDef,
+    pub router: Router,
     pub provider: Arc<dyn Provider>,
     pub tools: Arc<ToolRegistry>,
     pub system: String,
     pub parts: context::SystemParts,
     pub skills: Vec<Skill>,
     pub agents: Vec<AgentFile>,
-    pub providers: Providers,
 }
 
 impl Runtime {
     pub fn agent_config(&self) -> AgentConfig {
         AgentConfig {
-            model: self.plan.model.clone(),
+            model: self.model.clone(),
             ..AgentConfig::default()
         }
     }
@@ -226,6 +354,12 @@ pub fn enabled_skills(cfg: &Config, all: Vec<Skill>) -> Vec<Skill> {
 pub struct Assembly {
     pub store: Arc<KeyStore>,
     pub notify: Option<Notify>,
+    pub mode: Option<ModeDef>,
+    pub approver: Option<Arc<dyn PlanApprover>>,
+}
+
+fn allowed(mode: &ModeDef, name: &str) -> bool {
+    mode.tools.is_empty() || mode.tools.iter().any(|t| t.eq_ignore_ascii_case(name)) || name == "exit_plan"
 }
 
 pub fn assemble(
@@ -236,53 +370,68 @@ pub fn assemble(
     extra_tools: Vec<Box<dyn Tool>>,
     assembly: Assembly,
 ) -> Result<Runtime> {
-    let provider = guarded_named(&plan.entries(), switch_sink(&assembly.notify))?;
+    let base = guarded_named(&plan.entries(), switch_sink(&assembly.notify))?;
     let providers = Providers {
         cfg: cfg.clone(),
         store: assembly.store.clone(),
-        main: provider.clone(),
+        main: base,
         main_model: plan.model.clone(),
         notify: assembly.notify.clone(),
     };
+    let router = Router::new(providers, plan.provider_name.clone());
+    let mode = assembly
+        .mode
+        .clone()
+        .unwrap_or_else(|| modes::builtin("default").expect("default mode"));
+    let role = if mode.safe_only && router.configured("plan") { "plan" } else { "main" };
+    let main = router.for_role(role);
     let skills = enabled_skills(cfg, context::discover_skills());
     let agents = agents::load();
     let budget = cfg.general.context_budget.unwrap_or(DEFAULT_BUDGET);
-    let parts = context::system_parts(cwd, &skills, budget);
+    let mut parts = context::system_parts(cwd, &skills, budget);
+    parts.mode = modes::prompt_section(&mode);
     let system = parts.join();
 
-    let mut registry = ToolRegistry::new();
-    for tool in zarn_tools::builtin_list() {
-        registry.register(redacting(tool));
-    }
+    let mut tools: Vec<Box<dyn Tool>> = zarn_tools::builtin_list();
     if !skills.is_empty() {
-        registry.register(redacting(Box::new(SkillTool::new(skills.clone()))));
+        tools.push(Box::new(SkillTool::new(skills.clone())));
     }
     if !agents.is_empty() {
-        let task = TaskTool::new(
+        tools.push(Box::new(TaskTool::new(
             agents.iter().map(|a| a.def.clone()).collect(),
-            providers.factory(),
+            router.factory(),
             subagent_tools(),
             ctx,
             AgentConfig {
-                model: plan.model.clone(),
+                model: main.model.clone(),
                 ..AgentConfig::default()
             },
-        );
-        registry.register(redacting(Box::new(task)));
+        )));
     }
-    for tool in extra_tools {
-        registry.register(redacting(tool));
+    if mode.safe_only
+        && let Some(approver) = assembly.approver.clone()
+    {
+        tools.push(Box::new(ExitPlan::new(approver)));
+    }
+    tools.extend(extra_tools);
+    let mut registry = ToolRegistry::new();
+    for tool in tools {
+        if allowed(&mode, &tool.spec().name) {
+            registry.register(redacting(tool));
+        }
     }
 
     Ok(Runtime {
         plan,
-        provider,
+        model: main.model.clone(),
+        mode,
+        provider: main.provider,
+        router,
         tools: Arc::new(registry),
         system,
         parts,
         skills,
         agents,
-        providers,
     })
 }
 

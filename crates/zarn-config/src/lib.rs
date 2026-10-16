@@ -5,10 +5,12 @@ pub mod context;
 pub mod doctor;
 pub mod guard;
 pub mod layers;
+pub mod modes;
 pub mod ops;
 pub mod paths;
 pub mod pricing;
 pub mod runtime;
+pub mod titles;
 
 use anyhow::{Context, Result, bail};
 use auth::{KeySource, KeyStore};
@@ -46,6 +48,8 @@ pub struct General {
     pub context_budget: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_compact: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 impl General {
@@ -56,6 +60,7 @@ impl General {
         self.show_cost = self.show_cost.or(other.show_cost);
         self.context_budget = self.context_budget.or(other.context_budget);
         self.auto_compact = self.auto_compact.or(other.auto_compact);
+        self.mode = self.mode.take().or(other.mode);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -72,6 +77,49 @@ impl General {
 
     pub fn auto_compact(&self) -> bool {
         self.auto_compact.unwrap_or(true)
+    }
+
+    pub fn mode(&self) -> String {
+        self.mode.clone().unwrap_or_else(|| "default".to_string())
+    }
+}
+
+pub const ROLES: [&str; 8] = [
+    "main", "subagent", "explore", "plan", "compact", "title", "init", "review",
+];
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct RoleSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct Routing {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub roles: BTreeMap<String, RoleSpec>,
+}
+
+impl Routing {
+    pub fn is_empty(&self) -> bool {
+        *self == Routing::default()
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled.unwrap_or(false)
+    }
+
+    fn fill_from(&mut self, other: Routing) {
+        self.enabled = self.enabled.or(other.enabled);
+        for (role, spec) in other.roles {
+            let entry = self.roles.entry(role).or_default();
+            entry.provider = entry.provider.take().or(spec.provider);
+            entry.model = entry.model.take().or(spec.model);
+        }
     }
 }
 
@@ -115,6 +163,8 @@ pub struct Config {
     pub mcp: BTreeMap<String, ServerConfig>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub pricing: BTreeMap<String, Rates>,
+    #[serde(default, skip_serializing_if = "Routing::is_empty")]
+    pub routing: Routing,
 }
 
 impl Config {
@@ -148,6 +198,7 @@ impl Config {
         for (prefix, rates) in other.pricing {
             self.pricing.entry(prefix).or_insert(rates);
         }
+        self.routing.fill_from(other.routing);
     }
 
     pub fn home_path() -> Option<PathBuf> {
@@ -192,6 +243,26 @@ impl Config {
                     "provider '{name}' sets api_key inline. Secrets never belong in a config file: delete that line and run `zarn login {name}` to keep the key in the OS credential store, or set api_key_env = \"SOME_ENV_VAR\" naming the variable that holds it."
                 );
             }
+        }
+        for (role, spec) in &self.routing.roles {
+            if !ROLES.contains(&role.as_str()) {
+                bail!(
+                    "routing role '{role}' is not a role zarn knows; use one of {}",
+                    ROLES.join(", ")
+                );
+            }
+            if let Some(provider) = &spec.provider
+                && !self.providers.contains_key(provider)
+            {
+                bail!(
+                    "routing role '{role}' names provider '{provider}', which is not configured"
+                );
+            }
+        }
+        if let Some(mode) = &self.general.mode
+            && !catalog::valid_name(mode)
+        {
+            bail!("general.mode '{mode}' is not a valid mode name");
         }
         for (prefix, rates) in &self.pricing {
             if [rates.input, rates.output, rates.cached]

@@ -10,6 +10,7 @@ use tokio::sync::oneshot;
 use zarn_core::agent::AgentEvent;
 use zarn_core::provider::Event;
 use zarn_core::tools::Risk;
+use zarn_tools::exit_plan::PlanVerdict;
 use zarn_tools::permissions::Answer;
 
 pub const COLLAPSED_LINES: usize = 3;
@@ -20,6 +21,25 @@ pub struct PermissionRequest {
     pub risk: Risk,
     pub args: Value,
     pub reply: oneshot::Sender<Answer>,
+}
+
+#[derive(Debug)]
+pub struct PlanReview {
+    pub plan: String,
+    pub reply: Option<oneshot::Sender<PlanVerdict>>,
+    pub feedback: Option<crate::widgets::TextField>,
+    pub decided: Option<PlanVerdict>,
+}
+
+impl PlanReview {
+    pub fn new(plan: impl Into<String>, reply: oneshot::Sender<PlanVerdict>) -> Self {
+        PlanReview {
+            plan: plan.into(),
+            reply: Some(reply),
+            feedback: None,
+            decided: None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -68,6 +88,7 @@ pub struct Status {
     pub cached_tokens: u64,
     pub cost: Option<f64>,
     pub context: Option<(u32, u32)>,
+    pub mode: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -78,6 +99,12 @@ pub enum ChatPick {
     Resume,
     Login,
     Logout,
+    Mode,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConfirmFor {
+    Bypass,
 }
 
 #[derive(Debug)]
@@ -87,6 +114,7 @@ pub enum Overlay {
         input: MaskedInput,
         provider: String,
     },
+    Confirm(String, ConfirmFor),
 }
 
 #[derive(Default)]
@@ -108,6 +136,9 @@ pub enum Action {
     Picked(ChatPick, String),
     Login(String, Secret),
     SendQueued,
+    CycleMode,
+    Confirmed(ConfirmFor),
+    Plan(PlanVerdict),
 }
 
 #[derive(Clone, Debug)]
@@ -148,6 +179,7 @@ pub struct App {
     pub not_ready: Option<String>,
     pub queue: Vec<String>,
     pub queue_paused: bool,
+    pub plan_review: Option<PlanReview>,
     ctrl_c_armed: bool,
 }
 
@@ -174,6 +206,7 @@ impl App {
         matches!(self.mode, Mode::Chat)
             && self.overlay.is_none()
             && self.pending.is_none()
+            && self.plan_review.is_none()
             && !self.popup_hidden
             && !self.popup_matches().is_empty()
     }
@@ -198,6 +231,7 @@ impl App {
         match &mut self.overlay {
             Some(Overlay::Secret { input, .. }) => input.paste(text),
             Some(Overlay::Pick(picker, _)) => picker.filter.paste(text),
+            Some(Overlay::Confirm(..)) => {}
             None if self.pending.is_none() => {
                 for c in text.chars().filter(|c| *c != '\r') {
                     self.insert(c);
@@ -216,6 +250,17 @@ impl App {
                     None
                 }
                 Pick::Chosen(value) | Pick::Custom(value) => Some(Action::Picked(purpose, value)),
+            },
+            Overlay::Confirm(text, purpose) => match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') => Some(Action::Confirmed(purpose)),
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.notice("cancelled");
+                    None
+                }
+                _ => {
+                    self.overlay = Some(Overlay::Confirm(text, purpose));
+                    None
+                }
             },
             Overlay::Secret {
                 mut input,
@@ -436,6 +481,10 @@ impl App {
             return self.on_permission_key(key);
         }
 
+        if self.plan_review.as_ref().is_some_and(|r| r.decided.is_none()) {
+            return self.on_plan_key(key);
+        }
+
         match &mut self.mode {
             Mode::Panel(panel) => return panel.on_key(key).map(Action::Panel),
             Mode::Onboarding(flow) => return flow.on_key(key).map(Action::Onboard),
@@ -451,6 +500,8 @@ impl App {
         }
 
         match (key.code, key.modifiers) {
+            (KeyCode::BackTab, _) => return Some(Action::CycleMode),
+            (KeyCode::Tab, m) if m.contains(KeyModifiers::SHIFT) => return Some(Action::CycleMode),
             (KeyCode::Char('r'), m) if m.contains(KeyModifiers::CONTROL) => {
                 self.expand_last_output()
             }
@@ -505,6 +556,49 @@ impl App {
         }
 
         None
+    }
+
+    fn on_plan_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let review = self.plan_review.as_mut()?;
+        if let Some(field) = review.feedback.as_mut() {
+            match key.code {
+                KeyCode::Esc => review.feedback = None,
+                KeyCode::Enter => {
+                    let text = field.value.trim().to_string();
+                    let verdict = PlanVerdict::Reject(if text.is_empty() {
+                        "no feedback given".into()
+                    } else {
+                        text
+                    });
+                    review.decided = Some(verdict.clone());
+                    return Some(Action::Plan(verdict));
+                }
+                _ => {
+                    field.on_key(key);
+                }
+            }
+            return None;
+        }
+        let verdict = match key.code {
+            KeyCode::Char('a') | KeyCode::Char('A') => PlanVerdict::Approve("accept-edits".into()),
+            KeyCode::Char('d') | KeyCode::Char('D') => PlanVerdict::Approve("default".into()),
+            KeyCode::Char('r') | KeyCode::Char('R') => {
+                review.feedback = Some(crate::widgets::TextField::new(""));
+                return None;
+            }
+            KeyCode::Esc => PlanVerdict::Reject("the user dismissed the plan without feedback".into()),
+            KeyCode::PageUp => {
+                self.scroll_up = self.scroll_up.saturating_add(10);
+                return None;
+            }
+            KeyCode::PageDown => {
+                self.scroll_up = self.scroll_up.saturating_sub(10);
+                return None;
+            }
+            _ => return None,
+        };
+        review.decided = Some(verdict.clone());
+        Some(Action::Plan(verdict))
     }
 
     fn on_permission_key(&mut self, key: KeyEvent) -> Option<Action> {
@@ -641,6 +735,39 @@ mod tests {
         app.streaming = true;
         assert_eq!(typed(&mut app, "/cost"), Some(Action::Command("/cost".into())));
         assert!(app.queue.is_empty());
+    }
+
+    #[test]
+    fn shift_tab_asks_to_cycle_the_mode() {
+        let mut app = App::new("m");
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            Some(Action::CycleMode)
+        );
+    }
+
+    #[test]
+    fn a_plan_review_takes_approval_or_typed_feedback() {
+        let (tx, _rx) = oneshot::channel();
+        let mut app = App::new("m");
+        app.plan_review = Some(PlanReview::new("1. do it", tx));
+        app.on_key(key(KeyCode::Char('x')));
+        assert!(app.input.is_empty());
+        assert_eq!(
+            app.on_key(key(KeyCode::Char('a'))),
+            Some(Action::Plan(PlanVerdict::Approve("accept-edits".into())))
+        );
+
+        let (tx, _rx) = oneshot::channel();
+        app.plan_review = Some(PlanReview::new("1. do it", tx));
+        app.on_key(key(KeyCode::Char('r')));
+        for c in "add tests".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Action::Plan(PlanVerdict::Reject("add tests".into())))
+        );
     }
 
     #[test]

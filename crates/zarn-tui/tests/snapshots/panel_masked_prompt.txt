@@ -1,5 +1,5 @@
 ╭ zarn settings · changes save as you go ──────────────────────────────────────────────────────────╮
-│Providers │ Models │ Skills │ MCP │ Agents │ Permissions │ General                                │
+│Providers │ Models │ Skills │ MCP │ Agents │ Modes │ Permissions │ General                        │
 │                                                                                                  │
 │› claude (default)  anthropic · NO KEY · user                                                     │
 │  local      ╭ API key for claude ──────────────────────────────────────────────────╮             │

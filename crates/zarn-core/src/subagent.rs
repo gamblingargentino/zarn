@@ -78,7 +78,7 @@ pub fn load_definitions(dir: &Path) -> Vec<AgentDef> {
     defs
 }
 
-pub type ProviderFactory = Arc<dyn Fn(Option<&str>) -> Arc<dyn Provider> + Send + Sync>;
+pub type ProviderFactory = Arc<dyn Fn(&AgentDef) -> Arc<dyn Provider> + Send + Sync>;
 pub type ToolFactory = Arc<dyn Fn(&[String]) -> ToolRegistry + Send + Sync>;
 
 pub struct TaskTool {
@@ -168,7 +168,7 @@ impl Tool for TaskTool {
             return Ok(ToolOutput::error(format!("no agent named {name}")));
         };
 
-        let provider = (self.providers)(def.model.as_deref());
+        let provider = (self.providers)(def);
         let registry = Arc::new((self.tools)(&def.tools));
         let config = AgentConfig {
             model: def.model.clone().unwrap_or_else(|| self.config.model.clone()),

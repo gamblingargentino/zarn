@@ -445,6 +445,65 @@ pub fn set_general(
     Ok(())
 }
 
+pub fn set_routing_enabled(layers: &mut Layers, enabled: bool) -> Result<Scope> {
+    let scope = layers.routing_scope();
+    layers.layer_mut(scope).routing.enabled = Some(enabled);
+    layers.save(scope)?;
+    Ok(scope)
+}
+
+pub fn set_role(
+    layers: &mut Layers,
+    role: &str,
+    provider: Option<&str>,
+    model: Option<&str>,
+) -> Result<Scope> {
+    if !crate::ROLES.contains(&role) {
+        bail!("'{role}' is not a routing role; use one of {}", crate::ROLES.join(", "));
+    }
+    if let Some(provider) = provider
+        && !layers.merged().providers.contains_key(provider)
+    {
+        bail!("no provider named '{provider}'");
+    }
+    let scope = layers.role_scope(role);
+    let entry = layers
+        .layer_mut(scope)
+        .routing
+        .roles
+        .entry(role.to_string())
+        .or_default();
+    entry.provider = provider.map(str::to_string);
+    entry.model = model.map(str::trim).filter(|m| !m.is_empty()).map(str::to_string);
+    layers.save(scope)?;
+    Ok(scope)
+}
+
+pub fn clear_role(layers: &mut Layers, role: &str) -> Result<()> {
+    let mut found = false;
+    for scope in [Scope::Project, Scope::User] {
+        if layers.layer_mut(scope).routing.roles.remove(role).is_some() {
+            found = true;
+            layers.save(scope)?;
+        }
+    }
+    if !found {
+        bail!("routing role '{role}' is not set");
+    }
+    Ok(())
+}
+
+pub fn role_label(cfg: &Config, role: &str) -> String {
+    match cfg.routing.roles.get(role) {
+        Some(spec) if spec.provider.is_some() || spec.model.is_some() => format!(
+            "{} · {}",
+            spec.provider.as_deref().unwrap_or("main provider"),
+            spec.model.as_deref().unwrap_or("its default model")
+        ),
+        _ => "main model".to_string(),
+    }
+}
+
 pub fn set_skill_enabled(layers: &mut Layers, name: &str, enabled: bool) -> Result<Scope> {
     let scope = layers.skill_scope(name);
     let layer = layers.layer_mut(scope);
@@ -614,6 +673,47 @@ mod tests {
         assert_eq!(stdio.args, vec!["-y", "srv"]);
         let http = parse_server(&["https://example.com/mcp".into()]).unwrap();
         assert_eq!(http.url.as_deref(), Some("https://example.com/mcp"));
+    }
+
+    #[test]
+    fn routing_edits_round_trip_and_validate() {
+        let (_d, mut layers, _store) = fixture();
+        add_provider(&mut layers, &draft("a", "openai")).unwrap();
+        set_routing_enabled(&mut layers, true).unwrap();
+        set_role(&mut layers, "compact", Some("a"), Some("small")).unwrap();
+        let cfg = layers.merged();
+        assert!(cfg.routing.enabled());
+        assert_eq!(cfg.routing.roles["compact"].model.as_deref(), Some("small"));
+        assert_eq!(role_label(&cfg, "compact"), "a · small");
+        assert_eq!(role_label(&cfg, "title"), "main model");
+        assert!(set_role(&mut layers, "compact", Some("ghost"), None).is_err());
+        assert!(set_role(&mut layers, "nonsense", Some("a"), None).is_err());
+        clear_role(&mut layers, "compact").unwrap();
+        assert!(!layers.merged().routing.roles.contains_key("compact"));
+    }
+
+    #[test]
+    fn a_role_naming_a_missing_provider_is_rejected_naming_both() {
+        let cfg: Config = toml::from_str(
+            "[routing]\nenabled = true\n\n[routing.roles.explore]\nprovider = \"groq\"\nmodel = \"llama\"\n",
+        )
+        .unwrap();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("explore") && err.contains("groq"), "{err}");
+    }
+
+    #[test]
+    fn routing_merges_across_layers_with_the_project_winning() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("p.toml");
+        let u = dir.path().join("u.toml");
+        std::fs::write(&p, "[providers.a]\nkind = \"openai\"\n\n[routing.roles.compact]\nmodel = \"project-small\"\n").unwrap();
+        std::fs::write(&u, "[providers.b]\nkind = \"openai\"\n\n[routing]\nenabled = true\n\n[routing.roles.compact]\nprovider = \"b\"\nmodel = \"user-small\"\n\n[routing.roles.title]\nprovider = \"a\"\n").unwrap();
+        let cfg = Layers::load_from(p, Some(u)).unwrap().merged();
+        assert!(cfg.routing.enabled());
+        assert_eq!(cfg.routing.roles["compact"].model.as_deref(), Some("project-small"));
+        assert_eq!(cfg.routing.roles["compact"].provider.as_deref(), Some("b"));
+        assert_eq!(cfg.routing.roles["title"].provider.as_deref(), Some("a"));
     }
 
     #[tokio::test]

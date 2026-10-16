@@ -2,7 +2,7 @@ mod support;
 
 use std::sync::{Arc, Mutex};
 use support::*;
-use zarn_config::runtime::{self, Providers};
+use zarn_config::runtime::{self, Providers, Router};
 use zarn_core::agent::AgentConfig;
 use zarn_core::subagent::{AgentDef, TaskTool};
 use zarn_core::tools::{Ctx, Tool, ToolRegistry};
@@ -23,7 +23,7 @@ fn task(providers: &Providers, model: Option<&str>) -> TaskTool {
             model: model.map(str::to_string),
             instructions: "be brief".into(),
         }],
-        providers.factory(),
+        Router::new(providers.clone(), "main").factory(),
         Arc::new(|_: &[String]| ToolRegistry::new()),
         Arc::new(Ctx::new(".")),
         AgentConfig {

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use zarn_config::auth::{KeyStore, redact};
 use zarn_config::guard::RedactingWriter;
-use zarn_config::{Config, runtime};
+use zarn_config::{Config, modes, runtime};
 use zarn_core::agent::{Agent, AgentEvent};
 use zarn_core::provider::Event;
 use zarn_core::session;
@@ -117,6 +117,10 @@ async fn run_command(command: &Command) -> Result<()> {
             }) => commands::mcp_add(name, *project, target),
             Some(McpAction::Remove { name }) => commands::mcp_remove(name),
         },
+        Command::Modes { action } => match action {
+            None | Some(cli::ModesAction::List) => commands::modes_list(),
+            Some(cli::ModesAction::Show { name }) => commands::modes_show(name),
+        },
         Command::Doctor { offline } => commands::doctor(*offline).await,
     }
 }
@@ -136,6 +140,7 @@ async fn tui(args: &Args, resume: Option<PathBuf>) -> Result<()> {
         profile: args.profile.clone(),
         model: args.model.clone(),
         resume,
+        mode: args.mode.clone().or_else(|| args.permission_mode.clone()),
         ..zarn_tui::Options::default()
     })
     .await
@@ -150,8 +155,17 @@ async fn run_print(args: &Args, prompt: String) -> Result<()> {
     }
     let mcp = std::mem::take(&mut cfg.mcp);
     let store = KeyStore::shared();
-    let profile_name = runtime::active_profile(&cfg, args.profile.as_deref());
-    let plan = runtime::plan(&cfg, &store, &profile_name, args.model.as_deref())?;
+    let (mode, overlay) = print_mode(&cfg, args)?;
+    let profile_name = runtime::active_profile(
+        &cfg,
+        mode.profile.as_deref().or(args.profile.as_deref()),
+    );
+    let plan = runtime::plan(
+        &cfg,
+        &store,
+        &profile_name,
+        args.model.as_deref().or(mode.model.as_deref()),
+    )?;
     if let Some(notice) = store.fallback_notice() {
         eprintln!("{notice}");
     }
@@ -169,10 +183,15 @@ async fn run_print(args: &Args, prompt: String) -> Result<()> {
         runtime::Assembly {
             store: store.clone(),
             notify: Some(notify),
+            mode: Some(mode),
+            approver: Some(Arc::new(zarn_tools::exit_plan::Unattended)),
         },
     )?;
+    let gate = Permissions::headless()
+        .with_tools(cfg.permissions.clone())
+        .with_overlay(overlay);
     let agent = Agent::new(rt.provider.clone(), rt.tools.clone(), ctx, rt.agent_config())
-        .with_gate(Arc::new(Permissions::headless().with_tools(cfg.permissions.clone())));
+        .with_gate(Arc::new(gate));
 
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
     let printer = tokio::spawn(async move {
@@ -208,4 +227,33 @@ async fn run_print(args: &Args, prompt: String) -> Result<()> {
         bail!(redact(&err.to_string()));
     }
     Ok(())
+}
+
+fn print_mode(
+    cfg: &Config,
+    args: &Args,
+) -> Result<(modes::ModeDef, zarn_tools::permissions::Overlay)> {
+    let loaded = modes::load();
+    let find = |name: &str| {
+        loaded.find(name).map(|m| m.def.clone()).with_context(|| {
+            format!("no mode named '{name}'; modes: {}", loaded.names().join(", "))
+        })
+    };
+    let name = args
+        .mode
+        .clone()
+        .or_else(|| args.permission_mode.clone())
+        .unwrap_or_else(|| cfg.general.mode());
+    let mode = find(&name)?;
+    let policy = match &args.permission_mode {
+        Some(permission) => find(permission)?,
+        None => mode.clone(),
+    };
+    if policy.allow_all && args.permission_mode.as_deref() != Some("bypass") {
+        bail!(
+            "--print will not run in bypass mode unless you pass --permission-mode bypass. {}",
+            modes::BYPASS_RISK
+        );
+    }
+    Ok((mode, modes::overlay(&policy)))
 }

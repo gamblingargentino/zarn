@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use zarn_config::agents::{self, AgentFile};
+use zarn_config::modes::{self, ModeDef, ModeFile};
 use zarn_config::auth::KeyStore;
 use zarn_config::catalog;
 use zarn_config::layers::{GeneralField, Layers, Scope};
@@ -19,16 +20,18 @@ pub enum Tab {
     Skills,
     Mcp,
     Agents,
+    Modes,
     Permissions,
     General,
 }
 
-pub const TABS: [Tab; 7] = [
+pub const TABS: [Tab; 8] = [
     Tab::Providers,
     Tab::Models,
     Tab::Skills,
     Tab::Mcp,
     Tab::Agents,
+    Tab::Modes,
     Tab::Permissions,
     Tab::General,
 ];
@@ -41,6 +44,7 @@ impl Tab {
             Tab::Skills => "Skills",
             Tab::Mcp => "MCP",
             Tab::Agents => "Agents",
+            Tab::Modes => "Modes",
             Tab::Permissions => "Permissions",
             Tab::General => "General",
         }
@@ -53,10 +57,11 @@ impl Tab {
     pub fn hints(&self) -> &'static str {
         match self {
             Tab::Providers => "enter edit · a add · k key · t test · d delete",
-            Tab::Models => "enter change · [ ] or shift+↑↓ reorder fallback · d remove fallback",
+            Tab::Models => "enter change · [ ] reorder · d remove fallback or clear role",
             Tab::Skills => "enter or space toggles",
             Tab::Mcp => "enter edit · a add · r restart · d delete",
             Tab::Agents => "enter edit · a create · d delete",
+            Tab::Modes => "enter edit or switch · a create · d delete",
             Tab::Permissions => "enter cycles · a allow · s ask · d deny",
             Tab::General => "enter change",
         }
@@ -87,6 +92,7 @@ pub enum TestState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Effect {
     Reload,
+    SetMode(String),
     Test(String),
     RestartMcp(String),
     ListModels { provider: String, profile: String },
@@ -108,6 +114,11 @@ pub enum RowKind {
     AddMcp,
     Agent(usize),
     AddAgent,
+    Routing,
+    Role(String),
+    ActiveMode,
+    ModeEntry(usize),
+    AddMode,
     Permission(String),
     Accent,
     Banner,
@@ -148,6 +159,9 @@ pub enum PickFor {
     ProfileModel(String),
     AddFallback(String),
     Accent,
+    RoleProvider(String),
+    RoleModel(String, String),
+    ActiveMode,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,6 +174,8 @@ pub enum FormFor {
     EditAgent(usize),
     ContextBudget,
     NewProfile,
+    NewMode,
+    EditMode(usize),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -167,6 +183,7 @@ pub enum ConfirmFor {
     DeleteProvider(String),
     DeleteMcp(String),
     DeleteAgent(usize),
+    DeleteMode(usize),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -286,12 +303,15 @@ pub struct Panel {
     pub layers: Layers,
     pub data: PanelData,
     pub agents: Vec<AgentFile>,
-    pub cursor: [usize; 7],
+    pub modes: Vec<ModeFile>,
+    pub active_mode: String,
+    pub cursor: Vec<usize>,
     pub editor: Option<Editor>,
     pub message: Option<(String, bool)>,
     pub tests: BTreeMap<String, TestState>,
     store: Arc<KeyStore>,
     agent_dirs: (Option<PathBuf>, PathBuf),
+    mode_dirs: (Option<PathBuf>, PathBuf),
 }
 
 fn policy_label(policy: Policy) -> &'static str {
@@ -370,18 +390,42 @@ impl Panel {
         project_agents: PathBuf,
     ) -> Self {
         let agents = agents::load_from(user_agents.as_deref(), &project_agents);
+        let mode_dirs = (
+            modes::dir(Scope::User),
+            modes::dir(Scope::Project).unwrap_or_default(),
+        );
+        let loaded = modes::load_from(mode_dirs.0.as_deref(), &mode_dirs.1);
+        let active_mode = layers.merged().general.mode();
         Panel {
             tab: Tab::Providers,
             layers,
             data,
             agents,
-            cursor: [0; 7],
+            modes: loaded.modes,
+            active_mode,
+            cursor: vec![0; TABS.len()],
             editor: None,
             message: None,
             tests: BTreeMap::new(),
             store,
             agent_dirs: (user_agents, project_agents),
+            mode_dirs,
         }
+    }
+
+    pub fn with_mode_dirs(mut self, user: Option<PathBuf>, project: PathBuf) -> Self {
+        self.mode_dirs = (user, project);
+        self.reload_modes();
+        self
+    }
+
+    pub fn with_active_mode(mut self, mode: impl Into<String>) -> Self {
+        self.active_mode = mode.into();
+        self
+    }
+
+    fn reload_modes(&mut self) {
+        self.modes = modes::load_from(self.mode_dirs.0.as_deref(), &self.mode_dirs.1).modes;
     }
 
     pub fn open_at(mut self, tab: Tab) -> Self {
@@ -486,6 +530,28 @@ impl Panel {
                     }
                 }
                 rows.push(Row::new("+ new profile", "", RowKind::AddProfile));
+                rows.push(
+                    Row::new("routing", on_off(cfg.routing.enabled()), RowKind::Routing)
+                        .note("send each role below to its own provider and model"),
+                );
+                for role in zarn_config::ROLES {
+                    rows.push(Row::new(
+                        format!("role · {role}"),
+                        ops::role_label(&cfg, role),
+                        RowKind::Role(role.to_string()),
+                    ));
+                }
+                rows
+            }
+            Tab::Modes => {
+                let mut rows = vec![Row::new("active mode", self.active_mode.clone(), RowKind::ActiveMode)];
+                for (i, m) in self.modes.iter().enumerate() {
+                    rows.push(
+                        Row::new(m.def.name.clone(), m.source.label(), RowKind::ModeEntry(i))
+                            .note(m.def.description.clone()),
+                    );
+                }
+                rows.push(Row::new("+ create mode", "", RowKind::AddMode));
                 rows
             }
             Tab::Skills => self
@@ -683,13 +749,30 @@ impl Panel {
     fn shortcut(&mut self, c: char) -> Option<Effect> {
         let kind = self.selected_kind();
         match (self.tab, c, kind) {
-            (Tab::Providers, 'a', _) | (Tab::Mcp, 'a', _) | (Tab::Agents, 'a', _) => {
+            (Tab::Providers, 'a', _) | (Tab::Mcp, 'a', _) | (Tab::Agents, 'a', _) | (Tab::Modes, 'a', _) => {
                 let add = match self.tab {
                     Tab::Providers => RowKind::AddProvider,
                     Tab::Mcp => RowKind::AddMcp,
+                    Tab::Modes => RowKind::AddMode,
                     _ => RowKind::AddAgent,
                 };
                 self.activate_kind(add)
+            }
+            (Tab::Models, 'd', Some(RowKind::Role(role))) => {
+                let result = ops::clear_role(&mut self.layers, &role);
+                self.saved(format!("role {role} now uses the main model"), result)
+            }
+            (Tab::Modes, 'd', Some(RowKind::ModeEntry(i))) => {
+                let file = self.modes.get(i)?.clone();
+                if file.path.is_none() {
+                    self.fail(format!("{} is built in and cannot be deleted", file.def.name));
+                    return None;
+                }
+                self.editor = Some(Editor::Confirm(
+                    format!("Delete mode {}? y/n", file.def.name),
+                    ConfirmFor::DeleteMode(i),
+                ));
+                None
             }
             (Tab::Providers, 'k', Some(RowKind::Provider(name))) => {
                 self.ask_key(&name, false);
@@ -959,6 +1042,60 @@ impl Panel {
                 ));
                 None
             }
+            RowKind::Routing => {
+                let value = !cfg.routing.enabled();
+                let result = ops::set_routing_enabled(&mut self.layers, value).map(|_| ());
+                self.saved(format!("routing {}", on_off(value)), result)
+            }
+            RowKind::Role(role) => {
+                let mut choices = vec![Choice::new("", "main model").with_detail("clear this role")];
+                choices.extend(self.provider_choices());
+                let current = cfg
+                    .routing
+                    .roles
+                    .get(&role)
+                    .and_then(|r| r.provider.clone())
+                    .unwrap_or_default();
+                self.editor = Some(Editor::Pick(
+                    Picker::new(format!("Provider for the {role} role"), choices).select_value(&current),
+                    PickFor::RoleProvider(role),
+                ));
+                None
+            }
+            RowKind::ActiveMode => {
+                let choices = self
+                    .modes
+                    .iter()
+                    .map(|m| {
+                        Choice::new(m.def.name.clone(), m.def.name.clone())
+                            .with_detail(format!("{} · {}", m.source.label(), m.def.description))
+                    })
+                    .collect();
+                self.editor = Some(Editor::Pick(
+                    Picker::new("Active mode", choices).select_value(&self.active_mode),
+                    PickFor::ActiveMode,
+                ));
+                None
+            }
+            RowKind::ModeEntry(i) => {
+                let file = self.modes.get(i)?.clone();
+                if file.path.is_none() {
+                    self.say(format!(
+                        "{} is built in: {}. Create a custom mode to change behaviour.",
+                        file.def.name, file.def.description
+                    ));
+                    return None;
+                }
+                self.editor = Some(Editor::Form(
+                    mode_form(&format!("Edit mode {}", file.def.name), Some(&file)),
+                    FormFor::EditMode(i),
+                ));
+                None
+            }
+            RowKind::AddMode => {
+                self.editor = Some(Editor::Form(mode_form("Create mode", None), FormFor::NewMode));
+                None
+            }
             RowKind::Permission(tool) => {
                 let current = cfg
                     .permissions
@@ -1116,6 +1253,12 @@ impl Panel {
                 self.data.mcp_status.remove(&name);
                 self.saved(format!("MCP server {name} removed"), result)
             }
+            ConfirmFor::DeleteMode(i) => {
+                let file = self.modes.get(i).cloned()?;
+                let result = modes::delete(&file);
+                self.reload_modes();
+                self.saved(format!("mode {} deleted", file.def.name), result)
+            }
             ConfirmFor::DeleteAgent(i) => {
                 let file = self.agents.get(i).cloned()?;
                 let result = agents::delete(&file);
@@ -1176,6 +1319,42 @@ impl Panel {
                 order.push(value.clone());
                 let result = ops::set_fallback(&mut self.layers, &profile, order);
                 self.saved(format!("{value} added to the fallback chain"), result)
+            }
+            PickFor::RoleProvider(role) => {
+                if value.is_empty() {
+                    let result = ops::clear_role(&mut self.layers, &role);
+                    return self.saved(format!("role {role} now uses the main model"), result);
+                }
+                let cfg = self.layers.merged();
+                let kind = cfg.providers.get(&value).map(|s| s.kind.clone()).unwrap_or_default();
+                let choices: Vec<Choice> = catalog::suggested_models(&kind)
+                    .iter()
+                    .map(|m| Choice::plain(*m))
+                    .collect();
+                self.editor = Some(Editor::Pick(
+                    Picker::new(format!("Model for the {role} role on {value}"), choices)
+                        .custom("type any model name, then enter"),
+                    PickFor::RoleModel(role, value.clone()),
+                ));
+                None
+            }
+            PickFor::RoleModel(role, provider) => {
+                let result = ops::set_role(&mut self.layers, &role, Some(&provider), Some(&value)).map(|_| ());
+                self.saved(format!("role {role} now uses {provider} · {value}"), result)
+            }
+            PickFor::ActiveMode => {
+                if value != "bypass" {
+                    let result = ops::set_general(&mut self.layers, GeneralField::Mode, |g| {
+                        g.mode = Some(value.clone())
+                    });
+                    if let Err(err) = result {
+                        self.fail(format!("{err:#}"));
+                        return None;
+                    }
+                }
+                self.active_mode = value.clone();
+                self.say(format!("mode is now {value}"));
+                Some(Effect::SetMode(value))
             }
             PickFor::Accent => {
                 if !brand::ACCENTS.iter().any(|(n, _)| *n == value) && brand::parse_hex(&value).is_none() {
@@ -1332,6 +1511,39 @@ impl Panel {
                 }
                 _ => retry(self, form, purpose, "enter a positive number of tokens".into()),
             },
+            FormFor::NewMode | FormFor::EditMode(_) => {
+                let def = match mode_from_form(&form) {
+                    Ok(def) => def,
+                    Err(err) => return retry(self, form, purpose, err),
+                };
+                let previous = match &purpose {
+                    FormFor::EditMode(i) => self.modes.get(*i).cloned(),
+                    _ => None,
+                };
+                let dir = match form.value("scope").as_str() {
+                    "project" => Some(self.mode_dirs.1.clone()),
+                    "user" | "" => self.mode_dirs.0.clone(),
+                    other => {
+                        return retry(self, form, purpose, format!("scope must be user or project, not {other}"));
+                    }
+                };
+                let Some(dir) = dir else {
+                    return retry(self, form, purpose, "no home directory for user modes".into());
+                };
+                match modes::save_in(&dir, &def) {
+                    Ok(path) => {
+                        if let Some(old) = previous
+                            && old.path.as_ref().is_some_and(|p| *p != path)
+                        {
+                            let _ = modes::delete(&old);
+                        }
+                        self.reload_modes();
+                        self.say(format!("mode {} saved to {}", def.name, path.display()));
+                        Some(Effect::Reload)
+                    }
+                    Err(err) => retry(self, form, purpose, format!("{err:#}")),
+                }
+            }
             FormFor::NewProfile => {
                 let name = form.value("name");
                 match ops::add_profile(&mut self.layers, &name) {
@@ -1344,6 +1556,48 @@ impl Panel {
             }
         }
     }
+}
+
+fn mode_form(title: &str, file: Option<&ModeFile>) -> Form {
+    let def = file.map(|f| f.def.clone()).unwrap_or_default();
+    let scope = file.map(|f| f.source.label()).unwrap_or("user");
+    let rendered = modes::render(&def);
+    let permissions = rendered
+        .lines()
+        .find_map(|l| l.strip_prefix("permissions: ").map(str::to_string))
+        .unwrap_or_default();
+    Form::new(
+        title,
+        vec![
+            FormField::new("name", def.name),
+            FormField::new("description", def.description),
+            FormField::new("tools", def.tools.join(", ")).hint("comma separated; empty means every tool"),
+            FormField::new("permissions", permissions).hint("e.g. edit=deny, write=deny, bash=ask"),
+            FormField::new("profile", def.profile.unwrap_or_default()).hint("optional profile to switch to"),
+            FormField::new("model", def.model.unwrap_or_default()).hint("optional model to switch to"),
+            FormField::new("scope", scope).hint("user or project"),
+            FormField::new("prompt", def.prompt)
+                .hint("added to the system prompt; shift+enter for a new line, ctrl+s saves")
+                .multiline(),
+        ],
+    )
+}
+
+fn mode_from_form(form: &Form) -> Result<ModeDef, String> {
+    let mut text = String::from("---\n");
+    for key in ["name", "description", "tools", "permissions", "profile", "model"] {
+        let value = form.value(key).replace('\n', " ");
+        if !value.is_empty() {
+            text.push_str(&format!("{key}: {value}\n"));
+        }
+    }
+    text.push_str("---\n");
+    text.push_str(&form.value("prompt"));
+    let def = modes::parse(&text)?;
+    if modes::is_builtin(&def.name) {
+        return Err(format!("{} is a built-in mode; pick another name", def.name));
+    }
+    Ok(def)
 }
 
 fn agent_form(title: &str, file: Option<&AgentFile>) -> Form {

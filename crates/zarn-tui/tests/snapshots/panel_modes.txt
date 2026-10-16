@@ -1,0 +1,14 @@
+╭ zarn settings · changes save as you go ──────────────────────────────────────────────────────────╮
+│Providers │ Models │ Skills │ MCP │ Agents │ Modes │ Permissions │ General                        │
+│                                                                                                  │
+│› active mode    plan                                                                             │
+│  default        built-in  ask before edits and commands, as configured                           │
+│  plan           built-in  read-only investigation, then a plan for approval                      │
+│  accept-edits   built-in  file edits run without asking; everything else as configured           │
+│  bypass         built-in  every tool runs without asking                                         │
+│  review         project  read-only code review                                                   │
+│  + create mode                                                                                   │
+│                                                                                                  │
+│                                                                                                  │
+│↑↓ move · ←→ tab · enter edit or switch · a create · d delete · esc close                         │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

@@ -460,3 +460,55 @@ pub fn draw_onboarding(frame: &mut Frame, onboarding: &Onboarding, accent: Color
     };
     frame.render_widget(Paragraph::new(line), parts[3]);
 }
+
+pub fn draw_confirm(frame: &mut Frame, area: Rect, text: &str, accent: Color) {
+    let rect = centered(area, 72, 7);
+    frame.render_widget(Clear, rect);
+    let block = frame_block("confirm", Color::Yellow);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let lines = vec![
+        Line::styled(text.to_string(), Style::default().fg(Color::Yellow)),
+        Line::raw(""),
+        Line::from(vec![
+            Span::styled("[y] ", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+            Span::raw("yes   "),
+            Span::styled("[n] ", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+            Span::raw("no"),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+pub fn draw_plan(frame: &mut Frame, area: Rect, review: &crate::state::PlanReview, accent: Color) {
+    let body = crate::markdown::render(&review.plan);
+    let height = (body.len() as u16 + 6).min(area.height.saturating_sub(1)).max(8);
+    let rect = centered(area, 90, height);
+    frame.render_widget(Clear, rect);
+    let block = frame_block("plan for approval", accent);
+    let inner = block.inner(rect);
+    frame.render_widget(block, rect);
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
+    frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), rows[0]);
+    let footer = match &review.feedback {
+        Some(field) => vec![
+            Line::from(vec![
+                Span::styled("feedback ", dim()),
+                Span::raw(field.value.clone()),
+            ]),
+            Line::styled("enter sends it and keeps plan mode · esc goes back", dim()),
+        ],
+        None => vec![
+            Line::from(vec![
+                Span::styled("[a] ", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+                Span::raw("approve, accept edits   "),
+                Span::styled("[d] ", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+                Span::raw("approve, ask as usual   "),
+                Span::styled("[r] ", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
+                Span::raw("reject with feedback"),
+            ]),
+            Line::styled("esc rejects without feedback", dim()),
+        ],
+    };
+    frame.render_widget(Paragraph::new(footer), rows[1]);
+}

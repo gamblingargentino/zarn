@@ -21,6 +21,12 @@ pub struct Args {
 
     #[arg(long, value_name = "PROFILE", help = "Use this profile instead of the default")]
     pub profile: Option<String>,
+
+    #[arg(long, value_name = "NAME", help = "Start in this mode: default, plan, accept-edits, bypass or a custom mode")]
+    pub mode: Option<String>,
+
+    #[arg(long = "permission-mode", value_name = "NAME", help = "Permission policy to apply; --print needs --permission-mode bypass before it will run in bypass")]
+    pub permission_mode: Option<String>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -55,10 +61,26 @@ pub enum Command {
         #[command(subcommand)]
         action: Option<McpAction>,
     },
+    #[command(about = "List and inspect modes")]
+    Modes {
+        #[command(subcommand)]
+        action: Option<ModesAction>,
+    },
     #[command(about = "Check config, keys, provider reachability, MCP servers and the terminal")]
     Doctor {
         #[arg(long, help = "Skip network probes and MCP server starts")]
         offline: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ModesAction {
+    #[command(about = "List built-in and custom modes with their source")]
+    List,
+    #[command(about = "Show what a mode allows, its tools, prompt and profile")]
+    Show {
+        #[arg(help = "Mode name")]
+        name: String,
     },
 }
 

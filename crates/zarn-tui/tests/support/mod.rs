@@ -68,6 +68,14 @@ pub async fn bodies(server: &MockServer) -> Vec<Value> {
         .collect()
 }
 
+pub async fn chat_bodies(server: &MockServer) -> Vec<Value> {
+    bodies(server)
+        .await
+        .into_iter()
+        .filter(|b| !system_text(b).starts_with("Write a title"))
+        .collect()
+}
+
 pub fn system_text(body: &Value) -> String {
     body["messages"]
         .as_array()

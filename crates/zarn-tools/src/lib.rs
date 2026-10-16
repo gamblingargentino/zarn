@@ -1,6 +1,7 @@
 pub mod bash;
 pub mod budget;
 pub mod edit;
+pub mod exit_plan;
 pub mod freshness;
 pub mod fsx;
 pub mod mcp;

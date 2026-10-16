@@ -48,7 +48,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
             "Paste the key and press enter; characters are not shown. It goes to your OS credential store (or an owner-only fallback file), never to a config file. esc cancels.",
             app.theme.accent,
         ),
+        Some(Overlay::Confirm(text, _)) => views::draw_confirm(frame, areas[0], text, app.theme.accent),
         None => {}
+    }
+
+    if let Some(review) = &app.plan_review
+        && review.decided.is_none()
+    {
+        views::draw_plan(frame, areas[0], review, app.theme.accent);
     }
 }
 
@@ -224,7 +231,9 @@ fn permission_lines(tool: &str, args: &Value) -> Vec<Line<'static>> {
 }
 
 fn status(frame: &mut Frame, app: &App, area: Rect) {
+    let mode = if app.status.mode.is_empty() { "default" } else { app.status.mode.as_str() };
     let mut parts = vec![
+        format!("{mode} mode"),
         app.status.model.clone(),
         format!(
             "{} in / {} out",

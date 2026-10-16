@@ -100,6 +100,7 @@ impl Fixture {
             Some(self.root.join("user/agents")),
             self.root.join("project/agents"),
         )
+        .with_mode_dirs(Some(self.root.join("user/modes")), self.root.join("project/modes"))
     }
 
     fn user_config(&self) -> String {
@@ -138,7 +139,7 @@ fn snapshot_the_providers_tab() {
 fn snapshot_the_models_tab() {
     let fx = Fixture::new(TWO_PROVIDERS);
     let app = app_with_panel(fx.panel().open_at(Tab::Models));
-    snapshot("panel_models", &rows(100, 14, &app));
+    snapshot("panel_models", &rows(100, 24, &app));
 }
 
 #[test]
@@ -350,4 +351,140 @@ fn general_toggles_write_to_the_user_config() {
     panel.on_key(key(KeyCode::Down));
     assert_eq!(panel.on_key(key(KeyCode::Enter)), Some(Effect::Reload));
     assert!(fx.user_config().contains("banner = false"));
+}
+
+fn ctrl(c: char) -> KeyEvent {
+    KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+}
+
+const REVIEW_MODE: &str = "---\nname: review\ndescription: read-only code review\ntools: read, glob, grep\npermissions: edit=deny, write=deny, bash=ask\n---\nReview the code.\n";
+
+#[test]
+fn snapshot_the_modes_tab() {
+    let fx = Fixture::new(TWO_PROVIDERS);
+    std::fs::create_dir_all(fx.root.join("project/modes")).unwrap();
+    std::fs::write(fx.root.join("project/modes/review.md"), REVIEW_MODE).unwrap();
+    let app = app_with_panel(fx.panel().open_at(Tab::Modes).with_active_mode("plan"));
+    let out = rows(100, 14, &app);
+    snapshot("panel_modes", &out);
+    let text = out.join("\n");
+    assert!(text.contains("active mode") && text.contains("plan"));
+    assert!(text.contains("review") && text.contains("project"));
+    assert!(text.contains("built-in"));
+}
+
+#[test]
+fn a_custom_mode_is_created_edited_and_deleted_as_a_markdown_file() {
+    let fx = Fixture::new(TWO_PROVIDERS);
+    let before = fx.user_config();
+    let mut panel = fx.panel().open_at(Tab::Modes);
+    panel.on_key(key(KeyCode::Char('a')));
+    for k in typed("docs") {
+        panel.on_key(k);
+    }
+    panel.on_key(key(KeyCode::Down));
+    for k in typed("writes documentation") {
+        panel.on_key(k);
+    }
+    panel.on_key(key(KeyCode::Down));
+    panel.on_key(key(KeyCode::Down));
+    for k in typed("bash=deny") {
+        panel.on_key(k);
+    }
+    for _ in 0..4 {
+        panel.on_key(key(KeyCode::Down));
+    }
+    for k in typed("Write docs.") {
+        panel.on_key(k);
+    }
+    assert_eq!(panel.on_key(ctrl('s')), Some(Effect::Reload));
+    let path = fx.root.join("user/modes/docs.md");
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("name: docs"));
+    assert!(saved.contains("permissions: bash=deny"));
+    assert!(saved.contains("Write docs."));
+    assert_eq!(fx.user_config(), before, "config.toml must not change");
+
+    let row = panel.rows().iter().position(|r| r.label == "docs").unwrap();
+    panel.cursor[Tab::Modes.index()] = row;
+    panel.on_key(key(KeyCode::Enter));
+    panel.on_key(key(KeyCode::Down));
+    for _ in 0.."writes documentation".len() {
+        panel.on_key(key(KeyCode::Backspace));
+    }
+    for k in typed("edited") {
+        panel.on_key(k);
+    }
+    assert_eq!(panel.on_key(ctrl('s')), Some(Effect::Reload));
+    assert!(std::fs::read_to_string(&path).unwrap().contains("description: edited"));
+
+    let row = panel.rows().iter().position(|r| r.label == "docs").unwrap();
+    panel.cursor[Tab::Modes.index()] = row;
+    panel.on_key(key(KeyCode::Char('d')));
+    assert_eq!(panel.on_key(key(KeyCode::Char('y'))), Some(Effect::Reload));
+    assert!(!path.exists());
+    assert_eq!(fx.user_config(), before);
+}
+
+#[test]
+fn a_mode_with_a_builtin_name_cannot_be_created_and_builtins_cannot_be_deleted() {
+    let fx = Fixture::new("");
+    let mut panel = fx.panel().open_at(Tab::Modes);
+    panel.on_key(key(KeyCode::Char('a')));
+    for k in typed("plan") {
+        panel.on_key(k);
+    }
+    assert_eq!(panel.on_key(ctrl('s')), None);
+    assert!(panel.message.as_ref().unwrap().0.contains("built-in"));
+    panel.on_key(key(KeyCode::Esc));
+    panel.cursor[Tab::Modes.index()] = 1;
+    panel.on_key(key(KeyCode::Char('d')));
+    assert!(panel.message.as_ref().unwrap().0.contains("built in"));
+    assert!(panel.editor.is_none());
+}
+
+#[test]
+fn choosing_the_active_mode_writes_only_general_mode() {
+    let fx = Fixture::new("");
+    let mut panel = fx.panel().open_at(Tab::Modes);
+    panel.on_key(key(KeyCode::Enter));
+    for k in typed("plan") {
+        panel.on_key(k);
+    }
+    assert_eq!(panel.on_key(key(KeyCode::Enter)), Some(Effect::SetMode("plan".into())));
+    assert_eq!(fx.user_config().trim(), "[general]\nmode = \"plan\"");
+}
+
+#[test]
+fn the_models_tab_lists_roles_and_toggles_and_sets_routing() {
+    let fx = Fixture::new(TWO_PROVIDERS);
+    let mut panel = fx.panel().open_at(Tab::Models);
+    let rows = panel.rows();
+    for role in zarn_config::ROLES {
+        assert!(rows.iter().any(|r| r.label == format!("role · {role}")), "{role}");
+    }
+    let routing = rows.iter().position(|r| r.label == "routing").unwrap();
+    panel.cursor[Tab::Models.index()] = routing;
+    assert_eq!(panel.on_key(key(KeyCode::Enter)), Some(Effect::Reload));
+    assert!(fx.user_config().contains("[routing]\nenabled = true"));
+
+    let compact = panel.rows().iter().position(|r| r.label == "role · compact").unwrap();
+    panel.cursor[Tab::Models.index()] = compact;
+    panel.on_key(key(KeyCode::Enter));
+    for k in typed("local") {
+        panel.on_key(k);
+    }
+    panel.on_key(key(KeyCode::Enter));
+    for k in typed("qwen3:8b") {
+        panel.on_key(k);
+    }
+    assert_eq!(panel.on_key(key(KeyCode::Enter)), Some(Effect::Reload));
+    let saved = fx.user_config();
+    assert!(saved.contains("[routing.roles.compact]"), "{saved}");
+    assert!(saved.contains("provider = \"local\""));
+    assert!(saved.contains("model = \"qwen3:8b\""));
+    assert_eq!(panel.rows()[compact].value, "local · qwen3:8b");
+
+    assert_eq!(panel.on_key(key(KeyCode::Char('d'))), Some(Effect::Reload));
+    assert!(!fx.user_config().contains("roles.compact"));
 }

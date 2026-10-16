@@ -136,7 +136,16 @@ impl Layers {
             GeneralField::ShowCost => g.show_cost.is_some(),
             GeneralField::ContextBudget => g.context_budget.is_some(),
             GeneralField::AutoCompact => g.auto_compact.is_some(),
+            GeneralField::Mode => g.mode.is_some(),
         })
+    }
+
+    pub fn routing_scope(&self) -> Scope {
+        self.pick(self.project.routing.enabled.is_some())
+    }
+
+    pub fn role_scope(&self, role: &str) -> Scope {
+        self.pick(self.project.routing.roles.contains_key(role))
     }
 }
 
@@ -148,6 +157,7 @@ pub enum GeneralField {
     ShowCost,
     ContextBudget,
     AutoCompact,
+    Mode,
 }
 
 #[cfg(test)]

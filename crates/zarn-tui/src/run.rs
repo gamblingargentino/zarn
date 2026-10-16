@@ -3,7 +3,7 @@ use crate::onboarding::{self, Onboarding};
 use crate::popup;
 use crate::render;
 use crate::settings::{self, Panel, PanelData, RowKind, SkillRow, Tab, TestState};
-use crate::state::{Action, App, Block, ChatPick, Mode, Overlay, PermissionRequest};
+use crate::state::{Action, App, Block, ChatPick, ConfirmFor, Mode, Overlay, PermissionRequest, PlanReview};
 use crate::terminal;
 use crate::widgets::{Choice, MaskedInput, Picker};
 use anyhow::Result;
@@ -22,7 +22,9 @@ use tokio_util::sync::CancellationToken;
 use zarn_config::auth::KeyStore;
 use zarn_config::layers::{GeneralField, Layers};
 use zarn_config::runtime::{self, Runtime};
+use zarn_config::modes::{self, Loaded as Modes};
 use zarn_config::{Config, catalog, context, doctor, guard, ops, paths};
+use zarn_tools::exit_plan::{PlanApprover, PlanVerdict};
 use zarn_core::agent::{Agent, AgentEvent};
 use zarn_core::commands::{Command as CoreCommand, Commands};
 use zarn_core::compact;
@@ -59,6 +61,25 @@ impl PermissionPrompt for TuiPrompt {
     }
 }
 
+type PlanAsk = (String, oneshot::Sender<PlanVerdict>);
+
+pub struct TuiApprover {
+    tx: mpsc::Sender<PlanAsk>,
+}
+
+#[async_trait]
+impl PlanApprover for TuiApprover {
+    async fn review(&self, plan: &str) -> PlanVerdict {
+        let (reply, answer) = oneshot::channel();
+        if self.tx.send((plan.to_string(), reply)).await.is_err() {
+            return PlanVerdict::Reject("the plan could not be shown".into());
+        }
+        answer
+            .await
+            .unwrap_or_else(|_| PlanVerdict::Reject("the plan was dismissed".into()))
+    }
+}
+
 pub fn permission_channel() -> (Arc<TuiPrompt>, mpsc::Receiver<PermissionRequest>) {
     let (tx, rx) = mpsc::channel(4);
     (Arc::new(TuiPrompt { tx }), rx)
@@ -70,6 +91,7 @@ pub struct Options {
     pub model: Option<String>,
     pub resume: Option<PathBuf>,
     pub store: Option<Arc<KeyStore>>,
+    pub mode: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -102,6 +124,7 @@ enum UiEvent {
     },
     Doctor(String),
     Notice(String),
+    Title(Result<String, String>),
 }
 
 struct McpState {
@@ -156,6 +179,13 @@ pub struct Controller {
     cancel: CancellationToken,
     keyboard: bool,
     fingerprint: u64,
+    modes: Modes,
+    mode: String,
+    approver: Arc<TuiApprover>,
+    plans: mpsc::Receiver<PlanAsk>,
+    warned: std::collections::BTreeSet<String>,
+    titled: bool,
+    title: Option<String>,
 }
 
 fn flatten_messages(messages: &[Message]) -> Vec<Block> {
@@ -183,6 +213,7 @@ impl Controller {
         let gate = Arc::new(Permissions::new(prompt));
         let (ui_tx, ui_rx) = mpsc::channel::<UiEvent>(256);
         let commands = Commands::load(&paths::project_dir().join("commands"));
+        let (plan_tx, plans) = mpsc::channel::<PlanAsk>(2);
 
         let mut controller = Controller {
             app: App::new(""),
@@ -208,12 +239,20 @@ impl Controller {
             cancel: CancellationToken::new(),
             keyboard: terminal::keyboard_enhanced(),
             fingerprint: 0,
+            modes: Modes::default(),
+            mode: "default".into(),
+            approver: Arc::new(TuiApprover { tx: plan_tx }),
+            plans,
+            warned: Default::default(),
+            titled: false,
+            title: None,
         };
 
         if let Some(path) = controller.options.resume.clone() {
             controller.resume(&path);
         }
         controller.rebuild();
+        controller.startup_mode();
 
         let fresh = controller
             .layers
@@ -246,7 +285,83 @@ impl Controller {
     }
 
     fn profile(&self) -> String {
-        runtime::active_profile(&self.cfg(), self.options.profile.as_deref())
+        let mode_profile = self.mode_def().and_then(|m| m.profile);
+        runtime::active_profile(&self.cfg(), mode_profile.as_deref().or(self.options.profile.as_deref()))
+    }
+
+    fn mode_def(&self) -> Option<modes::ModeDef> {
+        self.modes.find(&self.mode).map(|m| m.def.clone())
+    }
+
+    fn startup_mode(&mut self) {
+        let from_cli = self.options.mode.clone();
+        let wanted = from_cli.clone().unwrap_or_else(|| self.cfg().general.mode());
+        if wanted == "default" {
+            return;
+        }
+        if wanted == "bypass" {
+            if from_cli.is_some() {
+                self.ask_bypass();
+            } else {
+                self.app.notice("general.mode is bypass, but bypass is never restored at startup; starting in default. /mode bypass enters it after a confirmation.");
+            }
+            return;
+        }
+        self.set_mode(&wanted, false);
+    }
+
+    fn ask_bypass(&mut self) {
+        self.app.overlay = Some(Overlay::Confirm(
+            format!("Enter bypass mode? {}", modes::BYPASS_RISK),
+            ConfirmFor::Bypass,
+        ));
+    }
+
+    fn set_mode(&mut self, name: &str, persist: bool) {
+        self.modes = modes::load();
+        let Some(file) = self.modes.find(name).cloned() else {
+            self.app.notice(format!(
+                "no mode named {name}; modes: {}",
+                self.modes.names().join(", ")
+            ));
+            return;
+        };
+        self.mode = name.to_string();
+        self.app.status.mode = name.to_string();
+        self.gate.set_overlay(modes::overlay(&file.def));
+        if persist && name != "bypass" {
+            let result = match self.layers() {
+                Some(layers) => ops::set_general(layers, GeneralField::Mode, |g| {
+                    g.mode = Some(name.to_string())
+                }),
+                None => Ok(()),
+            };
+            if let Err(err) = result {
+                self.app.notice(format!("mode not saved: {err:#}"));
+            }
+        }
+        self.rebuild();
+        self.app.notice(format!("{name} mode: {}", file.def.description));
+    }
+
+    fn cycle_mode(&mut self) {
+        self.modes = modes::load();
+        let next = self.modes.next_after(&self.mode);
+        self.set_mode(&next, true);
+    }
+
+    fn decide_plan(&mut self, verdict: PlanVerdict) {
+        let Some(mut review) = self.app.plan_review.take() else {
+            return;
+        };
+        if let PlanVerdict::Approve(mode) = &verdict {
+            self.set_mode(mode, true);
+        } else {
+            self.app.notice("plan rejected; staying in plan mode");
+        }
+        if let Some(reply) = review.reply.take() {
+            let _ = reply.send(verdict);
+        }
     }
 
     fn rebuild(&mut self) {
@@ -280,7 +395,25 @@ impl Controller {
         }
 
         let profile = self.profile();
-        let plan = match runtime::plan(&cfg, &self.store, &profile, self.options.model.as_deref()) {
+        self.modes = modes::load();
+        for warning in self.modes.warnings.clone() {
+            if self.warned.insert(warning.clone()) {
+                self.app.notice(warning);
+            }
+        }
+        if self.modes.find(&self.mode).is_none() {
+            self.mode = "default".into();
+        }
+        self.app.status.mode = self.mode.clone();
+        let mode = self.mode_def();
+        if let Some(def) = &mode {
+            self.gate.set_overlay(modes::overlay(def));
+        }
+        let model_override = mode
+            .as_ref()
+            .and_then(|m| m.model.clone())
+            .or_else(|| self.options.model.clone());
+        let plan = match runtime::plan(&cfg, &self.store, &profile, model_override.as_deref()) {
             Ok(plan) => plan,
             Err(err) => {
                 self.agent = None;
@@ -308,6 +441,8 @@ impl Controller {
         let assembly = runtime::Assembly {
             store: self.store.clone(),
             notify: Some(notify),
+            mode,
+            approver: Some(self.approver.clone() as Arc<dyn PlanApprover>),
         };
         match runtime::assemble(&cfg, plan, &self.cwd, self.ctx.clone(), tools, assembly) {
             Ok(rt) => {
@@ -321,8 +456,8 @@ impl Controller {
                 self.agent = Some(Arc::new(agent));
                 self.system = rt.system.clone();
                 self.set_system();
-                self.app.status.model = rt.plan.model.clone();
-                self.cost.set_model(rt.plan.model.clone());
+                self.app.status.model = rt.model.clone();
+                self.cost.set_model(rt.model.clone());
                 self.app.not_ready = None;
                 self.runtime = Some(rt);
                 self.app.status.cost = self.cost.total().usd;
@@ -467,7 +602,10 @@ impl Controller {
         let store = self.store.clone();
         let layers = self.layers()?.clone();
         self.app.overlay = None;
-        self.app.mode = Mode::Panel(Box::new(Panel::new(layers, store, data).open_at(tab)));
+        let mode = self.mode.clone();
+        self.app.mode = Mode::Panel(Box::new(
+            Panel::new(layers, store, data).open_at(tab).with_active_mode(mode),
+        ));
         match &mut self.app.mode {
             Mode::Panel(panel) => Some(panel),
             _ => None,
@@ -499,6 +637,11 @@ impl Controller {
                 request = self.permissions.recv() => {
                     if let Some(request) = request {
                         self.app.pending = Some(request);
+                    }
+                }
+                ask = self.plans.recv() => {
+                    if let Some((plan, reply)) = ask {
+                        self.app.plan_review = Some(PlanReview::new(plan, reply));
                     }
                 }
             }
@@ -579,6 +722,13 @@ impl Controller {
                 }
                 None => false,
             },
+            ask = self.plans.recv() => match ask {
+                Some((plan, reply)) => {
+                    self.app.plan_review = Some(PlanReview::new(plan, reply));
+                    true
+                }
+                None => false,
+            },
             _ = tokio::time::sleep(wait) => false,
         };
         self.ui_rx = Some(ui_rx);
@@ -589,10 +739,8 @@ impl Controller {
         let deadline = tokio::time::Instant::now() + limit;
         while tokio::time::Instant::now() < deadline {
             let got = self.pump(std::time::Duration::from_millis(60)).await;
-            if !got && !self.busy() && self.app.pending.is_none() {
-                break;
-            }
-            if self.app.pending.is_some() && !got {
+            let waiting = self.app.pending.is_some() || self.app.plan_review.is_some();
+            if !got && (!self.busy() || waiting) {
                 break;
             }
         }
@@ -612,6 +760,9 @@ impl Controller {
             Action::Onboard(effect) => self.onboard_effect(effect),
             Action::Picked(purpose, value) => self.picked(purpose, value),
             Action::SendQueued => self.send_next(),
+            Action::CycleMode => self.cycle_mode(),
+            Action::Confirmed(ConfirmFor::Bypass) => self.set_mode("bypass", true),
+            Action::Plan(verdict) => self.decide_plan(verdict),
             Action::Login(provider, secret) => {
                 let store = self.store.clone();
                 let result = match self.layers() {
@@ -639,6 +790,33 @@ impl Controller {
         if let Some(text) = self.app.next_queued() {
             self.submit(text);
         }
+    }
+
+    fn maybe_title(&mut self) {
+        if self.titled {
+            return;
+        }
+        let first_user = self
+            .messages
+            .iter()
+            .find(|m| matches!(m, Message::User(_)))
+            .map(|m| m.text());
+        let first_reply = self
+            .messages
+            .iter()
+            .find(|m| matches!(m, Message::Assistant { .. }) && !m.text().trim().is_empty())
+            .map(|m| m.text());
+        let (Some(user), Some(reply), Some(rt)) = (first_user, first_reply, self.runtime.as_ref()) else {
+            return;
+        };
+        self.titled = true;
+        let routed = rt.router.for_role("title");
+        let tx = self.ui_tx.clone();
+        tokio::spawn(async move {
+            let result =
+                zarn_config::titles::generate(routed.provider.as_ref(), &routed.model, &user, &reply).await;
+            let _ = tx.send(UiEvent::Title(result)).await;
+        });
     }
 
     fn update_meter(&mut self) {
@@ -686,10 +864,16 @@ impl Controller {
             self.app.notice("compacting…");
         }
         let messages = self.messages.clone();
-        let model = agent.config().model.clone();
+        let (provider, model) = match &self.runtime {
+            Some(rt) => {
+                let routed = rt.router.for_role("compact");
+                (routed.provider, routed.model)
+            }
+            None => (agent.provider().clone(), agent.config().model.clone()),
+        };
         let tx = self.ui_tx.clone();
         tokio::spawn(async move {
-            let result = compact::compact(agent.provider().as_ref(), &messages, &model, compact::KEEP_TURNS)
+            let result = compact::compact(provider.as_ref(), &messages, &model, compact::KEEP_TURNS)
                 .await
                 .map_err(|e| zarn_config::auth::redact(&e.to_string()));
             let _ = tx.send(UiEvent::Compacted(result)).await;
@@ -703,6 +887,36 @@ impl Controller {
         self.cfg().general.auto_compact()
             && compact::should_compact(agent.provider().as_ref(), &self.messages)
             && compact::split_point(&self.messages, compact::KEEP_TURNS).is_some()
+    }
+
+    fn submit_as(&mut self, text: String, role: &str) {
+        let routed = self
+            .runtime
+            .as_ref()
+            .filter(|rt| rt.router.configured(role))
+            .map(|rt| (rt.router.for_role(role), rt.tools.clone()));
+        let Some((routed, tools)) = routed else {
+            return self.submit(text);
+        };
+        if self.app.streaming {
+            self.app.queue.push(text.clone());
+            self.app.blocks.push(Block::Queued(text));
+            return;
+        }
+        let agent = Agent::new(
+            routed.provider,
+            tools,
+            self.ctx.clone(),
+            zarn_core::agent::AgentConfig {
+                model: routed.model,
+                ..Default::default()
+            },
+        )
+        .with_gate(self.gate.clone());
+        self.messages.push(Message::user(text));
+        self.cancel = CancellationToken::new();
+        self.app.streaming = true;
+        spawn_turn(Arc::new(agent), self.messages.clone(), self.ui_tx.clone(), self.cancel.clone());
     }
 
     fn submit(&mut self, text: String) {
@@ -753,6 +967,7 @@ impl Controller {
                     Ok(_) => {}
                     Err(err) => self.app.notice(format!("error: {err}")),
                 }
+                self.maybe_title();
                 if self.needs_auto_compact() {
                     self.start_compaction(true);
                 } else {
@@ -839,6 +1054,15 @@ impl Controller {
             }
             UiEvent::Doctor(report) => self.app.notice(report),
             UiEvent::Notice(text) => self.app.notice(text),
+            UiEvent::Title(Ok(title)) => {
+                self.title = Some(title.clone());
+                if let Some(session) = self.session.as_mut()
+                    && let Err(err) = session.set_title(&title)
+                {
+                    self.app.notice(format!("title not saved: {err:#}"));
+                }
+            }
+            UiEvent::Title(Err(err)) => tracing::debug!(error = %err, "no session title"),
         }
     }
 
@@ -853,7 +1077,10 @@ impl Controller {
                 &self.app.status.model,
                 Some(self.profile()),
             ) {
-                Ok(created) => {
+                Ok(mut created) => {
+                    if let Some(title) = &self.title {
+                        let _ = created.set_title(title);
+                    }
                     self.session = Some(created);
                     self.persisted = 1;
                 }
@@ -881,6 +1108,8 @@ impl Controller {
     fn resume(&mut self, path: &Path) {
         match session::read(path) {
             Ok((meta, loaded)) => {
+                self.titled = meta.title.is_some();
+                self.title = meta.title.clone();
                 let loaded: Vec<Message> = loaded
                     .into_iter()
                     .skip_while(|m| matches!(m, Message::System(_)))
@@ -905,6 +1134,11 @@ impl Controller {
 
     fn panel_effect(&mut self, effect: settings::Effect) {
         match effect {
+            settings::Effect::SetMode(name) if name == "bypass" => {
+                self.app.mode = Mode::Chat;
+                self.ask_bypass();
+            }
+            settings::Effect::SetMode(name) => self.set_mode(&name, false),
             settings::Effect::Close => {
                 self.app.mode = Mode::Chat;
                 self.rebuild();
@@ -1009,6 +1243,8 @@ impl Controller {
             ChatPick::Resume => self.resume(Path::new(&value)),
             ChatPick::Login => self.ask_login(&value),
             ChatPick::Logout => self.logout(&value),
+            ChatPick::Mode if value == "bypass" => self.ask_bypass(),
+            ChatPick::Mode => self.set_mode(&value, true),
         }
     }
 
@@ -1190,6 +1426,8 @@ impl Controller {
                 self.app.blocks.clear();
                 self.session = None;
                 self.persisted = 1;
+                self.titled = false;
+                self.title = None;
                 self.app.notice("conversation cleared");
             }
             "compact" => {
@@ -1249,10 +1487,16 @@ impl Controller {
                                 .map(|m| m.text())
                                 .unwrap_or_default();
                             let short: String = meta.id.chars().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect();
-                            Some(
-                                Choice::new(path.display().to_string(), format!("{short}  {}", first.replace('\n', " ")))
-                                    .with_detail(format!("{} messages", messages.len())),
-                            )
+                            let first: String = first.replace('\n', " ").chars().take(80).collect();
+                            let label = match &meta.title {
+                                Some(title) => format!("{short}  {title}"),
+                                None => format!("{short}  {first}"),
+                            };
+                            let detail = match &meta.title {
+                                Some(_) => format!("{} messages · {first}", messages.len()),
+                                None => format!("{} messages", messages.len()),
+                            };
+                            Some(Choice::new(path.display().to_string(), label).with_detail(detail))
                         })
                         .collect();
                     if choices.is_empty() {
@@ -1381,7 +1625,7 @@ impl Controller {
                 if self.agent.is_none() {
                     self.app.notice("cannot run /init: no provider is ready");
                 } else {
-                    self.submit(INIT_PROMPT.to_string());
+                    self.submit_as(INIT_PROMPT.to_string(), "init");
                 }
             }
             "doctor" => {
@@ -1421,6 +1665,24 @@ impl Controller {
                 }
                 self.app.notice(lines.join("\n"));
             }
+            "mode" => match first {
+                Some("bypass") => self.ask_bypass(),
+                Some(name) => self.set_mode(name, true),
+                None => {
+                    self.modes = modes::load();
+                    let choices = self
+                        .modes
+                        .modes
+                        .iter()
+                        .map(|m| {
+                            Choice::new(m.def.name.clone(), m.def.name.clone())
+                                .with_detail(format!("{} · {}", m.source.label(), m.def.description))
+                        })
+                        .collect();
+                    let picker = Picker::new("Mode", choices).select_value(&self.mode);
+                    self.app.overlay = Some(Overlay::Pick(picker, ChatPick::Mode));
+                }
+            },
             "theme" => match first {
                 Some(color) => self.set_theme(color),
                 None => {
