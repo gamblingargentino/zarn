@@ -32,6 +32,8 @@ pub struct ProviderSpec {
     #[serde(default)]
     pub api_key: Option<String>,
     #[serde(default)]
+    pub api_key_env: Option<String>,
+    #[serde(default)]
     pub context_window: Option<u32>,
     #[serde(default)]
     pub max_output: Option<u32>,
@@ -130,10 +132,16 @@ fn build_raw(spec: &ProviderSpec) -> Result<Arc<dyn Provider>, ProviderError> {
         }
         #[cfg(feature = "local")]
         "llamacpp" => {
-            let model_path = spec.base_url.clone().ok_or_else(|| {
-                ProviderError::BadRequest("llamacpp provider requires 'base_url' with model path".into())
-            })?;
-            let provider = llamacpp::LlamaCppProvider::new(&model_path)?;
+            let model_path = spec
+                .extra
+                .get("model_path")
+                .or(spec.base_url.as_ref())
+                .ok_or_else(|| {
+                    ProviderError::BadRequest(
+                        "llamacpp provider requires 'model_path' with a GGUF model file".into(),
+                    )
+                })?;
+            let provider = llamacpp::LlamaCppProvider::new(model_path)?;
             Ok(Arc::new(provider.with_caps(spec.caps(Caps {
                 tools: ToolSupport::Prompted,
                 ..Caps::default()
@@ -180,9 +188,26 @@ mod tests {
 
     #[test]
     fn every_adapter_kind_the_factory_documents_can_be_built() {
-        for kind in ["openai", "openai-compat", "anthropic", "claude", "google", "gemini", "ollama"] {
+        for kind in [
+            "openai",
+            "openai-compat",
+            "anthropic",
+            "claude",
+            "google",
+            "gemini",
+            "ollama",
+        ] {
             assert!(build(&spec(kind)).is_ok(), "{kind} failed to build");
         }
+    }
+
+    #[cfg(feature = "local")]
+    #[test]
+    fn llamacpp_requires_a_model_path() {
+        assert!(matches!(
+            build(&spec("llamacpp")),
+            Err(ProviderError::BadRequest(_))
+        ));
     }
 
     #[test]

@@ -1,11 +1,25 @@
 use async_trait::async_trait;
 use futures::StreamExt;
 use futures::stream::BoxStream;
-use llama_cpp_2::llama_model::LlamaModel;
-use std::sync::Arc;
+use llama_cpp_2::context::params::LlamaContextParams;
+use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::llama_batch::LlamaBatch;
+use llama_cpp_2::model::{LlamaChatMessage, LlamaModel, params::LlamaModelParams};
+use llama_cpp_2::sampling::LlamaSampler;
+use std::path::Path;
+use std::sync::{Arc, OnceLock};
 use tokio_stream::wrappers::ReceiverStream;
 use zarn_core::provider::{Caps, Event, Provider, ProviderError, ToolSupport};
-use zarn_core::types::{Message, Request, StopReason};
+use zarn_core::types::{Content, Message, Request, StopReason};
+
+static BACKEND: OnceLock<Result<LlamaBackend, String>> = OnceLock::new();
+
+fn backend() -> Result<&'static LlamaBackend, ProviderError> {
+    BACKEND
+        .get_or_init(|| LlamaBackend::init().map_err(|error| error.to_string()))
+        .as_ref()
+        .map_err(|error| ProviderError::Other(format!("Failed to initialize llama.cpp: {error}")))
+}
 
 pub struct LlamaCppProvider {
     model: Arc<LlamaModel>,
@@ -13,16 +27,25 @@ pub struct LlamaCppProvider {
 }
 
 impl LlamaCppProvider {
-    pub fn new(model_path: impl Into<String>) -> Result<Self, ProviderError> {
-        let path = model_path.into();
-        let model = LlamaModel::new(&path)
-            .map_err(|e| ProviderError::Other(format!("Failed to load model: {e}")))?;
+    pub fn new(model_path: impl AsRef<Path>) -> Result<Self, ProviderError> {
+        let path = model_path.as_ref();
+        if !path.is_file() {
+            return Err(ProviderError::BadRequest(format!(
+                "llamacpp model file does not exist: {}",
+                path.display()
+            )));
+        }
 
-        Ok(LlamaCppProvider {
+        let model = LlamaModel::load_from_file(backend()?, path, &LlamaModelParams::default())
+            .map_err(|error| ProviderError::Other(format!("Failed to load model: {error}")))?;
+
+        Ok(Self {
             model: Arc::new(model),
             caps: Caps {
                 tools: ToolSupport::Prompted,
                 streaming: true,
+                context_window: 512,
+                max_output: 256,
                 ..Caps::default()
             },
         })
@@ -38,23 +61,49 @@ impl LlamaCppProvider {
     }
 }
 
+fn prompt_for(model: &LlamaModel, messages: &[Message]) -> Result<String, ProviderError> {
+    let template = model
+        .chat_template(None)
+        .map_err(|error| ProviderError::BadRequest(format!("Model has no chat template: {error}")))?;
+    let messages = messages
+        .iter()
+        .map(|message| {
+            let (role, content) = match message {
+                Message::System(text) => ("system", text.clone()),
+                Message::User(items) => ("user", text_content(items)),
+                Message::Assistant { content, .. } => ("assistant", text_content(content)),
+                Message::ToolResult { content, .. } => ("tool", content.clone()),
+            };
+            LlamaChatMessage::new(role.to_string(), content)
+                .map_err(|error| ProviderError::BadRequest(format!("Invalid chat message: {error}")))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    model
+        .apply_chat_template(&template, &messages, true)
+        .map_err(|error| ProviderError::BadRequest(format!("Failed to format chat prompt: {error}")))
+}
+
+fn text_content(items: &[Content]) -> String {
+    items
+        .iter()
+        .filter_map(Content::as_text)
+        .collect::<Vec<_>>()
+        .join("")
+}
+
 #[async_trait]
 impl Provider for LlamaCppProvider {
     async fn stream(&self, req: Request) -> Result<BoxStream<'static, Event>, ProviderError> {
         let model = Arc::clone(&self.model);
         let max_tokens = req.max_tokens as usize;
-
-        let prompt = req
-            .messages
-            .iter()
-            .map(|m| m.text())
-            .collect::<Vec<_>>()
-            .join("\n");
-
+        let temperature = req.temperature;
         let (tx, rx) = tokio::sync::mpsc::channel(128);
 
         tokio::task::spawn_blocking(move || {
-            let _ = generate_completion(model, &prompt, max_tokens, tx).await;
+            if let Err(error) = generate_completion(model, &req, max_tokens, temperature, &tx) {
+                let _ = tx.blocking_send(Event::Error(error));
+            }
         });
 
         Ok(ReceiverStream::new(rx).boxed())
@@ -65,66 +114,92 @@ impl Provider for LlamaCppProvider {
     }
 
     fn count_tokens(&self, msgs: &[Message]) -> Result<u32, ProviderError> {
-        let bpe = tiktoken_rs::cl100k_base()
-            .map_err(|e| ProviderError::Other(format!("tokenizer unavailable: {e}")))?;
-        let text = msgs.iter().map(Message::text).collect::<Vec<_>>().join("\n");
-        Ok(bpe.encode_with_special_tokens(&text).len() as u32)
+        let prompt = prompt_for(&self.model, msgs)?;
+        let tokens = self.model.vocab().tokenize(prompt.as_bytes(), true, false);
+        u32::try_from(tokens.len())
+            .map_err(|error| ProviderError::Other(format!("Token count is too large: {error}")))
     }
 }
 
-async fn generate_completion(
+fn generate_completion(
     model: Arc<LlamaModel>,
-    prompt: &str,
+    req: &Request,
     max_tokens: usize,
-    tx: tokio::sync::mpsc::Sender<Event>,
+    temperature: f32,
+    tx: &tokio::sync::mpsc::Sender<Event>,
 ) -> Result<(), ProviderError> {
-    let mut ctx = model
-        .create_context(Default::default())
-        .map_err(|e| ProviderError::Other(format!("Failed to create context: {e}")))?;
-
-    let tokens = model
-        .tokenize(prompt, true)
-        .map_err(|e| ProviderError::Other(format!("Tokenization failed: {e}")))?;
-
+    let prompt = prompt_for(&model, &req.messages)?;
+    let tokens = model.vocab().tokenize(prompt.as_bytes(), true, false);
     if tokens.is_empty() {
-        let _ = tx.send(Event::Done(StopReason::EndTurn)).await;
+        return Err(ProviderError::BadRequest(
+            "The chat template produced an empty prompt".into(),
+        ));
+    }
+
+    let mut ctx = model
+        .new_context(backend()?, LlamaContextParams::default())
+        .map_err(|error| ProviderError::Other(format!("Failed to create context: {error}")))?;
+    if tokens.len() > ctx.n_ctx() as usize {
+        return Err(ProviderError::BadRequest(format!(
+            "Prompt has {} tokens, exceeding the llama.cpp context size of {}",
+            tokens.len(),
+            ctx.n_ctx()
+        )));
+    }
+
+    let mut batch = LlamaBatch::new(tokens.len(), 1);
+    batch
+        .add_sequence(&tokens, 0, true)
+        .map_err(|error| ProviderError::Other(format!("Failed to prepare prompt: {error}")))?;
+    ctx.decode(&mut batch)
+        .map_err(|error| ProviderError::Other(format!("Prompt decode failed: {error}")))?;
+
+    let available_tokens = ctx.n_ctx() as usize - tokens.len();
+    let max_tokens = max_tokens.min(available_tokens);
+    if max_tokens == 0 {
+        let _ = tx.blocking_send(Event::Done(StopReason::MaxTokens));
         return Ok(());
     }
 
-    for token in &tokens {
-        ctx.decode(*token)
-            .map_err(|e| ProviderError::Other(format!("Decode failed: {e}")))?;
-    }
+    let mut sampler = if temperature <= 0.0 {
+        LlamaSampler::greedy()
+    } else {
+        LlamaSampler::chain_simple([
+            LlamaSampler::temp(temperature),
+            LlamaSampler::dist(1234),
+        ])
+    };
+    let vocab = model.vocab();
+    let mut position = i32::try_from(tokens.len())
+        .map_err(|error| ProviderError::BadRequest(format!("Prompt is too long: {error}")))?;
 
-    for i in 0..max_tokens {
-        let next_token = ctx
-            .sample_next_token(Default::default())
-            .map_err(|e| ProviderError::Other(format!("Sampling failed: {e}")))?;
-
-        if next_token == model.token_eos() {
-            let _ = tx.send(Event::Done(StopReason::EndTurn)).await;
+    for index in 0..max_tokens {
+        let token = sampler.sample(&ctx, -1);
+        if vocab.is_eog(token) {
+            let _ = tx.blocking_send(Event::Done(StopReason::EndTurn));
             return Ok(());
         }
 
-        let text = model
-            .token_to_str(next_token)
-            .map_err(|e| ProviderError::Other(format!("Token to string failed: {e}")))?;
-
-        if !text.is_empty() {
-            if tx.send(Event::TextDelta(text)).await.is_err() {
-                return Ok(());
-            }
-        }
-
-        ctx.decode(next_token)
-            .map_err(|e| ProviderError::Other(format!("Decode failed: {e}")))?;
-
-        if i >= max_tokens - 1 {
-            let _ = tx.send(Event::Done(StopReason::MaxTokens)).await;
+        sampler.accept(token);
+        let text = String::from_utf8_lossy(&vocab.token_to_piece(token, false, None)).into_owned();
+        if !text.is_empty() && tx.blocking_send(Event::TextDelta(text)).is_err() {
             return Ok(());
         }
+
+        if index + 1 == max_tokens {
+            let _ = tx.blocking_send(Event::Done(StopReason::MaxTokens));
+            return Ok(());
+        }
+
+        batch.clear();
+        batch
+            .add(token, position, &[0], true)
+            .map_err(|error| ProviderError::Other(format!("Failed to prepare token: {error}")))?;
+        ctx.decode(&mut batch)
+            .map_err(|error| ProviderError::Other(format!("Token decode failed: {error}")))?;
+        position += 1;
     }
 
-    let _ = tx.send(Event::Done(StopReason::EndTurn)).await;
+    let _ = tx.blocking_send(Event::Done(StopReason::EndTurn));
     Ok(())
 }

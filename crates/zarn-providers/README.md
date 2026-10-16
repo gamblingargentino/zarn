@@ -166,19 +166,18 @@ fn main() {
 }
 ```
 
-## The `local` feature (llamacpp) is unverified
+## In-process Llama.cpp
 
-`LlamaCppProvider` is behind the optional `local` cargo feature and is NOT
-part of the default build. It has never been compiled: `llama-cpp-sys-2`
-builds llama.cpp from source and that native build fails in the environment
-this adapter was written in, so `cargo check --features local` cannot get as
-far as type-checking the Rust.
+The optional `local` feature enables `LlamaCppProvider`, which loads a GGUF
+model in-process using `llama-cpp-2`. Enable it with
+`zarn-providers = { path = "...", features = ["local"] }`. Configure a model
+file with `model_path`:
 
-Treat `llamacpp.rs` as a draft against the `llama-cpp-2` API, not a working
-binding. A review against the crate's real surface flagged the model loading,
-context creation, batch decoding and sampling calls as likely not matching any
-released version. Expect to rewrite that plumbing, and run
-`cargo check --features local` first, before relying on it.
+```toml
+[providers.local]
+kind = "llamacpp"
+model_path = "models/model.gguf"
+```
 
-Every other provider in this crate is on the default build and is covered by
-unit tests.
+The native llama.cpp dependency is built from source and requires a working
+native build toolchain.

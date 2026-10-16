@@ -3,11 +3,13 @@ mod cli;
 use anyhow::{Context, Result, bail};
 use clap::Parser;
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use zarn_config::Config;
 use zarn_core::agent::{Agent, AgentConfig, AgentEvent};
 use zarn_core::provider::Event;
+use zarn_core::session;
 use zarn_core::tools::Ctx;
 use zarn_core::types::Message;
 use zarn_providers::{build_chain, ProviderSpec};
@@ -44,85 +46,149 @@ async fn main() -> Result<()> {
     run_agent(&args).await
 }
 
-fn cmd_config_init() -> Result<()> {
-    let home = dirs::home_dir().context("cannot determine home directory")?;
-    let config_dir = home.join(".config/zarn");
-    let config_path = config_dir.join("config.toml");
+fn resume_messages(id: Option<&str>) -> Result<Vec<Message>> {
+    let root = session::data_root();
+    let cwd = std::env::current_dir()?;
 
-    if config_path.exists() {
-        eprintln!("Config already exists at {}", config_path.display());
+    let path = match id {
+        None => session::newest(&root, &cwd)
+            .context("no previous session for this directory")?,
+        Some(id) => session::find(&root, &cwd, id)
+            .with_context(|| format!("no session matching '{id}' in this directory"))?,
+    };
+
+    let (meta, messages) = session::read(&path)?;
+    eprintln!(
+        "resuming {} ({} messages, {} in / {} out)",
+        meta.id, messages.len(), meta.input_tokens, meta.output_tokens
+    );
+    Ok(messages)
+}
+
+fn config_target() -> Result<PathBuf> {
+    Config::home_path().context("cannot determine a home directory for the config")
+}
+
+fn cmd_config_init() -> Result<()> {
+    let path = config_target()?;
+    if path.exists() {
+        println!("config already exists at {}", path.display());
         return Ok(());
     }
 
-    std::fs::create_dir_all(&config_dir)
-        .with_context(|| format!("failed to create {}", config_dir.display()))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+    }
+    std::fs::write(&path, Config::starter())
+        .with_context(|| format!("writing {}", path.display()))?;
 
-    let starter_config = r#"[providers.openai]
-kind = "openai"
-
-[providers.anthropic]
-kind = "anthropic"
-
-[profiles.default]
-provider = "openai"
-model = "gpt-4o-mini"
-"#;
-
-    std::fs::write(&config_path, starter_config)
-        .with_context(|| format!("failed to write config to {}", config_path.display()))?;
-
-    println!("Created starter config at {}", config_path.display());
+    println!("wrote a starter config to {}", path.display());
+    println!("set the api_key_env variables it names, then run: zarn config check");
     Ok(())
 }
 
 fn cmd_config_check() -> Result<()> {
-    let cfg = Config::load().unwrap_or_default();
+    let sources = Config::sources();
+    println!("sources, highest precedence first:");
+    for path in &sources {
+        let mark = if path.exists() { "found" } else { "absent" };
+        println!("  [{mark}] {}", path.display());
+    }
 
-    println!("Providers:");
-    for (name, spec) in &cfg.providers {
-        println!("  {}: {}", name, spec.kind);
+    let cfg = Config::load()?;
+    println!();
+
+    let mut providers: Vec<_> = cfg.providers.iter().collect();
+    providers.sort_by_key(|(name, _)| name.as_str());
+    println!("providers:");
+    for (name, spec) in providers {
+        println!("  {name} ({})", spec.kind);
         if let Some(base_url) = &spec.base_url {
-            println!("    base_url: {}", base_url);
+            println!("    base_url      {base_url}");
         }
-        if spec.api_key.is_some() {
-            println!("    api_key: configured");
+        match &spec.api_key_env {
+            Some(var) => {
+                let state = if std::env::var(var).is_ok() { "set" } else { "NOT SET" };
+                println!("    api_key_env   {var} ({state})");
+            }
+            None => println!("    api_key_env   none"),
         }
-        if let Some(context_window) = spec.context_window {
-            println!("    context_window: {}", context_window);
+        if let Some(window) = spec.context_window {
+            println!("    context       {window}");
         }
     }
 
-    println!("\nProfiles:");
-    for (name, profile) in &cfg.profiles {
-        println!("  {}:", name);
+    let mut profiles: Vec<_> = cfg.profiles.iter().collect();
+    profiles.sort_by_key(|(name, _)| name.as_str());
+    println!("\nprofiles:");
+    for (name, profile) in profiles {
+        println!("  {name}");
         if let Some(provider) = &profile.provider {
-            println!("    provider: {}", provider);
+            println!("    provider      {provider}");
         }
         if let Some(model) = &profile.model {
-            println!("    model: {}", model);
+            println!("    model         {model}");
         }
-        if let Some(fallback) = &profile.fallback {
-            println!("    fallback: {}", fallback.join(", "));
+        if let Some(fallback) = &profile.fallback
+            && !fallback.is_empty()
+        {
+            println!("    fallback      {}", fallback.join(" -> "));
         }
     }
 
-    println!("\nPermissions: {} policies", cfg.permissions.len());
+    let mut permissions: Vec<_> = cfg.permissions.iter().collect();
+    permissions.sort_by_key(|(name, _)| name.as_str());
+    println!("\npermissions:");
+    if permissions.is_empty() {
+        println!("  none set; risk defaults apply");
+    }
+    for (tool, policy) in permissions {
+        println!("  {tool:<8} {policy:?}");
+    }
 
+    println!("\nconfig is valid");
     Ok(())
 }
 
+async fn reachable(base_url: &str) -> String {
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => return format!("unknown ({err})"),
+    };
+
+    match client.get(base_url).send().await {
+        Ok(response) => format!("reachable (HTTP {})", response.status().as_u16()),
+        Err(err) if err.is_timeout() => "unreachable (timed out)".to_string(),
+        Err(err) if err.is_connect() => "unreachable (connection refused)".to_string(),
+        Err(_) => "unreachable".to_string(),
+    }
+}
+
 async fn cmd_providers() -> Result<()> {
-    let cfg = Config::load().unwrap_or_default();
+    let cfg = Config::load()?;
+    if cfg.providers.is_empty() {
+        println!("no providers configured; run: zarn config init");
+        return Ok(());
+    }
 
-    println!("Configured providers:");
-    for (name, spec) in &cfg.providers {
-        let status = if spec.api_key.is_some() {
-            "configured"
-        } else {
-            "not configured"
+    let mut providers: Vec<_> = cfg.providers.iter().collect();
+    providers.sort_by_key(|(name, _)| name.as_str());
+
+    for (name, spec) in providers {
+        let key = match &spec.api_key_env {
+            None => "no key needed".to_string(),
+            Some(var) if std::env::var(var).is_ok() => format!("{var} set"),
+            Some(var) => format!("{var} NOT SET"),
         };
-
-        println!("  {} [{}]: {}", name, status, spec.kind);
+        let health = match &spec.base_url {
+            Some(base_url) => reachable(base_url).await,
+            None => "no base_url to probe".to_string(),
+        };
+        println!("{name:<12} {:<16} {key:<28} {health}", spec.kind);
     }
 
     Ok(())
@@ -176,7 +242,12 @@ async fn run_agent(args: &Args) -> Result<()> {
     let run_mode = args.run_mode();
 
     match run_mode {
-        RunMode::Interactive => {
+        RunMode::Interactive | RunMode::ContinueLast | RunMode::ResumeSession(_) => {
+            let history = match &run_mode {
+                RunMode::ContinueLast => resume_messages(None)?,
+                RunMode::ResumeSession(id) => resume_messages(Some(id))?,
+                _ => Vec::new(),
+            };
             let (prompt_sink, permissions) = zarn_tui::permission_channel();
             let mut perms = Permissions::new(prompt_sink);
             perms = perms.with_tools(cfg.permissions);
@@ -184,7 +255,7 @@ async fn run_agent(args: &Args) -> Result<()> {
             let agent = Arc::new(
                 Agent::new(provider, tools, ctx, config).with_gate(gate),
             );
-            zarn_tui::run(agent, Vec::new(), permissions).await?;
+            zarn_tui::run(agent, history, permissions).await?;
         }
         RunMode::OneShot(prompt) => {
             let agent = Agent::new(provider, tools, ctx, config)
@@ -224,12 +295,6 @@ async fn run_agent(args: &Args) -> Result<()> {
                 Ok(_) => {}
                 Err(err) => bail!(err),
             }
-        }
-        RunMode::ContinueLast => {
-            bail!("--continue not yet implemented");
-        }
-        RunMode::ResumeSession(_id) => {
-            bail!("--resume not yet implemented");
         }
     }
 
