@@ -288,7 +288,7 @@ impl Picker {
             let value = choice.value.to_lowercase();
             if label.starts_with(&needle) || value.starts_with(&needle) {
                 starts.push(choice);
-            } else if label.contains(&needle) || value.contains(&needle) {
+            } else if label.contains(&needle) || value.contains(&needle) || choice.detail.to_lowercase().contains(&needle) {
                 contains.push(choice);
             }
         }

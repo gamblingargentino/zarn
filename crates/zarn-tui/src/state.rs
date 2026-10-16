@@ -82,8 +82,9 @@ impl PlanReview {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum CardStatus {
+    #[default]
     Pending,
     Running,
     Done,
@@ -101,7 +102,7 @@ impl CardStatus {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct ToolCard {
     pub id: String,
     pub name: String,
@@ -109,7 +110,11 @@ pub struct ToolCard {
     pub status: CardStatus,
     pub output: Option<String>,
     pub expanded: bool,
+    pub detail: Option<String>,
+    pub live: Vec<String>,
 }
+
+pub const LIVE_LINES: usize = 200;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CompareSide {
@@ -138,6 +143,17 @@ pub struct Status {
     pub cost: Option<f64>,
     pub context: Option<(u32, u32)>,
     pub mode: String,
+    pub profile: String,
+    pub cwd: String,
+    pub branch: String,
+    pub turn_started: Option<std::time::Instant>,
+    pub streamed_chars: usize,
+}
+
+impl Status {
+    pub fn turn_tokens(&self) -> u64 {
+        (self.streamed_chars as u64).div_ceil(4)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -205,6 +221,8 @@ pub struct Theme {
     pub accent: Color,
     pub banner: bool,
     pub show_cost: bool,
+    pub palette: crate::theme::Palette,
+    pub status_line: Option<crate::status_line::Template>,
 }
 
 impl Default for Theme {
@@ -213,6 +231,8 @@ impl Default for Theme {
             accent: brand::ACCENT,
             banner: true,
             show_cost: true,
+            palette: crate::theme::DARK,
+            status_line: None,
         }
     }
 }
@@ -243,12 +263,14 @@ pub struct App {
     pub files: Vec<String>,
     pub keymap: crate::keymap::Keymap,
     pub transcript: bool,
+    pub todos: Vec<zarn_core::session::Todo>,
     pub vim: Option<Vim>,
     pub transcript_scroll: u16,
     pub search: Option<Search>,
     pub pastes: Vec<Paste>,
     pub paste_count: usize,
     pub queue_display: Vec<String>,
+    pub focused: Option<bool>,
     ctrl_c_armed: bool,
     esc_armed: bool,
 }
@@ -628,10 +650,13 @@ impl App {
 
     pub fn apply(&mut self, event: AgentEvent) {
         match event {
-            AgentEvent::Provider(Event::TextDelta(text)) => match self.blocks.last_mut() {
-                Some(Block::Assistant(existing)) => existing.push_str(&text),
-                _ => self.blocks.push(Block::Assistant(text)),
-            },
+            AgentEvent::Provider(Event::TextDelta(text)) => {
+                self.status.streamed_chars += text.len();
+                match self.blocks.last_mut() {
+                    Some(Block::Assistant(existing)) => existing.push_str(&text),
+                    _ => self.blocks.push(Block::Assistant(text)),
+                }
+            }
             AgentEvent::Provider(Event::Usage {
                 input,
                 output,
@@ -651,8 +676,7 @@ impl App {
                     name,
                     args,
                     status: CardStatus::Running,
-                    output: None,
-                    expanded: false,
+                    ..ToolCard::default()
                 }));
             }
             AgentEvent::ToolFinished { id, output, .. } => {
@@ -665,6 +689,31 @@ impl App {
                     card.output = Some(output.content);
                 }
             }
+        }
+    }
+
+    pub fn progress(&mut self, command: &str, line: &str) {
+        let card = self.blocks.iter_mut().rev().find_map(|b| match b {
+            Block::Tool(card)
+                if card.name == "bash"
+                    && card.status == CardStatus::Running
+                    && card.args.get("command").and_then(Value::as_str) == Some(command) =>
+            {
+                Some(card)
+            }
+            _ => None,
+        });
+        if let Some(card) = card {
+            card.live.push(line.to_string());
+            if card.live.len() > LIVE_LINES {
+                card.live.remove(0);
+            }
+        }
+    }
+
+    pub fn set_card_detail(&mut self, id: &str, detail: String) {
+        if let Some(card) = self.card_mut(id) {
+            card.detail = Some(detail);
         }
     }
 
@@ -729,6 +778,16 @@ impl App {
             Mode::Panel(panel) => return panel.on_key(key).map(Action::Panel),
             Mode::Onboarding(flow) => return flow.on_key(key).map(Action::Onboard),
             Mode::Chat => {}
+        }
+
+        if self.transcript {
+            return self.on_transcript_key(key);
+        }
+
+        if self.search.is_some()
+            && let Some(action) = self.on_search_key(key)
+        {
+            return action;
         }
 
         if let Some(overlay) = self.overlay.take() {
@@ -955,10 +1014,95 @@ impl App {
 
     pub fn toggle_transcript(&mut self) {
         self.transcript = !self.transcript;
+        if self.transcript {
+            self.transcript_scroll = 0;
+        }
     }
 
     pub fn start_search(&mut self) {
-        self.search = Some(crate::state::Search::default());
+        self.search = Some(Search {
+            typing: true,
+            ..Search::default()
+        });
+    }
+
+    pub fn scroll_by(&mut self, up: i32) {
+        let target = if self.transcript {
+            &mut self.transcript_scroll
+        } else {
+            &mut self.scroll_up
+        };
+        *target = if up >= 0 {
+            target.saturating_add(up as u16)
+        } else {
+            target.saturating_sub(up.unsigned_abs() as u16)
+        };
+    }
+
+    pub fn on_mouse(&mut self, event: crossterm::event::MouseEvent) {
+        use crossterm::event::MouseEventKind;
+        match event.kind {
+            MouseEventKind::ScrollUp => self.scroll_by(3),
+            MouseEventKind::ScrollDown => self.scroll_by(-3),
+            _ => {}
+        }
+    }
+
+    fn on_transcript_key(&mut self, key: KeyEvent) -> Option<Action> {
+        if self.keymap.action(&key) == Some(crate::keymap::KeyAction::Transcript) {
+            self.transcript = false;
+            return None;
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.transcript = false,
+            KeyCode::Up | KeyCode::Char('k') => self.scroll_by(1),
+            KeyCode::Down | KeyCode::Char('j') => self.scroll_by(-1),
+            KeyCode::PageUp => self.scroll_by(10),
+            KeyCode::PageDown => self.scroll_by(-10),
+            KeyCode::Home | KeyCode::Char('g') => self.transcript_scroll = u16::MAX,
+            KeyCode::End | KeyCode::Char('G') => self.transcript_scroll = 0,
+            _ => {}
+        }
+        None
+    }
+
+    fn on_search_key(&mut self, key: KeyEvent) -> Option<Option<Action>> {
+        let search = self.search.as_mut()?;
+        if search.typing {
+            match key.code {
+                KeyCode::Esc => self.search = None,
+                KeyCode::Enter => {
+                    if search.query.is_empty() {
+                        self.search = None;
+                    } else {
+                        search.typing = false;
+                        search.hit = 0;
+                    }
+                }
+                KeyCode::Backspace => {
+                    search.query.pop();
+                }
+                KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    search.query.push(c);
+                    search.hit = 0;
+                }
+                _ => {}
+            }
+            return Some(None);
+        }
+        match key.code {
+            KeyCode::Char('n') if self.input.is_empty() => search.hit = search.hit.saturating_add(1),
+            KeyCode::Char('N') if self.input.is_empty() => search.hit = search.hit.saturating_sub(1),
+            KeyCode::Esc => self.search = None,
+            _ if self.keymap.action(&key) == Some(crate::keymap::KeyAction::SearchScrollback) => {
+                self.start_search();
+            }
+            _ => {
+                self.search = None;
+                return None;
+            }
+        }
+        Some(None)
     }
 
     fn on_plan_key(&mut self, key: KeyEvent) -> Option<Action> {

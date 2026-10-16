@@ -373,6 +373,8 @@ pub async fn doctor(offline: bool) -> Result<()> {
     let store = KeyStore::shared();
     let mut checks = doctor::run(&store, paths::project_config(), paths::user_config(), !offline).await;
     checks.extend(zarn_tui::terminal::checks(None));
+    let mouse = layers().map(|l| l.merged().general.mouse()).unwrap_or(false);
+    checks.push(zarn_tui::terminal::mouse_check(mouse));
     println!("{}", doctor::render(&checks));
     if checks.iter().any(|c| c.status == doctor::Status::Fail) {
         std::process::exit(1);

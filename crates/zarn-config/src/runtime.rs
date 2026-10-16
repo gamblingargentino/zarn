@@ -359,6 +359,7 @@ pub struct Assembly {
     pub notify: Option<Notify>,
     pub mode: Option<ModeDef>,
     pub approver: Option<Arc<dyn PlanApprover>>,
+    pub todos: Option<zarn_tools::todo::TodoList>,
 }
 
 fn allowed(mode: &ModeDef, name: &str) -> bool {
@@ -411,6 +412,9 @@ pub fn assemble(
                 ..AgentConfig::default()
             },
         )));
+    }
+    if let Some(list) = assembly.todos.clone() {
+        tools.push(Box::new(zarn_tools::todo::TodoTool::new(list)));
     }
     if mode.safe_only
         && let Some(approver) = assembly.approver.clone()

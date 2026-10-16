@@ -157,6 +157,7 @@ impl Tool for Bash {
 
         let merged = Arc::new(Mutex::new(String::new()));
         let mut readers = Vec::new();
+        let progress_owner = crate::progress::owner(ctx);
 
         for pipe in [
             child.stdout.take().map(PipeKind::Out),
@@ -166,12 +167,14 @@ impl Tool for Bash {
         .flatten()
         {
             let sink = merged.clone();
+            let command_text = command.to_string();
             readers.push(tokio::spawn(async move {
                 let mut lines = match pipe {
                     PipeKind::Out(out) => BufReader::new(Box::pin(out) as PinnedRead).lines(),
                     PipeKind::Err(err) => BufReader::new(Box::pin(err) as PinnedRead).lines(),
                 };
                 while let Ok(Some(line)) = lines.next_line().await {
+                    crate::progress::emit(progress_owner, &command_text, &line);
                     if let Ok(mut sink) = sink.lock() {
                         sink.push_str(&line);
                         sink.push('\n');
@@ -241,6 +244,29 @@ mod tests {
 
     fn ctx() -> Ctx {
         Ctx::new(std::env::temp_dir())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn output_streams_through_the_progress_sink_as_it_arrives() {
+        let ctx = ctx();
+        let seen: Arc<Mutex<Vec<(std::time::Instant, String)>>> = Arc::default();
+        let log = seen.clone();
+        crate::progress::register(
+            &ctx,
+            Arc::new(move |_cmd, line| log.lock().unwrap().push((std::time::Instant::now(), line.to_string()))),
+        );
+        let started = std::time::Instant::now();
+        Bash::new()
+            .run(json!({ "command": "echo first; sleep 0.6; echo second" }), &ctx)
+            .await
+            .unwrap();
+        let finished = std::time::Instant::now();
+        crate::progress::unregister(&ctx);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.iter().map(|(_, l)| l.as_str()).collect::<Vec<_>>(), vec!["first", "second"]);
+        assert!(seen[0].0.duration_since(started) < std::time::Duration::from_millis(400));
+        assert!(finished.duration_since(seen[0].0) >= std::time::Duration::from_millis(400));
     }
 
     #[tokio::test]

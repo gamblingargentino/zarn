@@ -1,5 +1,6 @@
 pub mod brand;
 pub mod editor;
+pub mod export;
 pub mod keymap;
 pub mod markdown;
 pub mod mentions;
@@ -11,6 +12,9 @@ pub mod run;
 pub mod settings;
 pub mod state;
 pub mod terminal;
+pub mod theme;
+pub mod notify;
+pub mod status_line;
 pub mod views;
 pub mod widgets;
 

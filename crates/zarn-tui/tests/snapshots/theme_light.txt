@@ -1,0 +1,22 @@
+«Indexed(242)»a notice in the dim role«»
+
+«Rgb(138, 43, 226)»› «»hello
+
+Some «Indexed(25)»code«» and bold text.
+
+«Indexed(242)»┌ «»grep  «Indexed(28)»done«»  'x' · 1 match
+«Indexed(242)»│ «»a.rs:1: x
+«Indexed(242)»└«»
+
+«Indexed(242)»┌ «»bash  «Indexed(160)»failed«»
+«Indexed(242)»│ «»$ false
+«Indexed(242)»│ «»exit 1
+«Indexed(242)»└«»
+
+
+
+
+«Indexed(242)»default mode  ·  m  ·  0 in / 0 out  ·  ctx 0%  ·  no rate configured«»
+«Indexed(242)»╭──────────────────────────────────────────────────────────────────────╮«»
+«Indexed(242)»│«»                                                                      «Indexed(242)»│«»
+«Indexed(242)»╰──────────────────────────────────────────────────────────────────────╯«»

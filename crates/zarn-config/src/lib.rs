@@ -64,6 +64,14 @@ pub struct General {
     pub sandbox: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vim: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub theme: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notifications: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_line: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mouse: Option<bool>,
 }
 
 impl General {
@@ -80,6 +88,10 @@ impl General {
         self.auto_allow_read_only = self.auto_allow_read_only.or(other.auto_allow_read_only);
         self.sandbox = self.sandbox.or(other.sandbox);
         self.vim = self.vim.or(other.vim);
+        self.theme = self.theme.take().or(other.theme);
+        self.notifications = self.notifications.or(other.notifications);
+        self.status_line = self.status_line.take().or(other.status_line);
+        self.mouse = self.mouse.or(other.mouse);
     }
 
     pub fn vim(&self) -> bool {
@@ -88,6 +100,14 @@ impl General {
 
     pub fn sandbox(&self) -> bool {
         self.sandbox.unwrap_or(false)
+    }
+
+    pub fn notifications(&self) -> bool {
+        self.notifications.unwrap_or(true)
+    }
+
+    pub fn mouse(&self) -> bool {
+        self.mouse.unwrap_or(false)
     }
 
     pub fn tool_options(&self) -> zarn_tools::Options {

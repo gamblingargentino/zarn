@@ -153,6 +153,10 @@ pub enum RowKind {
     ReadOnly,
     Sandbox,
     Vim,
+    Theme,
+    Notifications,
+    StatusLine,
+    Mouse,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -187,6 +191,7 @@ pub enum PickFor {
     ProfileModel(String),
     AddFallback(String),
     Accent,
+    Theme,
     RoleProvider(String),
     RoleModel(String, String),
     ActiveMode,
@@ -205,6 +210,7 @@ pub enum FormFor {
     NewMode,
     EditMode(usize),
     SpendCap(bool),
+    StatusLine,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -248,6 +254,7 @@ pub struct Form {
     pub title: String,
     pub fields: Vec<FormField>,
     pub focus: usize,
+    pub preview: Option<crate::status_line::Values>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -263,6 +270,7 @@ impl Form {
             title: title.into(),
             fields,
             focus: 0,
+            preview: None,
         }
     }
 
@@ -334,6 +342,7 @@ pub struct Panel {
     pub agents: Vec<AgentFile>,
     pub modes: Vec<ModeFile>,
     pub active_mode: String,
+    pub status_values: crate::status_line::Values,
     pub cursor: Vec<usize>,
     pub editor: Option<Editor>,
     pub message: Option<(String, bool)>,
@@ -432,6 +441,7 @@ impl Panel {
             agents,
             modes: loaded.modes,
             active_mode,
+            status_values: crate::status_line::Values::default(),
             cursor: vec![0; TABS.len()],
             editor: None,
             message: None,
@@ -445,6 +455,11 @@ impl Panel {
     pub fn with_mode_dirs(mut self, user: Option<PathBuf>, project: PathBuf) -> Self {
         self.mode_dirs = (user, project);
         self.reload_modes();
+        self
+    }
+
+    pub fn with_status_values(mut self, values: crate::status_line::Values) -> Self {
+        self.status_values = values;
         self
     }
 
@@ -783,6 +798,22 @@ impl Panel {
                         .to_string(),
                     RowKind::ContextBudget,
                 ),
+                Row::new(
+                    "theme",
+                    cfg.general.theme.clone().unwrap_or_else(|| "auto".into()),
+                    RowKind::Theme,
+                )
+                .note("auto follows COLORFGBG and falls back to dark"),
+                Row::new("notifications", on_off(cfg.general.notifications()), RowKind::Notifications)
+                    .note("bell and title after turns over 10s and on permission prompts"),
+                Row::new(
+                    "status line",
+                    cfg.general.status_line.clone().unwrap_or_else(|| "built-in".into()),
+                    RowKind::StatusLine,
+                )
+                .note("template with {model} {mode} {profile} {context} {cost} {cwd} {branch}"),
+                Row::new("mouse scrolling", on_off(cfg.general.mouse()), RowKind::Mouse)
+                    .note("captures the mouse, so native text selection needs shift; see /doctor"),
             ],
         }
     }
@@ -1289,6 +1320,36 @@ impl Panel {
                 ));
                 None
             }
+            RowKind::Theme => {
+                let choices = crate::theme::NAMES.iter().map(|n| Choice::plain(*n)).collect();
+                self.editor = Some(Editor::Pick(
+                    Picker::new("Theme", choices).select_value(cfg.general.theme.as_deref().unwrap_or("auto")),
+                    PickFor::Theme,
+                ));
+                None
+            }
+            RowKind::Notifications => {
+                let value = !cfg.general.notifications();
+                let result = ops::set_general(&mut self.layers, GeneralField::Notifications, |g| {
+                    g.notifications = Some(value)
+                });
+                self.saved(format!("notifications {}", on_off(value)), result)
+            }
+            RowKind::Mouse => {
+                let value = !cfg.general.mouse();
+                let result = ops::set_general(&mut self.layers, GeneralField::Mouse, |g| g.mouse = Some(value));
+                self.saved(format!("mouse scrolling {}", on_off(value)), result)
+            }
+            RowKind::StatusLine => {
+                let mut form = Form::new(
+                    "Status line",
+                    vec![FormField::new("template", cfg.general.status_line.clone().unwrap_or_default())
+                        .hint("{model} {mode} {profile} {context} {cost} {cwd} {branch}; empty resets")],
+                );
+                form.preview = Some(self.status_values.clone());
+                self.editor = Some(Editor::Form(form, FormFor::StatusLine));
+                None
+            }
             RowKind::Banner => {
                 let value = !cfg.general.banner();
                 let result = ops::set_general(&mut self.layers, GeneralField::Banner, |g| {
@@ -1556,6 +1617,12 @@ impl Panel {
                 self.say(format!("mode is now {value}"));
                 Some(Effect::SetMode(value))
             }
+            PickFor::Theme => {
+                let result = ops::set_general(&mut self.layers, GeneralField::Theme, |g| {
+                    g.theme = Some(value.clone())
+                });
+                self.saved(format!("theme is now {value}"), result)
+            }
             PickFor::Accent => {
                 if !brand::ACCENTS.iter().any(|(n, _)| *n == value) && brand::parse_hex(&value).is_none() {
                     self.fail(format!("'{value}' is not a color name or #rrggbb"));
@@ -1715,6 +1782,22 @@ impl Panel {
                         Some(Effect::Reload)
                     }
                     Err(err) => retry(self, form, purpose, format!("{err:#}")),
+                }
+            }
+            FormFor::StatusLine => {
+                let source = form.value("template");
+                if source.is_empty() {
+                    let result = ops::set_general(&mut self.layers, GeneralField::StatusLine, |g| g.status_line = None);
+                    return self.saved("status line reset to the built-in one".to_string(), result);
+                }
+                match crate::status_line::Template::parse(&source) {
+                    Ok(_) => {
+                        let result = ops::set_general(&mut self.layers, GeneralField::StatusLine, |g| {
+                            g.status_line = Some(source.clone())
+                        });
+                        self.saved(format!("status line is now {source}"), result)
+                    }
+                    Err(err) => retry(self, form, purpose, format!("{err}; the previous status line is kept")),
                 }
             }
             FormFor::ContextBudget => match form.value("tokens").parse::<u32>() {

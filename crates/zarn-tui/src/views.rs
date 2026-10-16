@@ -2,6 +2,7 @@ use crate::brand;
 use crate::onboarding::{Onboarding, Step};
 use crate::settings::{Editor, Form, Panel, TABS};
 use crate::widgets::{MaskedInput, Picker, TextField};
+use crate::theme;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -11,7 +12,7 @@ use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
 const PICKER_ROWS: usize = 10;
 
 fn dim() -> Style {
-    Style::default().fg(Color::DarkGray)
+    Style::default().fg(theme::dim())
 }
 
 fn frame_block(title: &str, accent: Color) -> Block<'static> {
@@ -125,9 +126,9 @@ pub fn draw_panel(frame: &mut Frame, panel: &Panel, accent: Color) {
                 ];
                 if !row.note.is_empty() && rest > 3 {
                     let style = if row.note.starts_with("FAILED") {
-                        Style::default().fg(Color::Red)
+                        Style::default().fg(theme::error())
                     } else if row.note.starts_with("OK") {
-                        Style::default().fg(Color::Green)
+                        Style::default().fg(theme::ok())
                     } else {
                         dim()
                     };
@@ -142,9 +143,9 @@ pub fn draw_panel(frame: &mut Frame, panel: &Panel, accent: Color) {
 
     if let Some((text, error)) = &panel.message {
         let style = if *error {
-            Style::default().fg(Color::Red)
+            Style::default().fg(theme::error())
         } else {
-            Style::default().fg(Color::Green)
+            Style::default().fg(theme::ok())
         };
         frame.render_widget(Paragraph::new(Line::styled(clip(text, width), style)), parts[3]);
     }
@@ -296,7 +297,8 @@ pub fn draw_form(frame: &mut Frame, area: Rect, form: &Form, accent: Color) {
         .iter()
         .map(|f| f.input.value.split('\n').count().max(1) as u16)
         .sum();
-    let rect = centered(area, 76, field_rows + 5);
+    let extra = if form.preview.is_some() { 2 } else { 0 };
+    let rect = centered(area, 76, field_rows + 5 + extra);
     frame.render_widget(Clear, rect);
     let block = frame_block(&form.title, accent);
     let inner = block.inner(rect);
@@ -323,6 +325,17 @@ pub fn draw_form(frame: &mut Frame, area: Rect, form: &Form, accent: Color) {
             let row = before.matches('\n').count();
             cursor = Some((lines.len() - field.input.value.split('\n').count() + row, field_col(&field.input)));
         }
+    }
+    if let Some(values) = &form.preview {
+        let source = form.fields.first().map(|f| f.input.value.as_str()).unwrap_or("");
+        lines.push(Line::raw(""));
+        lines.push(match crate::status_line::preview(source, values) {
+            Ok(text) => Line::from(vec![Span::styled("preview  ", dim()), Span::raw(text)]),
+            Err(err) => Line::from(vec![
+                Span::styled("preview  ", dim()),
+                Span::styled(err, Style::default().fg(theme::error())),
+            ]),
+        });
     }
     lines.push(Line::raw(""));
     let hint = form
@@ -425,7 +438,7 @@ pub fn draw_onboarding(frame: &mut Frame, onboarding: &Onboarding, accent: Color
             frame.render_widget(
                 Paragraph::new(Line::styled(
                     format!("sending a test request to {}…", onboarding.model),
-                    Style::default().fg(Color::Yellow),
+                    Style::default().fg(theme::warn()),
                 )),
                 body,
             );
@@ -434,7 +447,7 @@ pub fn draw_onboarding(frame: &mut Frame, onboarding: &Onboarding, accent: Color
         Step::Failed(err) => {
             frame.render_widget(
                 Paragraph::new(vec![
-                    Line::styled("The test request failed:", Style::default().fg(Color::Red)),
+                    Line::styled("The test request failed:", Style::default().fg(theme::error())),
                     Line::raw(err.clone()),
                 ])
                 .wrap(Wrap { trim: false }),
@@ -445,7 +458,7 @@ pub fn draw_onboarding(frame: &mut Frame, onboarding: &Onboarding, accent: Color
         Step::Saved(text) => {
             frame.render_widget(
                 Paragraph::new(vec![
-                    Line::styled("It works.", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+                    Line::styled("It works.", Style::default().fg(theme::ok()).add_modifier(Modifier::BOLD)),
                     Line::raw(text.clone()),
                     Line::raw(""),
                     Line::raw("Change anything later with /config, /login, /model or /provider."),
@@ -457,7 +470,7 @@ pub fn draw_onboarding(frame: &mut Frame, onboarding: &Onboarding, accent: Color
         }
     };
     let line = match &onboarding.message {
-        Some(message) => Line::styled(message.clone(), Style::default().fg(Color::Yellow)),
+        Some(message) => Line::styled(message.clone(), Style::default().fg(theme::warn())),
         None => Line::styled(hint, dim()),
     };
     frame.render_widget(Paragraph::new(line), parts[3]);
@@ -470,12 +483,12 @@ pub fn draw_confirm(frame: &mut Frame, area: Rect, text: &str, accent: Color) {
         .sum();
     let rect = centered(area, 72, wrapped as u16 + 5);
     frame.render_widget(Clear, rect);
-    let block = frame_block("confirm", Color::Yellow);
+    let block = frame_block("confirm", theme::warn());
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
     let mut lines: Vec<Line> = text
         .lines()
-        .map(|l| Line::styled(l.to_string(), Style::default().fg(Color::Yellow)))
+        .map(|l| Line::styled(l.to_string(), Style::default().fg(theme::warn())))
         .collect();
     lines.extend([
         Line::raw(""),

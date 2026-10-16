@@ -88,6 +88,7 @@ fn tool_card_renders_name_and_status() {
         status: CardStatus::Done,
         output: Some("file1.txt\nfile2.txt".into()),
         expanded: false,
+        ..ToolCard::default()
     }));
 
     let output = render_app(80, 24, &app);
@@ -112,6 +113,7 @@ fn long_tool_output_is_collapsed_with_line_count() {
         status: CardStatus::Done,
         output: Some(long_output),
         expanded: false,
+        ..ToolCard::default()
     }));
 
     let output = render_app(80, 24, &app);
@@ -138,6 +140,7 @@ fn expanding_output_shows_all_lines_and_removes_more_marker() {
         status: CardStatus::Done,
         output: Some(long_output),
         expanded: false,
+        ..ToolCard::default()
     }));
 
     app.expand_last_output();
@@ -224,6 +227,7 @@ fn tool_status_pending_shows_correct_label() {
         status: CardStatus::Pending,
         output: None,
         expanded: false,
+        ..ToolCard::default()
     }));
 
     let output = render_app(80, 24, &app);
@@ -242,6 +246,7 @@ fn tool_status_running_shows_correct_label() {
         status: CardStatus::Running,
         output: None,
         expanded: false,
+        ..ToolCard::default()
     }));
 
     let output = render_app(80, 24, &app);
@@ -260,6 +265,7 @@ fn tool_status_failed_shows_correct_label() {
         status: CardStatus::Failed,
         output: Some("Error: permission denied".into()),
         expanded: false,
+        ..ToolCard::default()
     }));
 
     let output = render_app(80, 24, &app);
@@ -329,17 +335,26 @@ fn tool_with_args_shows_truncated_argument_values() {
     let mut app = App::new("model");
     app.blocks.push(Block::Tool(ToolCard {
         id: "tool-1".into(),
-        name: "bash".into(),
+        name: "mcp__shell__run".into(),
         args: json!({ "command": "echo 'hello'" }),
         status: CardStatus::Done,
         output: None,
         expanded: false,
+        ..ToolCard::default()
+    }));
+    app.blocks.push(Block::Tool(ToolCard {
+        id: "tool-2".into(),
+        name: "bash".into(),
+        args: json!({ "command": "echo 'hello'" }),
+        status: CardStatus::Done,
+        ..ToolCard::default()
     }));
 
     let output = render_app(80, 24, &app);
     let text = output.join("\n");
 
-    assert!(text.contains("command"));
+    assert!(text.contains("command: echo 'hello'"));
+    assert!(text.contains("$ echo 'hello'"));
 }
 
 #[test]

@@ -4,7 +4,6 @@ mod support;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use serde_json::json;
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
@@ -17,36 +16,6 @@ fn key(c: char) -> KeyEvent {
 
 fn enter() -> KeyEvent {
     KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)
-}
-
-fn screen(c: &zarn_tui::Controller, width: u16, height: u16) -> Vec<String> {
-    let mut terminal =
-        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
-    terminal.draw(|f| zarn_tui::render::draw(f, c.app())).unwrap();
-    let buffer = terminal.backend().buffer();
-    (0..height)
-        .map(|y| {
-            (0..width)
-                .map(|x| buffer.cell((x, y)).map(|c| c.symbol().to_string()).unwrap_or_default())
-                .collect::<String>()
-                .trim_end()
-                .to_string()
-        })
-        .collect()
-}
-
-fn snapshot(name: &str, rendered: &[String]) {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/snapshots")
-        .join(format!("{name}.txt"));
-    let text = rendered.join("\n") + "\n";
-    if std::env::var("ZARN_UPDATE_SNAPSHOTS").is_ok() {
-        std::fs::write(&path, &text).unwrap();
-        return;
-    }
-    let expected = std::fs::read_to_string(&path)
-        .unwrap_or_else(|_| panic!("missing snapshot {}\n{text}", path.display()));
-    assert_eq!(text, expected, "snapshot {name} differs");
 }
 
 fn scripted(steps: Vec<String>) -> impl Fn(&serde_json::Value) -> (String, u64) + Send + Sync + 'static {

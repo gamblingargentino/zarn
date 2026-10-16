@@ -189,6 +189,7 @@ async fn run_print(args: &Args, prompt: String) -> Result<()> {
             notify: Some(notify),
             mode: Some(mode),
             approver: Some(Arc::new(zarn_tools::exit_plan::Unattended)),
+            todos: Some(Default::default()),
         },
     )?;
     let gate = Permissions::headless().with_overlay(overlay);

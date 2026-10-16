@@ -154,7 +154,7 @@ fn snapshot_the_permissions_tab() {
 fn snapshot_the_general_tab() {
     let fx = Fixture::new(TWO_PROVIDERS);
     let app = app_with_panel(fx.panel().open_at(Tab::General));
-    snapshot("panel_general", &rows(100, 14, &app));
+    snapshot("panel_general", &rows(110, 24, &app));
 }
 
 #[test]
@@ -647,4 +647,47 @@ fn snapshot_the_hooks_tab() {
     assert!(text.contains("pre_tool · edit|write"));
     assert!(text.contains("./scripts/check-paths.sh"));
     assert!(text.contains("10 seconds"));
+}
+
+fn panel_key(panel: &mut Panel, code: KeyCode) -> Option<Effect> {
+    panel.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+}
+
+#[test]
+fn snapshot_the_status_line_form_previews_live_and_refuses_bad_templates() {
+    let fx = Fixture::new(&format!("[general]\nstatus_line = \"{{model}}\"\n\n{TWO_PROVIDERS}"));
+    let mut panel = fx.panel().open_at(Tab::General).with_status_values(zarn_tui::status_line::Values {
+        model: "gpt-x".into(),
+        mode: "plan".into(),
+        profile: "work".into(),
+        context: "42%".into(),
+        cost: "$0.0120".into(),
+        cwd: "~/src/app".into(),
+        branch: "main".into(),
+    });
+    let at = panel.rows().iter().position(|r| r.label == "status line").unwrap();
+    for _ in 0..at {
+        panel_key(&mut panel, KeyCode::Down);
+    }
+    panel_key(&mut panel, KeyCode::Enter);
+    for _ in 0.."{model}".len() {
+        panel_key(&mut panel, KeyCode::Backspace);
+    }
+    panel.paste("{model} · {mode} · {branch} · {context}");
+    let app = app_with_panel(panel);
+    let shown = rows(100, 24, &app);
+    snapshot("panel_status_line_preview", &shown);
+    assert!(shown.join("\n").contains("preview  gpt-x · plan · main · 42%"));
+
+    let Mode::Panel(mut panel) = app.mode else { unreachable!() };
+    for _ in 0..40 {
+        panel_key(&mut panel, KeyCode::Backspace);
+    }
+    panel.paste("{model} {oops}");
+    let app = app_with_panel(*panel);
+    assert!(rows(100, 24, &app).join("\n").contains("{oops} is not a status line field"));
+    let Mode::Panel(mut panel) = app.mode else { unreachable!() };
+    panel_key(&mut panel, KeyCode::Enter);
+    assert!(panel.message.as_ref().unwrap().0.contains("the previous status line is kept"));
+    assert!(fx.user_config().contains("status_line = \"{model}\""));
 }

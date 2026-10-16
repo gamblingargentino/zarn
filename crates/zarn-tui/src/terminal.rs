@@ -62,3 +62,19 @@ pub fn checks(known_keyboard: Option<bool>) -> Vec<Check> {
     }
     out
 }
+
+pub fn mouse_check(on: bool) -> Check {
+    if on {
+        Check::new(
+            "mouse",
+            Status::Ok,
+            "capture on: the wheel scrolls the scrollback, but native text selection now needs shift (option on macOS Terminal); turn it off under /config → General → mouse scrolling",
+        )
+    } else {
+        Check::new(
+            "mouse",
+            Status::Ok,
+            "capture off: native text selection works; scroll with pgup/pgdn, or turn on /config → General → mouse scrolling at the cost of plain selection",
+        )
+    }
+}

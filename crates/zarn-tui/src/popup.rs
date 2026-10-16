@@ -1,3 +1,4 @@
+use crate::theme;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -31,6 +32,9 @@ pub const BUILTINS: &[(&str, &str, &str)] = &[
     ("context", "", "show what fills the context window"),
     ("limits", "[session|day <usd|off>]", "show or set the spend caps"),
     ("resume", "[id]", "resume an earlier session in this directory"),
+    ("rename", "<title>", "rename this session"),
+    ("export", "[path]", "write the conversation to Markdown with keys redacted"),
+    ("copy", "", "copy the last reply to the clipboard"),
     ("tools", "", "list the registered tools"),
     ("login", "[provider]", "add or replace a provider's API key"),
     ("logout", "[provider]", "remove a provider's API key"),
@@ -49,7 +53,7 @@ pub const BUILTINS: &[(&str, &str, &str)] = &[
     ("hooks", "", "list the configured hooks"),
     ("doctor", "", "check config, keys, providers, MCP and the terminal"),
     ("status", "", "show profile, model, provider, cwd and session"),
-    ("theme", "[color]", "pick the accent color"),
+    ("theme", "[dark|light|colorblind|auto|color]", "pick the theme or the accent color"),
     ("quit", "", "exit zarn"),
 ];
 
@@ -178,7 +182,7 @@ pub fn draw_with(
             Line::from(vec![
                 Span::styled(marker, Style::default().fg(accent)),
                 Span::styled(format!("{prefix}{:<name_width$}", entry.name), name_style),
-                Span::styled(entry.description.clone(), Style::default().fg(Color::DarkGray)),
+                Span::styled(entry.description.clone(), Style::default().fg(theme::dim())),
             ])
         })
         .collect();
@@ -188,7 +192,7 @@ pub fn draw_with(
             Block::default()
                 .borders(Borders::ALL)
                 .border_type(BorderType::Rounded)
-                .border_style(Style::default().fg(Color::DarkGray)),
+                .border_style(Style::default().fg(theme::dim())),
         ),
         rect,
     );

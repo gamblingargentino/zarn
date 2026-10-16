@@ -181,3 +181,76 @@ pub async fn wait_for(c: &mut Controller, limit: Duration, done: impl Fn(&Contro
         c.pump(Duration::from_millis(50)).await;
     }
 }
+
+pub fn screen(c: &Controller, width: u16, height: u16) -> Vec<String> {
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+    terminal.draw(|f| zarn_tui::render::draw(f, c.app())).unwrap();
+    let buffer = terminal.backend().buffer();
+    (0..height)
+        .map(|y| {
+            (0..width)
+                .map(|x| buffer.cell((x, y)).map(|c| c.symbol().to_string()).unwrap_or_default())
+                .collect::<String>()
+                .trim_end()
+                .to_string()
+        })
+        .collect()
+}
+
+pub fn styled_screen(c: &Controller, width: u16, height: u16) -> Vec<String> {
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+    terminal.draw(|f| zarn_tui::render::draw(f, c.app())).unwrap();
+    let buffer = terminal.backend().buffer();
+    (0..height)
+        .map(|y| {
+            let mut out = String::new();
+            let mut current: Option<String> = None;
+            let mut run = String::new();
+            for x in 0..width {
+                let Some(cell) = buffer.cell((x, y)) else { continue };
+                let tag = match (cell.fg, cell.bg) {
+                    (ratatui::style::Color::Reset, ratatui::style::Color::Reset) => String::new(),
+                    (fg, ratatui::style::Color::Reset) => format!("{fg:?}"),
+                    (fg, bg) => format!("{fg:?}/{bg:?}"),
+                };
+                if current.as_ref() != Some(&tag) {
+                    if let Some(prev) = current.take() {
+                        out.push_str(&tagged(&prev, &run));
+                    }
+                    run.clear();
+                    current = Some(tag);
+                }
+                run.push_str(cell.symbol());
+            }
+            if let Some(prev) = current {
+                let trimmed = if prev.is_empty() { run.trim_end().to_string() } else { run.clone() };
+                out.push_str(&tagged(&prev, &trimmed));
+            }
+            out.trim_end().to_string()
+        })
+        .collect()
+}
+
+fn tagged(tag: &str, text: &str) -> String {
+    if tag.is_empty() || text.trim().is_empty() && !tag.contains('/') {
+        text.to_string()
+    } else {
+        format!("«{tag}»{text}«»")
+    }
+}
+
+pub fn snapshot(name: &str, rendered: &[String]) {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/snapshots")
+        .join(format!("{name}.txt"));
+    let text = rendered.join("\n") + "\n";
+    if std::env::var("ZARN_UPDATE_SNAPSHOTS").is_ok() {
+        std::fs::write(&path, &text).unwrap();
+        return;
+    }
+    let expected = std::fs::read_to_string(&path)
+        .unwrap_or_else(|_| panic!("missing snapshot {}\n{text}", path.display()));
+    assert_eq!(text, expected, "snapshot {name} differs");
+}

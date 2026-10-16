@@ -1,3 +1,4 @@
+use crate::theme;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::sync::LazyLock;
@@ -107,7 +108,7 @@ pub fn inline(text: &str) -> Vec<Span<'static>> {
             flush(&mut plain, &mut spans);
             spans.push(Span::styled(
                 chars[i + 1..end].iter().collect::<String>(),
-                Style::default().fg(Color::Cyan),
+                Style::default().fg(theme::info()),
             ));
             i = end + 1;
         } else if let Some(end) = closing(&chars, i, "*") {

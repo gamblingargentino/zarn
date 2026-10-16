@@ -140,6 +140,10 @@ impl Layers {
             GeneralField::ReadOnly => g.auto_allow_read_only.is_some(),
             GeneralField::Sandbox => g.sandbox.is_some(),
             GeneralField::Vim => g.vim.is_some(),
+            GeneralField::Theme => g.theme.is_some(),
+            GeneralField::Notifications => g.notifications.is_some(),
+            GeneralField::StatusLine => g.status_line.is_some(),
+            GeneralField::Mouse => g.mouse.is_some(),
         })
     }
 
@@ -169,6 +173,10 @@ pub enum GeneralField {
     ReadOnly,
     Sandbox,
     Vim,
+    Theme,
+    Notifications,
+    StatusLine,
+    Mouse,
 }
 
 #[cfg(test)]

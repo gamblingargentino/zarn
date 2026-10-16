@@ -136,6 +136,7 @@ enum UiEvent {
         output: zarn_core::tools::ToolOutput,
     },
     Window { model: String, window: u32 },
+    Progress { command: String, line: String },
 }
 
 struct McpState {
@@ -149,7 +150,8 @@ pub async fn run(options: Options) -> Result<()> {
     let _ = crossterm::execute!(
         std::io::stdout(),
         PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
-        EnableBracketedPaste
+        EnableBracketedPaste,
+        crossterm::event::EnableFocusChange
     );
 
     let outcome = match Controller::new(options) {
@@ -163,6 +165,8 @@ pub async fn run(options: Options) -> Result<()> {
     let _ = crossterm::execute!(
         std::io::stdout(),
         DisableBracketedPaste,
+        crossterm::event::DisableFocusChange,
+        crossterm::event::DisableMouseCapture,
         PopKeyboardEnhancementFlags
     );
     ratatui::restore();
@@ -215,6 +219,10 @@ pub struct Controller {
     shell_runs: usize,
     interactive: bool,
     editor_pending: bool,
+    todos: zarn_tools::todo::TodoList,
+    notifier: crate::notify::Notifier,
+    mouse: bool,
+    mouse_on: bool,
 }
 
 fn flatten_messages(messages: &[Message]) -> Vec<Block> {
@@ -298,8 +306,22 @@ impl Controller {
             shell_runs: 0,
             interactive: false,
             editor_pending: false,
+            todos: Arc::default(),
+            notifier: crate::notify::Notifier::stdout(),
+            mouse: false,
+            mouse_on: false,
         };
 
+        let progress_tx = controller.ui_tx.clone();
+        zarn_tools::progress::register(
+            &controller.ctx,
+            Arc::new(move |command: &str, line: &str| {
+                let _ = progress_tx.try_send(UiEvent::Progress {
+                    command: command.to_string(),
+                    line: zarn_config::auth::redact(line),
+                });
+            }),
+        );
         if let Some(path) = controller.options.resume.clone() {
             controller.resume(&path);
         }
@@ -582,6 +604,23 @@ impl Controller {
         self.app.theme.accent = brand::accent(cfg.general.accent.as_deref());
         self.app.theme.banner = cfg.general.banner();
         self.app.theme.show_cost = cfg.general.show_cost();
+        let colorfgbg = std::env::var("COLORFGBG").ok();
+        match crate::theme::resolve(cfg.general.theme.as_deref(), colorfgbg.as_deref()) {
+            Ok(palette) => self.app.theme.palette = palette,
+            Err(err) => self.app.notice(format!("theme: {err}")),
+        }
+        match cfg.general.status_line.as_deref().map(crate::status_line::Template::parse) {
+            None => self.app.theme.status_line = None,
+            Some(Ok(template)) => self.app.theme.status_line = Some(template),
+            Some(Err(err)) => {
+                let kept = if self.app.theme.status_line.is_some() { "keeping the previous one" } else { "using the default" };
+                self.app.notice(format!("status_line: {err}; {kept}"));
+            }
+        }
+        self.notifier.enabled = cfg.general.notifications();
+        self.mouse = cfg.general.mouse();
+        self.app.status.cwd = crate::status_line::short_path(&self.cwd, std::env::var_os("HOME").map(PathBuf::from).as_deref());
+        self.app.status.branch = crate::status_line::branch(&self.cwd);
         if let Ok(mut hooks) = self.hooks.write() {
             *hooks = cfg.hooks.clone();
         }
@@ -599,6 +638,7 @@ impl Controller {
         }
 
         let profile = self.profile();
+        self.app.status.profile = profile.clone();
         self.modes = modes::load();
         for warning in self.modes.warnings.clone() {
             if self.warned.insert(warning.clone()) {
@@ -647,6 +687,7 @@ impl Controller {
             notify: Some(notify),
             mode,
             approver: Some(self.approver.clone() as Arc<dyn PlanApprover>),
+            todos: Some(self.todos.clone()),
         };
         match runtime::assemble(&cfg, plan, &self.cwd, self.ctx.clone(), tools, assembly) {
             Ok(rt) => {
@@ -846,7 +887,10 @@ impl Controller {
             self.fetch_quota(Some(name), false, false);
         }
         self.app.mode = Mode::Panel(Box::new(
-            Panel::new(layers, store, data).open_at(tab).with_active_mode(mode),
+            Panel::new(layers, store, data)
+                .open_at(tab)
+                .with_active_mode(mode)
+                .with_status_values(render::status_values(&self.app)),
         ));
         match &mut self.app.mode {
             Mode::Panel(panel) => Some(panel),
@@ -860,6 +904,14 @@ impl Controller {
         let mut frames = tokio::time::interval(FRAME_INTERVAL);
 
         loop {
+            if self.mouse != self.mouse_on {
+                self.mouse_on = self.mouse;
+                let _ = if self.mouse {
+                    crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)
+                } else {
+                    crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture)
+                };
+            }
             terminal.draw(|frame| render::draw(frame, &self.app))?;
 
             tokio::select! {
@@ -919,6 +971,18 @@ impl Controller {
                 self.app.paste(&text);
                 None
             }
+            TermEvent::Mouse(mouse) => {
+                self.app.on_mouse(mouse);
+                None
+            }
+            TermEvent::FocusGained => {
+                self.app.focused = Some(true);
+                None
+            }
+            TermEvent::FocusLost => {
+                self.app.focused = Some(false);
+                None
+            }
             _ => None,
         };
         match action {
@@ -928,6 +992,7 @@ impl Controller {
     }
 
     async fn shutdown(&mut self) {
+        zarn_tools::progress::unregister(&self.ctx);
         self.cancel.cancel();
         for state in std::mem::take(&mut self.mcp).into_values() {
             if let Some(server) = state.server {
@@ -942,6 +1007,16 @@ impl Controller {
 
     pub fn app_mut(&mut self) -> &mut App {
         &mut self.app
+    }
+
+    pub fn set_notifier(&mut self, notifier: crate::notify::Notifier) {
+        let enabled = self.notifier.enabled;
+        self.notifier = notifier;
+        self.notifier.enabled = enabled;
+    }
+
+    pub fn mouse_capture(&self) -> bool {
+        self.mouse
     }
 
     pub fn messages(&self) -> &[Message] {
@@ -1011,6 +1086,7 @@ impl Controller {
         request.pattern = zarn_tools::permissions::suggest(&request.tool, &request.args, &self.cwd);
         request.preview = zarn_tools::diff::preview(&request.tool, &request.args, &self.cwd);
         self.app.pending_expanded = false;
+        self.notifier.permission(self.app.focused, &request.tool);
         self.app.pending = Some(request);
     }
 
@@ -1174,6 +1250,82 @@ impl Controller {
         }
     }
 
+    fn export(&mut self, path: Option<&str>) {
+        if self.messages.len() <= 1 {
+            self.app.notice("nothing to export yet");
+            return;
+        }
+        let target = match path {
+            Some(p) => {
+                let p = PathBuf::from(p);
+                if p.is_absolute() { p } else { self.cwd.join(p) }
+            }
+            None => {
+                let id = self
+                    .session
+                    .as_ref()
+                    .map(|s| s.meta().id.chars().rev().take(8).collect::<Vec<_>>().into_iter().rev().collect::<String>())
+                    .unwrap_or_else(|| "conversation".into());
+                self.cwd.join(format!("zarn-{id}.md"))
+            }
+        };
+        let text = crate::export::markdown(self.title.as_deref(), &self.app.status.model, &self.messages);
+        match std::fs::write(&target, text) {
+            Ok(()) => self.app.notice(format!("exported the conversation to {} (keys redacted)", target.display())),
+            Err(err) => self.app.notice(format!("could not write {}: {err}", target.display())),
+        }
+    }
+
+    fn copy_last(&mut self) {
+        let Some(reply) = crate::export::last_reply(&self.messages) else {
+            self.app.notice("no assistant reply to copy yet");
+            return;
+        };
+        let reply = zarn_config::auth::redact(&reply);
+        let os = std::env::consts::OS;
+        let command = crate::export::clipboard_command(os, |k| std::env::var(k).ok(), zarn_config::doctor::on_path);
+        if let Some(command) = command {
+            match crate::export::pipe_to(&command, &reply) {
+                Ok(()) => {
+                    self.app.notice(format!("copied the last reply ({} chars) with {}", reply.chars().count(), command[0]));
+                    return;
+                }
+                Err(err) => self.app.notice(format!("{} failed: {err}", command[0])),
+            }
+        }
+        if self.interactive && std::io::IsTerminal::is_terminal(&std::io::stdout()) {
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            let _ = out.write_all(crate::export::osc52(&reply).as_bytes());
+            let _ = out.flush();
+            self.app.notice(format!(
+                "sent the last reply ({} chars) to the clipboard with OSC 52; if nothing was copied, your terminal blocks it",
+                reply.chars().count()
+            ));
+            return;
+        }
+        self.app.notice(format!("no clipboard is available here; the last reply is:\n{reply}"));
+    }
+
+    fn rename(&mut self, title: &str) {
+        if title.is_empty() {
+            self.app.notice(match &self.title {
+                Some(t) => format!("this session is \"{t}\"; /rename <title> changes it"),
+                None => "usage: /rename <title>".to_string(),
+            });
+            return;
+        }
+        self.title = Some(title.to_string());
+        self.titled = true;
+        if let Some(session) = self.session.as_mut()
+            && let Err(err) = session.set_title(title)
+        {
+            self.app.notice(format!("could not save the title: {err:#}"));
+            return;
+        }
+        self.app.notice(format!("session renamed to \"{title}\""));
+    }
+
     fn maybe_title(&mut self) {
         if self.titled {
             return;
@@ -1303,6 +1455,8 @@ impl Controller {
         self.messages.push(Message::user(text));
         self.cancel = CancellationToken::new();
         self.app.streaming = true;
+        self.app.status.turn_started = Some(std::time::Instant::now());
+        self.app.status.streamed_chars = 0;
         spawn_turn(Arc::new(agent), self.messages.clone(), self.ui_tx.clone(), self.cancel.clone());
     }
 
@@ -1405,6 +1559,16 @@ impl Controller {
             };
             let _ = tx.send(UiEvent::Shell { id, command, output }).await;
         });
+    }
+
+    fn sync_todos(&mut self) {
+        let todos = self.todos.lock().map(|t| t.clone()).unwrap_or_default();
+        self.app.todos = todos.clone();
+        if let Some(session) = self.session.as_mut()
+            && let Err(err) = session.set_todos(&todos)
+        {
+            self.app.notice(format!("todo list not saved: {err:#}"));
+        }
     }
 
     fn open_editor(&mut self) {
@@ -1631,6 +1795,8 @@ impl Controller {
         self.messages.push(message);
         self.cancel = CancellationToken::new();
         self.app.streaming = true;
+        self.app.status.turn_started = Some(std::time::Instant::now());
+        self.app.status.streamed_chars = 0;
         spawn_turn(agent, self.messages.clone(), self.ui_tx.clone(), self.cancel.clone());
     }
 
@@ -1638,8 +1804,17 @@ impl Controller {
         match event {
             UiEvent::Agent(event) => {
                 let usage = matches!(&event, AgentEvent::Provider(zarn_core::provider::Event::Usage { .. }));
-                if let AgentEvent::ToolStarted { args, .. } = &event {
-                    self.note_tool_call(args);
+                let started = match &event {
+                    AgentEvent::ToolStarted { id, name, args } => {
+                        self.note_tool_call(args);
+                        Some((id.clone(), name.clone(), args.clone()))
+                    }
+                    _ => None,
+                };
+                if let AgentEvent::ToolFinished { name, .. } = &event
+                    && name == "todo"
+                {
+                    self.sync_todos();
                 }
                 if let AgentEvent::ToolFinished { id, name, output } = &event {
                     let args = self
@@ -1662,6 +1837,12 @@ impl Controller {
                     self.cost.observe(provider_event);
                 }
                 self.app.apply(event);
+                if let Some((id, name, args)) = started
+                    && let Some(preview) = zarn_tools::diff::preview(&name, &args, &self.cwd)
+                {
+                    let label = if preview.new_file { "new file " } else { "" };
+                    self.app.set_card_detail(&id, format!("{} {label}{}", preview.summary(), preview.path));
+                }
                 self.app.status.cost = self.cost.total().usd;
                 if usage && self.app.streaming && !self.cap_stopped && !self.check_caps(false) {
                     self.cap_stopped = true;
@@ -1670,6 +1851,10 @@ impl Controller {
             }
             UiEvent::TurnDone { messages, result } => {
                 self.app.streaming = false;
+                if let Some(started) = self.app.status.turn_started.take() {
+                    self.notifier.turn_finished(started.elapsed());
+                }
+                self.app.status.branch = crate::status_line::branch(&self.cwd);
                 self.checkpoints.end();
                 let notes: Vec<String> = self
                     .checkpoint_notes
@@ -1793,6 +1978,7 @@ impl Controller {
             }
             UiEvent::Title(Err(err)) => tracing::debug!(error = %err, "no session title"),
             UiEvent::Compared(sides) => self.app.blocks.push(Block::Compare(sides)),
+            UiEvent::Progress { command, line } => self.app.progress(&command, &line),
             UiEvent::HookFailed(text) => self.app.notice(text),
             UiEvent::Shell { id, command, output } => {
                 self.last_shell = Some((command, output.content.clone()));
@@ -1845,6 +2031,9 @@ impl Controller {
                     if let Some(title) = &self.title {
                         let _ = created.set_title(title);
                     }
+                    if !self.app.todos.is_empty() {
+                        let _ = created.set_todos(&self.app.todos);
+                    }
                     self.session = Some(created);
                     self.persisted = 1;
                 }
@@ -1874,6 +2063,10 @@ impl Controller {
             Ok((meta, loaded)) => {
                 self.titled = meta.title.is_some();
                 self.title = meta.title.clone();
+                if let Ok(mut todos) = self.todos.lock() {
+                    *todos = meta.todos.clone();
+                }
+                self.app.todos = meta.todos.clone();
                 let loaded: Vec<Message> = loaded
                     .into_iter()
                     .skip_while(|m| matches!(m, Message::System(_)))
@@ -2064,6 +2257,20 @@ impl Controller {
     }
 
     fn set_theme(&mut self, color: &str) {
+        if crate::theme::NAMES.contains(&color) {
+            let result = match self.layers() {
+                Some(layers) => ops::set_general(layers, GeneralField::Theme, |g| g.theme = Some(color.to_string())),
+                None => return,
+            };
+            match result {
+                Ok(()) => {
+                    self.rebuild();
+                    self.app.notice(format!("theme is now {color} ({})", self.app.theme.palette.name));
+                }
+                Err(err) => self.app.notice(format!("{err:#}")),
+            }
+            return;
+        }
         if !brand::ACCENTS.iter().any(|(n, _)| *n == color) && brand::parse_hex(color).is_none() {
             self.app.notice(format!(
                 "'{color}' is not a color; pick one of {} or #rrggbb",
@@ -2201,6 +2408,10 @@ impl Controller {
                 self.persisted = 1;
                 self.titled = false;
                 self.title = None;
+                if let Ok(mut todos) = self.todos.lock() {
+                    todos.clear();
+                }
+                self.app.todos.clear();
                 self.app.notice("conversation cleared");
             }
             "compact" => {
@@ -2326,6 +2537,12 @@ impl Controller {
                     names.join("\n")
                 });
             }
+            "export" => self.export(first),
+            "copy" => self.copy_last(),
+            "rename" => {
+                let title = line.trim_start().trim_start_matches('/').trim_start_matches("rename").trim();
+                self.rename(title);
+            }
             "resume" => match first {
                 Some(id) => match session::find(&session::data_root(), &self.cwd, id) {
                     Some(path) => self.resume(&path),
@@ -2358,7 +2575,10 @@ impl Controller {
                     if choices.is_empty() {
                         self.app.notice("no earlier sessions in this directory");
                     } else {
-                        self.app.overlay = Some(Overlay::Pick(Picker::new("Resume a session", choices), ChatPick::Resume));
+                        self.app.overlay = Some(Overlay::Pick(
+                            Picker::new("Resume a session (type to filter titles and first messages)", choices),
+                            ChatPick::Resume,
+                        ));
                     }
                 }
             },
@@ -2496,6 +2716,7 @@ impl Controller {
                 let tx = self.ui_tx.clone();
                 let mut checks = terminal::checks(Some(self.keyboard));
                 checks.extend(crate::keymap::checks());
+                checks.push(terminal::mouse_check(self.mouse));
                 tokio::spawn(async move {
                     let mut all = doctor::run(&store, paths::project_config(), paths::user_config(), true).await;
                     all.append(&mut checks);
@@ -2554,8 +2775,12 @@ impl Controller {
                 Some(color) => self.set_theme(color),
                 None => {
                     let cfg = self.cfg();
-                    let choices = brand::ACCENTS.iter().map(|(n, _)| Choice::plain(*n)).collect();
-                    let picker = Picker::new("Accent color", choices)
+                    let choices = crate::theme::NAMES
+                        .iter()
+                        .map(|n| Choice::new(*n, *n).with_detail("theme"))
+                        .chain(brand::ACCENTS.iter().map(|(n, _)| Choice::new(*n, *n).with_detail("accent color")))
+                        .collect();
+                    let picker = Picker::new("Theme or accent color", choices)
                         .custom("or type a hex color like #ff8800")
                         .select_value(cfg.general.accent.as_deref().unwrap_or("violet"));
                     self.app.overlay = Some(Overlay::Pick(picker, ChatPick::Theme));
@@ -2758,4 +2983,10 @@ fn spawn_turn(
         let _ = forward.await;
         let _ = ui.send(UiEvent::TurnDone { messages, result }).await;
     });
+}
+
+impl Drop for Controller {
+    fn drop(&mut self) {
+        zarn_tools::progress::unregister(&self.ctx);
+    }
 }

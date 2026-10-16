@@ -10,9 +10,9 @@ tools now
   glob   allow default for its risk
   grep   allow default for its risk
   read   allow default for its risk
+  todo   allow default for its risk
   write  allow accept-edits mode
 /permissions edit opens the settings tab
-
 
 
 

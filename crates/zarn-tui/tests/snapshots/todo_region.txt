@@ -1,0 +1,14 @@
+
+
+
+
+
+
+todo 1/3 done
+  ☑ read the parser
+  ◐ fix the off-by-one
+  ☐ add a regression test
+default mode  ·  m  ·  15 in / 10 out  ·  ctx 0%  ·  no rate configure
+╭────────────────────────────────────────────────────────────────────╮
+│                                                                    │
+╰────────────────────────────────────────────────────────────────────╯

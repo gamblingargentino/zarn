@@ -6,6 +6,12 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Todo {
+    pub content: String,
+    pub status: String,
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
 pub struct Meta {
     pub id: String,
@@ -19,6 +25,8 @@ pub struct Meta {
     pub cached_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub todos: Vec<Todo>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -141,6 +149,13 @@ impl Session {
 
     pub fn set_title(&mut self, title: &str) -> Result<()> {
         self.meta.title = Some(title.to_string());
+        self.meta.updated = now();
+        let record = Record::Meta(self.meta.clone());
+        self.write(&record)
+    }
+
+    pub fn set_todos(&mut self, todos: &[Todo]) -> Result<()> {
+        self.meta.todos = todos.to_vec();
         self.meta.updated = now();
         let record = Record::Meta(self.meta.clone());
         self.write(&record)
