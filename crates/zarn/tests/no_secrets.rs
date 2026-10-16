@@ -89,7 +89,7 @@ fn printable_runs(bytes: &[u8]) -> String {
 }
 
 fn fake(prefix: &str, body: &str, len: usize) -> String {
-    format!("{prefix}{}", body.repeat(len / body.len() + 1)[..len].to_string())
+    format!("{prefix}{}", &body.repeat(len / body.len() + 1)[..len])
 }
 
 #[test]
