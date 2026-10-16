@@ -22,17 +22,25 @@ The result is in `target/dist/release/`.
 ## First run
 
 zarn ships with no provider and no key. The first time you run `zarn` it opens
-a setup flow: pick a provider, paste your key (it is never shown on screen),
-pick a model, and zarn sends one small test request. Nothing is saved until
-that request succeeds, and the prompt does not open until a provider works or
-you choose to skip.
+a setup flow. The first choice, "Set up in your browser", opens a page on
+`http://localhost:9276` (the next free port up to 9299 if that one is busy):
+pick a provider, paste the key, press Save. zarn sends one small test request,
+stores the key in your OS credential store and opens the prompt as soon as the
+key works. You can also stay in the terminal: pick a provider, paste your key
+(it is never shown on screen) and pick a model. Either way nothing is saved
+until the test request succeeds.
+
+The setup page only listens on 127.0.0.1, only works from the link zarn prints
+(it carries a one-time token), refuses other hosts and other sites' forms, and
+never shows a saved key again. Open it any time with `/login web` or
+`zarn setup`; it closes when you click Done or after 30 idle minutes.
 
 Everything after that is done from inside zarn, with no hand-edited files:
 
 | Command | What it does |
 | --- | --- |
 | `/config` | settings panel: providers, models, skills, MCP, agents, modes, quota, permissions, hooks, plugins, general |
-| `/login [provider]`, `/logout [provider]` | add, replace or remove a key |
+| `/login [provider\|web]`, `/logout [provider]` | add, replace or remove a key; `web` opens the browser setup page |
 | `/provider list\|add\|switch` | manage providers |
 | `/model [name]`, `/models [refresh]` | pick a model; list every provider's models, limits and credits |
 | `/profile` (ctrl+p) | pick a profile for this session |
@@ -47,11 +55,16 @@ Everything after that is done from inside zarn, with no hand-edited files:
 | `/status`, `/theme`, `/init` | session info, theme or accent color, write a `ZARN.md` for the project |
 
 Type `/` to see every command, including your own from `.zarn/commands/*.md`,
-MCP prompts and your skills.
+MCP prompts and your skills. After a command and a space, the list shows its
+arguments (subcommands, modes, models, profiles, providers, MCP servers,
+agents, themes) and the input shows the syntax still to fill in, for example
+`/limits [session|day <usd|off>]`. ↑↓ or the wheel move through a list, tab
+completes, enter runs, and a click picks an entry.
 
 The same operations exist on the command line:
 
 ```sh
+zarn setup                     # the browser page on localhost:9276
 zarn login anthropic
 zarn providers add --kind openai-compat --base-url https://api.groq.com/openai/v1
 zarn providers list | test <name> | remove <name>
@@ -140,7 +153,7 @@ banner = true
 show_cost = true
 status_line = "{model} · {mode} · {branch} · {context} · {cost}"
 notifications = true
-mouse = false
+mouse = true
 vim = false
 mode = "default"
 auto_compact = true
@@ -247,7 +260,7 @@ What the less obvious keys do:
 | `general.theme` | `dark`, `light`, `colorblind` or `auto` (reads `COLORFGBG`, falls back to dark) |
 | `general.status_line` | template with `{model}`, `{mode}`, `{profile}`, `{context}`, `{cost}`, `{cwd}`, `{branch}`; `{{` and `}}` are literal braces |
 | `general.notifications` | bell and window title after turns over 10 seconds and on permission prompts while the terminal may be unfocused; never written when stdout is not a terminal |
-| `general.mouse` | wheel scrolling; it captures the mouse, so native text selection needs shift (see `/doctor`) |
+| `general.mouse` | on by default: the wheel scrolls the conversation and menus take clicks; native text selection needs shift (option in macOS Terminal). Turn it off to select without shift; the wheel then sends arrow keys in most terminals (see `/doctor`) |
 | `general.context_budget` | token budget for all `ZARN.md` text, including nested files and imports |
 | `general.read_only_commands`, `auto_allow_read_only` | shell commands that run without asking |
 | `general.sandbox` | run bash with secret-looking environment variables removed; not OS isolation |
@@ -296,9 +309,11 @@ them; results are cached for `discovery_cache_minutes`.
 
 Every tool call goes through one policy: deny rules, then ask rules, then
 allow rules, then the mode, then the tool's risk (reads are allowed, writes
-and commands ask). The prompt shows a diff for edits and offers `[y]` once,
-`[a]` this pattern for the session, or saving the rule to the project,
-`[l]` just for you, or your user config. File tools ask before touching paths
+and commands ask). The prompt shows a diff for edits and a numbered list: yes
+once, yes for this pattern for the session, or yes and save the rule to the
+project, just for you, or your user config, or no. Move with ↑↓ and press
+enter, press the number, click the line, or use the letters `y a p l u n`.
+The plan review and other confirmations work the same way. File tools ask before touching paths
 outside the working directory; `--add-dir` adds more directories. Read-only
 shell commands run without asking.
 
@@ -320,6 +335,12 @@ conversation to before any earlier turn.
 
 ## Display
 
+- The mouse wheel scrolls the conversation (`general.mouse`, on by default);
+  ↑↓ in the input walk your earlier prompts, moving between lines first in a
+  multi-line prompt. Menus, pickers, the command list and the settings tabs
+  and rows take clicks. With the mouse on, hold shift to select text.
+- Replies render Markdown: headings, bullet and numbered lists, quotes,
+  tables, links and code blocks.
 - A todo list the model keeps (`todo` tool) stays above the input.
 - Tool cards are specific per tool: line ranges, match counts, diff summaries,
   live bash output, and a row per running agent.

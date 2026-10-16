@@ -302,7 +302,7 @@ async fn mouse_scrolling_is_a_toggle_and_search_moves_between_hits() {
     let mock = echo_server("ok").await;
     let env = Env::new(&provider_config(&mock.uri(), "")).await;
     let mut c = env.controller();
-    assert!(!c.mouse_capture(), "off by default");
+    assert!(c.mouse_capture(), "on by default so the wheel scrolls the conversation, not the prompt history");
     c.app_mut().on_mouse(MouseEvent {
         kind: MouseEventKind::ScrollUp,
         column: 0,
@@ -337,11 +337,11 @@ async fn mouse_scrolling_is_a_toggle_and_search_moves_between_hits() {
 
     std::fs::write(
         env.user_dir().join("config.toml"),
-        format!("[general]\nmouse = true\n\n{}", provider_config(&mock.uri(), "")),
+        format!("[general]\nmouse = false\n\n{}", provider_config(&mock.uri(), "")),
     )
     .unwrap();
     let c = env.controller();
-    assert!(c.mouse_capture());
+    assert!(!c.mouse_capture());
     let check = zarn_tui::terminal::mouse_check(true);
     assert!(check.detail.contains("native text selection now needs shift"));
 }

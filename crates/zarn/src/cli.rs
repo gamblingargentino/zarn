@@ -80,6 +80,13 @@ pub enum Command {
         #[arg(help = "Provider name, e.g. anthropic, openai, google, or one you added")]
         provider: String,
     },
+    #[command(about = "Open a page on localhost to add, test and remove API keys in your browser")]
+    Setup {
+        #[arg(long, value_name = "PORT", help = "Port to listen on; the default is 9276, or the next free one up to 9299")]
+        port: Option<u16>,
+        #[arg(long = "no-browser", help = "Print the link without opening a browser")]
+        no_browser: bool,
+    },
     #[command(about = "Remove a provider's stored API key")]
     Logout {
         #[arg(help = "Provider name")]

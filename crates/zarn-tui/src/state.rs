@@ -264,6 +264,7 @@ pub struct App {
     pub mode: Mode,
     pub overlay: Option<Overlay>,
     pub entries: Vec<Entry>,
+    pub args: std::collections::BTreeMap<String, Vec<(String, String)>>,
     pub popup_selected: usize,
     pub popup_hidden: bool,
     pub theme: Theme,
@@ -284,6 +285,10 @@ pub struct App {
     pub queue_display: Vec<String>,
     pub focused: Option<bool>,
     pub agents: Vec<AgentRow>,
+    pub hits: crate::hits::Hits,
+    pub permission_choice: usize,
+    pub plan_choice: usize,
+    pub confirm_choice: usize,
     ctrl_c_armed: bool,
     esc_armed: bool,
 }
@@ -322,11 +327,47 @@ impl App {
             .collect()
     }
 
-    pub fn popup_matches(&self) -> Vec<&Entry> {
-        match popup::query(&self.input) {
-            Some(q) => popup::filter(&self.entries, q),
-            None => Vec::new(),
+    pub fn popup_matches(&self) -> Vec<Entry> {
+        if let Some(q) = popup::query(&self.input) {
+            return popup::filter(&self.entries, q).into_iter().cloned().collect();
         }
+        if self.cursor < self.len() {
+            return Vec::new();
+        }
+        let Some((key, partial)) = popup::argument_query(&self.input) else {
+            return Vec::new();
+        };
+        let needle = partial.to_lowercase();
+        let all = popup::arguments(&key, &self.args);
+        let (mut starts, contains): (Vec<Entry>, Vec<Entry>) = all
+            .into_iter()
+            .filter(|e| e.name.to_lowercase().contains(&needle))
+            .partition(|e| e.name.to_lowercase().starts_with(&needle));
+        if starts.len() == 1 && contains.is_empty() && starts[0].name == partial {
+            return Vec::new();
+        }
+        starts.extend(contains);
+        starts
+    }
+
+    pub fn popup_prefix(&self) -> &'static str {
+        if popup::query(&self.input).is_some() { "/" } else { "" }
+    }
+
+    pub fn usage_hint(&self) -> Option<String> {
+        if self.cursor < self.len() || self.popup_visible() && popup::query(&self.input).is_some() {
+            return None;
+        }
+        popup::usage_hint(&self.input, &self.entries)
+    }
+
+    fn complete_argument(&mut self, value: &str) {
+        let Some((_, partial)) = popup::argument_query(&self.input) else {
+            return;
+        };
+        let keep = self.input.len() - partial.len();
+        let line = format!("{}{value} ", &self.input[..keep]);
+        self.set_input(line);
     }
 
     pub fn mention_visible(&self) -> bool {
@@ -507,17 +548,37 @@ impl App {
                 }
                 Pick::Chosen(value) | Pick::Custom(value) => Some(Action::Picked(purpose, value)),
             },
-            Overlay::Confirm(text, purpose) => match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => Some(Action::Confirmed(purpose)),
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.notice("cancelled");
-                    None
+            Overlay::Confirm(text, purpose) => {
+                let yes = match key.code {
+                    KeyCode::Char('y') | KeyCode::Char('Y') => Some(true),
+                    KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(false),
+                    KeyCode::Enter => Some(self.confirm_choice == 0),
+                    KeyCode::Left | KeyCode::Up | KeyCode::BackTab => {
+                        self.confirm_choice = 0;
+                        None
+                    }
+                    KeyCode::Right | KeyCode::Down | KeyCode::Tab => {
+                        self.confirm_choice = 1;
+                        None
+                    }
+                    _ => None,
+                };
+                match yes {
+                    Some(answer) => {
+                        self.confirm_choice = 0;
+                        if answer {
+                            Some(Action::Confirmed(purpose))
+                        } else {
+                            self.notice("cancelled");
+                            None
+                        }
+                    }
+                    None => {
+                        self.overlay = Some(Overlay::Confirm(text, purpose));
+                        None
+                    }
                 }
-                _ => {
-                    self.overlay = Some(Overlay::Confirm(text, purpose));
-                    None
-                }
-            },
+            }
             Overlay::Secret {
                 mut input,
                 provider,
@@ -546,11 +607,12 @@ impl App {
         if !self.popup_visible() {
             return None;
         }
-        let shown = self.popup_matches().len();
-        let chosen = self
-            .popup_matches()
-            .get(self.popup_selected.min(shown.saturating_sub(1)))
-            .map(|e| e.name.clone());
+        let matches = self.popup_matches();
+        let shown = matches.len();
+        let chosen_entry = matches.get(self.popup_selected.min(shown.saturating_sub(1))).cloned();
+        let chosen = chosen_entry.as_ref().map(|e| e.name.clone());
+        let arguments = popup::query(&self.input).is_none();
+        let needs_more = chosen_entry.as_ref().is_some_and(|e| popup::requires_arguments(&e.usage));
         match key.code {
             KeyCode::Up => {
                 self.popup_selected = self.popup_selected.saturating_sub(1);
@@ -564,15 +626,32 @@ impl App {
                 self.popup_hidden = true;
                 Some(None)
             }
+            KeyCode::Tab if arguments => {
+                if let Some(name) = chosen {
+                    self.complete_argument(&name);
+                }
+                Some(None)
+            }
             KeyCode::Tab => {
                 if let Some(name) = chosen {
                     self.set_input(format!("/{name} "));
-                    self.popup_hidden = true;
                 }
                 Some(None)
             }
             KeyCode::Enter if !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) => {
                 let name = chosen?;
+                if arguments {
+                    self.complete_argument(&name);
+                    if needs_more {
+                        return Some(None);
+                    }
+                    let line = self.input.trim().to_string();
+                    return Some(self.submit_line(line));
+                }
+                if needs_more {
+                    self.set_input(format!("/{name} "));
+                    return Some(None);
+                }
                 let line = format!("/{name}");
                 self.set_input("");
                 Some(self.submit_line(line))
@@ -786,6 +865,7 @@ impl App {
 
     pub fn answer_permission(&mut self, answer: Answer) {
         self.pending_expanded = false;
+        self.permission_choice = 0;
         if let Some(request) = self.pending.take() {
             let _ = request.reply.send(answer);
         }
@@ -869,8 +949,8 @@ impl App {
                 KeyAction::SearchScrollback => self.start_search(),
                 KeyAction::ScrollUp => self.scroll_up = self.scroll_up.saturating_add(10),
                 KeyAction::ScrollDown => self.scroll_up = self.scroll_up.saturating_sub(10),
-                KeyAction::HistoryPrev => self.recall(-1),
-                KeyAction::HistoryNext => self.recall(1),
+                KeyAction::HistoryPrev => self.vim_vertical(false),
+                KeyAction::HistoryNext => self.vim_vertical(true),
                 KeyAction::Newline => self.insert('\n'),
                 KeyAction::ExpandThinking => {}
             }
@@ -1090,12 +1170,94 @@ impl App {
         };
     }
 
-    pub fn on_mouse(&mut self, event: crossterm::event::MouseEvent) {
-        use crossterm::event::MouseEventKind;
+    fn wheel_moves_selection(&self) -> bool {
+        match &self.mode {
+            Mode::Panel(_) => true,
+            Mode::Onboarding(flow) => matches!(flow.step, crate::onboarding::Step::Kind(_) | crate::onboarding::Step::Model(_)),
+            Mode::Chat => {
+                matches!(self.overlay, Some(Overlay::Pick(..)))
+                    || self.popup_visible()
+                    || self.mention_visible()
+            }
+        }
+    }
+
+    fn picker_mut(&mut self) -> Option<&mut crate::widgets::Picker> {
+        match &mut self.mode {
+            Mode::Panel(panel) => panel.picker_mut(),
+            Mode::Onboarding(flow) => match &mut flow.step {
+                crate::onboarding::Step::Kind(picker) | crate::onboarding::Step::Model(picker) => Some(picker),
+                _ => None,
+            },
+            Mode::Chat => match &mut self.overlay {
+                Some(Overlay::Pick(picker, _)) => Some(picker),
+                _ => None,
+            },
+        }
+    }
+
+    pub fn on_mouse(&mut self, event: crossterm::event::MouseEvent) -> Option<Action> {
+        use crate::hits::Hit;
+        use crossterm::event::{MouseButton, MouseEventKind};
+        let enter = KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE);
         match event.kind {
-            MouseEventKind::ScrollUp => self.scroll_by(3),
-            MouseEventKind::ScrollDown => self.scroll_by(-3),
-            _ => {}
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
+                let up = event.kind == MouseEventKind::ScrollUp;
+                if self.wheel_moves_selection() {
+                    return self.on_key(KeyEvent::new(
+                        if up { KeyCode::Up } else { KeyCode::Down },
+                        KeyModifiers::NONE,
+                    ));
+                }
+                self.scroll_by(if up { 3 } else { -3 });
+                None
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                match self.hits.at(event.column, event.row)? {
+                    Hit::Popup(i) => {
+                        if !self.popup_visible() && !self.mention_visible() {
+                            return None;
+                        }
+                        self.popup_selected = i;
+                        self.on_key(enter)
+                    }
+                    Hit::Picker(i) => {
+                        let picker = self.picker_mut()?;
+                        picker.selected = i;
+                        self.on_key(enter)
+                    }
+                    Hit::Permission(i) => {
+                        self.pending.as_ref()?;
+                        self.permission_choice = i;
+                        self.on_key(enter)
+                    }
+                    Hit::Plan(i) => {
+                        if self.plan_review.as_ref().is_none_or(|r| r.decided.is_some() || r.feedback.is_some()) {
+                            return None;
+                        }
+                        self.plan_choice = i;
+                        self.on_key(enter)
+                    }
+                    Hit::Confirm(i) => {
+                        if !matches!(self.overlay, Some(Overlay::Confirm(..))) {
+                            return None;
+                        }
+                        self.confirm_choice = i;
+                        self.on_key(enter)
+                    }
+                    Hit::Tab(i) => {
+                        if let Mode::Panel(panel) = &mut self.mode {
+                            panel.select_tab(i);
+                        }
+                        None
+                    }
+                    Hit::Row(i) => match &mut self.mode {
+                        Mode::Panel(panel) => panel.click_row(i).map(Action::Panel),
+                        _ => None,
+                    },
+                }
+            }
+            _ => None,
         }
     }
 
@@ -1177,6 +1339,26 @@ impl App {
             }
             return None;
         }
+        let picked = match key.code {
+            KeyCode::Up => {
+                self.plan_choice = self.plan_choice.saturating_sub(1);
+                return None;
+            }
+            KeyCode::Down => {
+                self.plan_choice = (self.plan_choice + 1).min(crate::views::PLAN_OPTIONS.len() - 1);
+                return None;
+            }
+            KeyCode::Enter => Some(self.plan_choice),
+            KeyCode::Char(c @ '1'..='3') => Some(c as usize - '1' as usize),
+            _ => None,
+        };
+        let key = match picked {
+            Some(0) => KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            Some(1) => KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            Some(_) => KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE),
+            None => key,
+        };
+        let review = self.plan_review.as_mut()?;
         let verdict = match key.code {
             KeyCode::Char('a') | KeyCode::Char('A') => PlanVerdict::Approve("accept-edits".into()),
             KeyCode::Char('d') | KeyCode::Char('D') => PlanVerdict::Approve("default".into()),
@@ -1196,10 +1378,29 @@ impl App {
             _ => return None,
         };
         review.decided = Some(verdict.clone());
+        self.plan_choice = 0;
         Some(Action::Plan(verdict))
     }
 
     fn on_permission_key(&mut self, key: KeyEvent) -> Option<Action> {
+        const LETTERS: [char; 6] = ['y', 'a', 'p', 'l', 'u', 'n'];
+        let picked = match key.code {
+            KeyCode::Up => {
+                self.permission_choice = self.permission_choice.saturating_sub(1);
+                return None;
+            }
+            KeyCode::Down | KeyCode::Tab => {
+                self.permission_choice = (self.permission_choice + 1).min(LETTERS.len() - 1);
+                return None;
+            }
+            KeyCode::Enter => Some(self.permission_choice),
+            KeyCode::Char(c @ '1'..='6') => Some(c as usize - '1' as usize),
+            _ => None,
+        };
+        let key = match picked {
+            Some(i) => KeyEvent::new(KeyCode::Char(LETTERS[i.min(LETTERS.len() - 1)]), KeyModifiers::NONE),
+            None => key,
+        };
         let pattern = self.pending.as_ref().map(|p| p.pattern.clone()).unwrap_or_default();
         let save = |scope| Some(Action::SaveRule(pattern.clone(), scope));
         match key.code {
@@ -1578,6 +1779,82 @@ mod tests {
             app.on_key(key(KeyCode::Enter)),
             Some(Action::Plan(PlanVerdict::Reject("add tests".into())))
         );
+    }
+
+    #[test]
+    fn the_plan_review_and_confirm_dialogs_take_arrows_and_enter() {
+        let (tx, _rx) = oneshot::channel();
+        let mut app = App::new("m");
+        app.plan_review = Some(PlanReview::new("1. do it", tx));
+        app.on_key(key(KeyCode::Down));
+        assert_eq!(app.plan_choice, 1);
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Action::Plan(PlanVerdict::Approve("default".into())))
+        );
+        assert_eq!(app.plan_choice, 0);
+
+        let (tx, _rx) = oneshot::channel();
+        app.plan_review = Some(PlanReview::new("1. do it", tx));
+        app.on_key(key(KeyCode::Char('3')));
+        assert!(app.plan_review.as_ref().unwrap().feedback.is_some());
+
+        let mut app = App::new("m");
+        app.overlay = Some(Overlay::Confirm("sure?".into(), ConfirmFor::Bypass));
+        app.on_key(key(KeyCode::Right));
+        assert_eq!(app.confirm_choice, 1);
+        assert_eq!(app.on_key(key(KeyCode::Enter)), None);
+        assert!(app.overlay.is_none());
+        app.overlay = Some(Overlay::Confirm("sure?".into(), ConfirmFor::Bypass));
+        assert_eq!(app.confirm_choice, 0);
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Action::Confirmed(ConfirmFor::Bypass))
+        );
+    }
+
+    #[test]
+    fn up_and_down_move_between_lines_before_walking_the_history() {
+        let mut app = App::new("m");
+        app.history = vec!["older".into()];
+        app.set_input("one\ntwo");
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.input, "one\ntwo");
+        assert_eq!(app.cursor, 3);
+        app.on_key(key(KeyCode::Up));
+        assert_eq!(app.input, "older");
+    }
+
+    #[test]
+    fn arguments_complete_from_a_list_and_required_ones_wait_for_more() {
+        let mut app = App::new("m");
+        app.args.insert("mode".into(), vec![("default".into(), "".into()), ("plan".into(), "read only".into())]);
+        app.set_input("/mode p");
+        let names: Vec<String> = app.popup_matches().into_iter().map(|e| e.name).collect();
+        assert_eq!(names, vec!["plan"]);
+        assert_eq!(app.popup_prefix(), "");
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Some(Action::Command("/mode plan".into())));
+
+        app.set_input("/limits ");
+        assert_eq!(app.usage_hint().as_deref(), Some("[session|day <usd|off>]"));
+        app.on_key(key(KeyCode::Tab));
+        assert_eq!(app.input, "/limits session ");
+        assert_eq!(app.usage_hint().as_deref(), Some("<usd|off>"));
+
+        app.set_input("/limits d");
+        assert_eq!(app.on_key(key(KeyCode::Enter)), None);
+        assert_eq!(app.input, "/limits day ");
+
+        app.set_input("/ren");
+        assert_eq!(app.on_key(key(KeyCode::Enter)), None);
+        assert_eq!(app.input, "/rename ");
+        assert_eq!(app.usage_hint().as_deref(), Some("<title>"));
+
+        app.set_input("/mode plan");
+        assert!(app.popup_matches().is_empty(), "a finished argument closes the list");
+
+        app.set_input("/loo");
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Some(Action::Command("/loop".into())), "alternatives mean no argument is required");
     }
 
     #[test]

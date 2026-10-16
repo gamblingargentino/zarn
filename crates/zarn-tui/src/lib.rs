@@ -1,5 +1,6 @@
 pub mod brand;
 pub mod editor;
+pub mod hits;
 pub mod export;
 pub mod keymap;
 pub mod markdown;

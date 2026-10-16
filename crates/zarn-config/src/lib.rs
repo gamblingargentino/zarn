@@ -21,6 +21,7 @@ pub mod schedule;
 pub mod secrets;
 pub mod spend;
 pub mod titles;
+pub mod webkeys;
 
 use anyhow::{Context, Result, bail};
 use auth::{KeySource, KeyStore};
@@ -119,7 +120,7 @@ impl General {
     }
 
     pub fn mouse(&self) -> bool {
-        self.mouse.unwrap_or(false)
+        self.mouse.unwrap_or(true)
     }
 
     pub fn lazy_tools_threshold(&self) -> usize {

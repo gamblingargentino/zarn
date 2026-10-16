@@ -121,6 +121,7 @@ enum UiEvent {
     },
     Doctor(String),
     Notice(String),
+    WebKeys(zarn_config::webkeys::Change),
     Title(Result<String, String>),
     Quota {
         reports: Vec<zarn_config::quota::Report>,
@@ -251,6 +252,7 @@ pub struct Controller {
     memory: Arc<context::NestedMemory>,
     mouse: bool,
     mouse_on: bool,
+    web: Option<zarn_config::webkeys::Running>,
 }
 
 fn flatten_messages(messages: &[Message]) -> Vec<Block> {
@@ -346,6 +348,7 @@ impl Controller {
             memory: context::NestedMemory::new(&cwd_for_memory),
             mouse: false,
             mouse_on: false,
+            web: None,
         };
 
         let progress_tx = controller.ui_tx.clone();
@@ -820,6 +823,91 @@ impl Controller {
             .map(|s| (s.name, s.description))
             .collect();
         self.app.entries = popup::entries(&custom, &skills);
+        self.app.args = self.argument_values(cfg);
+    }
+
+    fn argument_values(&self, cfg: &Config) -> BTreeMap<String, Vec<(String, String)>> {
+        let mut args: BTreeMap<String, Vec<(String, String)>> = BTreeMap::new();
+        let loaded = modes::load();
+        args.insert(
+            "mode".into(),
+            loaded.modes.iter().map(|m| (m.def.name.clone(), m.def.description.clone())).collect(),
+        );
+        let default_profile = cfg.default_profile();
+        args.insert(
+            "profile".into(),
+            cfg.profiles
+                .iter()
+                .map(|(name, p)| {
+                    let mut detail = format!(
+                        "{} · {}",
+                        p.provider.clone().unwrap_or_else(|| "no provider".into()),
+                        p.model.clone().unwrap_or_else(|| "default model".into())
+                    );
+                    if *name == default_profile {
+                        detail.push_str(" · default");
+                    }
+                    (name.clone(), detail)
+                })
+                .collect(),
+        );
+        let providers: Vec<(String, String)> = cfg
+            .providers
+            .iter()
+            .map(|(name, spec)| (name.clone(), spec.kind.clone()))
+            .collect();
+        for key in ["provider switch", "logout", "compare"] {
+            args.insert(key.into(), providers.clone());
+        }
+        let mut login = providers.clone();
+        for kind in zarn_config::catalog::KINDS {
+            if !login.iter().any(|(name, _)| name == kind.id) {
+                login.push((kind.id.to_string(), kind.label.to_string()));
+            }
+        }
+        args.insert("login".into(), login);
+        let servers: Vec<(String, String)> = cfg
+            .mcp
+            .keys()
+            .map(|name| {
+                let state = self
+                    .mcp
+                    .get(name)
+                    .map(|m| if m.server.is_some() { "running" } else { "not running" })
+                    .unwrap_or("MCP server");
+                (name.clone(), state.to_string())
+            })
+            .collect();
+        for key in ["mcp remove", "mcp restart", "mcp login", "mcp logout"] {
+            args.insert(key.into(), servers.clone());
+        }
+        args.insert(
+            "agents edit".into(),
+            zarn_config::agents::load()
+                .into_iter()
+                .map(|a| (a.def.name, a.def.description))
+                .collect(),
+        );
+        args.insert(
+            "theme".into(),
+            brand::ACCENTS.iter().map(|(n, _)| (n.to_string(), "accent color".to_string())).collect(),
+        );
+        let profile = runtime::active_profile(cfg, self.options.profile.as_deref());
+        if let Some(provider) = cfg.profiles.get(&profile).and_then(|p| p.provider.clone())
+            && let Some(spec) = cfg.providers.get(&provider)
+        {
+            let mut models: Vec<(String, String)> = zarn_config::catalog::suggested_models(&spec.kind)
+                .iter()
+                .map(|m| (m.to_string(), format!("suggested for {provider}")))
+                .collect();
+            for model in zarn_config::quota::cached_models(&zarn_config::quota::cache_dir(), &provider) {
+                if !models.iter().any(|(id, _)| *id == model.id) {
+                    models.push((model.id, zarn_config::quota::context_label(model.context_window)));
+                }
+            }
+            args.insert("model".into(), models);
+        }
+        args
     }
 
     fn sync_mcp(&mut self, cfg: &Config) {
@@ -1066,10 +1154,7 @@ impl Controller {
                 self.app.paste(&text);
                 None
             }
-            TermEvent::Mouse(mouse) => {
-                self.app.on_mouse(mouse);
-                None
-            }
+            TermEvent::Mouse(mouse) => self.app.on_mouse(mouse),
             TermEvent::FocusGained => {
                 self.app.focused = Some(true);
                 None
@@ -1089,6 +1174,9 @@ impl Controller {
     }
 
     async fn shutdown(&mut self) {
+        if let Some(web) = self.web.take() {
+            web.stop();
+        }
         zarn_tools::progress::unregister(&self.ctx);
         self.shells.kill_all();
         self.cancel.cancel();
@@ -1127,6 +1215,10 @@ impl Controller {
 
     pub fn paste(&mut self, text: &str) {
         self.on_terminal(TermEvent::Paste(text.to_string()));
+    }
+
+    pub fn mouse(&mut self, event: crossterm::event::MouseEvent) -> bool {
+        self.on_terminal(TermEvent::Mouse(event))
     }
 
     pub fn type_line(&mut self, text: &str) -> bool {
@@ -2413,6 +2505,7 @@ impl Controller {
             }
             UiEvent::Doctor(report) => self.app.notice(report),
             UiEvent::Notice(text) => self.app.notice(text),
+            UiEvent::WebKeys(change) => self.web_change(change),
             UiEvent::Title(Ok(title)) => {
                 self.title = Some(title.clone());
                 if let Some(session) = self.session.as_mut()
@@ -2438,7 +2531,7 @@ impl Controller {
                 match result {
                     Ok(message) => {
                         self.app.overlay = Some(Overlay::Confirm(
-                            format!("Commit the staged changes with this message?\n\n{message}\n\n[y] commit   [n] cancel"),
+                            format!("Commit the staged changes with this message?\n\n{message}"),
                             ConfirmFor::Commit(message),
                         ));
                     }
@@ -2733,6 +2826,13 @@ impl Controller {
                 self.rebuild();
                 self.app.notice("setup complete. Type a message, or / for commands.");
             }
+            onboarding::Effect::Web => {
+                if let Some(url) = self.open_key_page()
+                    && let Mode::Onboarding(flow) = &mut self.app.mode
+                {
+                    flow.step = onboarding::Step::Browser(url);
+                }
+            }
             onboarding::Effect::Skipped => {
                 self.app.mode = Mode::Chat;
                 self.rebuild();
@@ -2749,6 +2849,9 @@ impl Controller {
             ChatPick::Theme => self.set_theme(&value),
             ChatPick::SwitchProvider => self.switch_provider(&value),
             ChatPick::Resume => self.resume(Path::new(&value)),
+            ChatPick::Login if value == "web" => {
+                self.open_key_page();
+            }
             ChatPick::Login => self.ask_login(&value),
             ChatPick::Logout => self.logout(&value),
             ChatPick::Profile => self.use_profile(&value),
@@ -2758,6 +2861,71 @@ impl Controller {
             ChatPick::Mode if value == "bypass" => self.ask_bypass(),
             ChatPick::Mode => self.set_mode(&value, true),
         }
+    }
+
+    pub fn key_page(&self) -> Option<&str> {
+        self.web.as_ref().filter(|w| !w.is_stopped()).map(|w| w.url.as_str())
+    }
+
+    fn open_key_page(&mut self) -> Option<String> {
+        if let Some(url) = self.key_page() {
+            let url = url.to_string();
+            zarn_config::webkeys::open_browser(&url);
+            self.app.notice(format!("the API key page is already open at {url}"));
+            return Some(url);
+        }
+        let tx = self.ui_tx.clone();
+        let mut options = zarn_config::webkeys::Options::new(self.store.clone());
+        options.on_change = Some(Arc::new(move |change| {
+            let _ = tx.try_send(UiEvent::WebKeys(change));
+        }));
+        match zarn_config::webkeys::start(options) {
+            Ok(running) => {
+                let url = running.url.clone();
+                let opened = zarn_config::webkeys::open_browser(&url);
+                self.web = Some(running);
+                self.app.notice(format!(
+                    "API key setup is open at {url}\n{} Keys you save there apply here right away; click Done on the page when you are finished.",
+                    if opened { "It should open in your browser now; if not, open the link on this machine." } else { "Open the link in a browser on this machine." }
+                ));
+                Some(url)
+            }
+            Err(err) => {
+                self.app.notice(format!("could not open the key setup page: {err:#}; use /login <provider> instead"));
+                None
+            }
+        }
+    }
+
+    fn web_change(&mut self, change: zarn_config::webkeys::Change) {
+        use zarn_config::webkeys::Change;
+        let onboarding = matches!(self.app.mode, Mode::Onboarding(_));
+        match change {
+            Change::Closed => {
+                self.web = None;
+                if let Mode::Onboarding(flow) = &mut self.app.mode
+                    && matches!(flow.step, onboarding::Step::Browser(_))
+                {
+                    flow.back_to_start();
+                }
+                self.app.notice("the API key setup page is closed");
+                return;
+            }
+            Change::Saved { provider, place } => {
+                self.app.notice(format!("{provider}: key saved from the setup page to the {place}"))
+            }
+            Change::Removed(provider) => self.app.notice(format!("{provider}: key removed from the setup page")),
+            Change::Added(provider) => self.app.notice(format!("{provider}: endpoint added from the setup page")),
+        }
+        if onboarding {
+            self.app.mode = Mode::Chat;
+            self.rebuild();
+            if self.app.not_ready.is_none() {
+                self.app.notice("setup complete. Type a message, or / for commands.");
+            }
+            return;
+        }
+        self.rebuild();
     }
 
     fn ask_login(&mut self, provider: &str) {
@@ -3152,9 +3320,16 @@ impl Controller {
                 }
             },
             "login" => match first {
+                Some("web") => {
+                    self.open_key_page();
+                }
                 Some(provider) => self.ask_login(provider),
                 None => {
-                    let picker = self.provider_picker("Log in to which provider?", true, false).custom("or type a provider name");
+                    let mut picker = self.provider_picker("Log in to which provider?", true, false).custom("or type a provider name");
+                    picker.choices.insert(
+                        0,
+                        Choice::new("web", "web").with_detail("set up keys in your browser on a localhost page"),
+                    );
                     self.app.overlay = Some(Overlay::Pick(picker, ChatPick::Login));
                 }
             },

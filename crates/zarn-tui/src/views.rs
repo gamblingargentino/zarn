@@ -1,4 +1,5 @@
 use crate::brand;
+use crate::hits::{self, Hit};
 use crate::onboarding::{Onboarding, Step};
 use crate::settings::{Editor, Form, Panel, TABS};
 use crate::widgets::{MaskedInput, Picker, TextField};
@@ -62,10 +63,20 @@ pub fn draw_panel(frame: &mut Frame, panel: &Panel, accent: Color) {
     .split(inner);
 
     let mut tabs = Vec::new();
+    let mut x = parts[0].x;
     for (i, tab) in TABS.iter().enumerate() {
         if i > 0 {
             tabs.push(Span::styled("  ", dim()));
+            x += 2;
         }
+        let width = tab.label().chars().count() as u16;
+        if x < parts[0].x + parts[0].width && panel.editor.is_none() {
+            hits::add(
+                Rect { x, y: parts[0].y, width: width.min(parts[0].x + parts[0].width - x), height: 1 },
+                Hit::Tab(i),
+            );
+        }
+        x += width;
         let style = if *tab == panel.tab {
             Style::default()
                 .fg(accent)
@@ -90,6 +101,11 @@ pub fn draw_panel(frame: &mut Frame, panel: &Panel, accent: Color) {
         .min(32)
         + 2;
     let width = body.width as usize;
+    if panel.editor.is_none() {
+        for (k, i) in (offset..rows.len()).take(height).enumerate() {
+            hits::row(body, body.y + k as u16, Hit::Row(i));
+        }
+    }
     let lines: Vec<Line> = if rows.is_empty() {
         vec![Line::styled(
             match panel.tab {
@@ -256,6 +272,10 @@ pub fn draw_picker(frame: &mut Frame, area: Rect, picker: &Picker, accent: Color
         ));
     }
     let width = inner.width as usize;
+    let first_row = inner.y + 1 + hint_rows;
+    for (k, i) in (start..visible.len()).take(rows).enumerate() {
+        hits::row(inner, first_row + k as u16, Hit::Picker(i));
+    }
     for (i, choice) in visible.iter().enumerate().skip(start).take(rows) {
         let chosen = i == picker.selected;
         let style = if chosen {
@@ -434,6 +454,24 @@ pub fn draw_onboarding(frame: &mut Frame, onboarding: &Onboarding, accent: Color
             draw_secret(frame, body, "paste your API key", input, &hint, accent);
             "enter continue · esc back".to_string()
         }
+        Step::Browser(url) => {
+            frame.render_widget(
+                Paragraph::new(vec![
+                    Line::styled(
+                        "The setup page is open in your browser:",
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                    Line::raw(""),
+                    Line::styled(url.clone(), Style::default().fg(accent).add_modifier(Modifier::UNDERLINED)),
+                    Line::raw(""),
+                    Line::raw("Pick a provider there, paste its key and press Save. zarn tests the key, stores it in your OS credential store and starts here as soon as it is saved."),
+                    Line::styled("If no browser opened, copy the link into a browser on this machine.", dim()),
+                ])
+                .wrap(Wrap { trim: false }),
+                body,
+            );
+            "waiting for a key from the browser · enter opens it again · esc goes back".to_string()
+        }
         Step::Testing => {
             frame.render_widget(
                 Paragraph::new(Line::styled(
@@ -476,7 +514,7 @@ pub fn draw_onboarding(frame: &mut Frame, onboarding: &Onboarding, accent: Color
     frame.render_widget(Paragraph::new(line), parts[3]);
 }
 
-pub fn draw_confirm(frame: &mut Frame, area: Rect, text: &str, accent: Color) {
+pub fn draw_confirm(frame: &mut Frame, area: Rect, text: &str, choice: usize, accent: Color) {
     let wrapped: usize = text
         .lines()
         .map(|l| l.chars().count().div_ceil(68).max(1))
@@ -486,31 +524,58 @@ pub fn draw_confirm(frame: &mut Frame, area: Rect, text: &str, accent: Color) {
     let block = frame_block("confirm", theme::warn());
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
-    let mut lines: Vec<Line> = text
-        .lines()
-        .map(|l| Line::styled(l.to_string(), Style::default().fg(theme::warn())))
+    let mut lines: Vec<Line> = crate::render::wrap(text, inner.width.max(1) as usize)
+        .into_iter()
+        .map(|l| Line::styled(l, Style::default().fg(theme::warn())))
         .collect();
-    lines.extend([
-        Line::raw(""),
-        Line::from(vec![
-            Span::styled("[y] ", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
-            Span::raw("yes   "),
-            Span::styled("[n] ", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
-            Span::raw("no"),
-        ]),
-    ]);
-    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+    lines.push(Line::raw(""));
+    let options = [("Yes", "y"), ("No", "n")];
+    let mut spans = Vec::new();
+    let mut x = inner.x;
+    for (i, (label, key)) in options.iter().enumerate() {
+        let chosen = i == choice;
+        let text = format!("{}{label} [{key}]", if chosen { "› " } else { "  " });
+        let style = if chosen {
+            Style::default().fg(accent).add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default().fg(accent)
+        };
+        let width = text.chars().count() as u16;
+        let y = inner.y + lines.len() as u16;
+        if y < inner.y + inner.height {
+            hits::add(Rect { x, y, width, height: 1 }, Hit::Confirm(i));
+        }
+        x += width + 3;
+        spans.push(Span::styled(text, style));
+        spans.push(Span::raw("   "));
+    }
+    spans.push(Span::styled("←→ choose · enter", dim()));
+    lines.push(Line::from(spans));
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
-pub fn draw_plan(frame: &mut Frame, area: Rect, review: &crate::state::PlanReview, accent: Color) {
+pub const PLAN_OPTIONS: [&str; 3] = [
+    "Approve, and accept edits without asking [a]",
+    "Approve, and ask before each edit as usual [d]",
+    "Keep planning: tell the model what to change [r]",
+];
+
+pub fn draw_plan(
+    frame: &mut Frame,
+    area: Rect,
+    review: &crate::state::PlanReview,
+    choice: usize,
+    accent: Color,
+) {
     let body = crate::markdown::render(&review.plan);
-    let height = (body.len() as u16 + 6).min(area.height.saturating_sub(1)).max(8);
+    let height = (body.len() as u16 + 9).min(area.height.saturating_sub(1)).max(10);
     let rect = centered(area, 90, height);
     frame.render_widget(Clear, rect);
     let block = frame_block("plan for approval", accent);
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
-    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(2)]).split(inner);
+    let footer_rows = if review.feedback.is_some() { 2 } else { PLAN_OPTIONS.len() as u16 + 1 };
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(footer_rows)]).split(inner);
     frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), rows[0]);
     let footer = match &review.feedback {
         Some(field) => vec![
@@ -520,17 +585,15 @@ pub fn draw_plan(frame: &mut Frame, area: Rect, review: &crate::state::PlanRevie
             ]),
             Line::styled("enter sends it and keeps plan mode · esc goes back", dim()),
         ],
-        None => vec![
-            Line::from(vec![
-                Span::styled("[a] ", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
-                Span::raw("approve, accept edits   "),
-                Span::styled("[d] ", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
-                Span::raw("approve, ask as usual   "),
-                Span::styled("[r] ", Style::default().fg(accent).add_modifier(Modifier::BOLD)),
-                Span::raw("reject with feedback"),
-            ]),
-            Line::styled("esc rejects without feedback", dim()),
-        ],
+        None => {
+            let options: Vec<String> = PLAN_OPTIONS.iter().map(|o| o.to_string()).collect();
+            for i in 0..options.len() {
+                hits::row(rows[1], rows[1].y + i as u16, Hit::Plan(i));
+            }
+            let mut lines = crate::render::menu_lines(&options, choice, Style::default().fg(accent));
+            lines.push(Line::styled("↑↓ choose · enter confirm · esc rejects without feedback", dim()));
+            lines
+        }
     };
     frame.render_widget(Paragraph::new(footer), rows[1]);
 }

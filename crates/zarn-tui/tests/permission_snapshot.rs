@@ -56,13 +56,14 @@ fn snapshot_an_edit_shows_a_unified_diff() {
         "edit",
         json!({ "path": "lib.rs", "old_string": "fn step_6() {}", "new_string": "fn step_six() {\n    run();\n}" }),
     );
-    let out = rows(90, 20, &app);
+    let out = rows(90, 26, &app);
     snapshot("permission_edit_diff", &out);
     let text = out.join("\n");
     assert!(text.contains("edit lib.rs (+3 -1)"));
     assert!(text.contains("6 - fn step_6() {}"));
     assert!(text.contains("6 + fn step_six() {"));
-    assert!(text.contains("[a] allow edit(lib.rs) for this session"));
+    assert!(text.contains("2. Yes, allow edit(lib.rs) for this session [a]"));
+    assert!(text.contains("› 1. Yes, once [y]"));
     assert_eq!(std::fs::read_to_string(dir.path().join("lib.rs")).unwrap(), body);
 }
 
@@ -74,7 +75,7 @@ fn snapshot_a_new_file_shows_its_content_under_a_new_file_header() {
         "write",
         json!({ "path": "notes/todo.md", "content": "# Todo\n\n- ship it\n" }),
     );
-    let out = rows(90, 12, &app);
+    let out = rows(90, 18, &app);
     snapshot("permission_new_file", &out);
     assert!(out.join("\n").contains("write new file notes/todo.md (+3 -0)"));
     assert!(!dir.path().join("notes/todo.md").exists());

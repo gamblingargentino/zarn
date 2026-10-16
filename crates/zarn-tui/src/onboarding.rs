@@ -8,6 +8,7 @@ use zarn_config::ops::{self, ProviderDraft};
 use zarn_providers::ProviderSpec;
 
 pub const SKIP: &str = "__skip__";
+pub const WEB: &str = "__web__";
 
 #[derive(Debug)]
 pub enum Step {
@@ -18,6 +19,7 @@ pub enum Step {
     Testing,
     Failed(String),
     Saved(String),
+    Browser(String),
 }
 
 impl Step {
@@ -30,6 +32,7 @@ impl Step {
             Step::Testing => "Testing",
             Step::Failed(_) => "The test request failed",
             Step::Saved(_) => "Ready",
+            Step::Browser(_) => "Set up in your browser",
         }
     }
 }
@@ -40,6 +43,7 @@ pub enum Effect {
     ListModels,
     Done,
     Skipped,
+    Web,
 }
 
 pub struct Onboarding {
@@ -54,10 +58,8 @@ pub struct Onboarding {
 }
 
 fn kind_picker() -> Picker {
-    let mut choices: Vec<Choice> = catalog::KINDS
-        .iter()
-        .map(|k| Choice::new(k.id, k.label))
-        .collect();
+    let mut choices: Vec<Choice> = vec![Choice::new(WEB, "Set up in your browser (a page on localhost)")];
+    choices.extend(catalog::KINDS.iter().map(|k| Choice::new(k.id, k.label)));
     choices.push(Choice::new(SKIP, "Skip setup for now"));
     Picker::new("Which provider do you want to use?", choices)
 }
@@ -74,6 +76,11 @@ impl Onboarding {
             layers,
             store,
         }
+    }
+
+    pub fn back_to_start(&mut self) {
+        self.step = Step::Kind(kind_picker());
+        self.message = None;
     }
 
     pub fn store_label(&self) -> String {
@@ -220,6 +227,10 @@ impl Onboarding {
                     self.step = Step::Kind(picker);
                     Some(Effect::Skipped)
                 }
+                Pick::Chosen(value) if value == WEB => {
+                    self.step = Step::Kind(picker);
+                    Some(Effect::Web)
+                }
                 Pick::Chosen(value) | Pick::Custom(value) => {
                     self.kind = catalog::kind(&value);
                     self.model.clear();
@@ -324,6 +335,20 @@ impl Onboarding {
                 }
                 _ => {
                     self.step = Step::Failed(err);
+                    None
+                }
+            },
+            Step::Browser(url) => match key.code {
+                KeyCode::Esc => {
+                    self.step = Step::Kind(kind_picker());
+                    None
+                }
+                KeyCode::Enter => {
+                    self.step = Step::Browser(url);
+                    Some(Effect::Web)
+                }
+                _ => {
+                    self.step = Step::Browser(url);
                     None
                 }
             },

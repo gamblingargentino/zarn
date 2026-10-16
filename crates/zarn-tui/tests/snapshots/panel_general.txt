@@ -14,7 +14,7 @@
 │  theme                 auto  auto follows COLORFGBG and falls back to dark                                 │
 │  notifications         on  bell and title after turns over 10s and on permission prompts                   │
 │  status line           built-in  template with {model} {mode} {profile} {context} {cost} {cwd} {branch}    │
-│  mouse scrolling       off  captures the mouse, so native text selection needs shift; see /doctor          │
+│  mouse                 on  wheel scrolls the conversation and menus take clicks; text selection needs shift│
 │                                                                                                            │
 │                                                                                                            │
 │                                                                                                            │

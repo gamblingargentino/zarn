@@ -1,4 +1,5 @@
 use crate::brand;
+use crate::hits::{self, Hit};
 use crate::markdown;
 use crate::popup;
 use crate::state::{App, Block, CardStatus, COLLAPSED_LINES, CompareSide, Mode, Overlay, ToolCard};
@@ -37,6 +38,12 @@ fn todo_list(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 pub fn draw(frame: &mut Frame, app: &App) {
+    hits::begin();
+    draw_screen(frame, app);
+    app.hits.replace(hits::finish());
+}
+
+fn draw_screen(frame: &mut Frame, app: &App) {
     theme::set(app.theme.palette);
     match &app.mode {
         Mode::Panel(panel) => return views::draw_panel(frame, panel, app.theme.accent),
@@ -71,14 +78,15 @@ pub fn draw(frame: &mut Frame, app: &App) {
     input(frame, app, areas[2]);
 
     if app.popup_visible() {
-        let shown = app.popup_matches();
+        let matches = app.popup_matches();
+        let shown: Vec<&popup::Entry> = matches.iter().collect();
         let selected = app.popup_selected.min(shown.len().saturating_sub(1));
-        popup::draw(frame, areas[0], &shown, selected, app.theme.accent);
+        popup::draw_with(frame, areas[0], &shown, selected, app.theme.accent, app.popup_prefix());
     } else if app.mention_visible() {
         let entries = app.mention_entries();
         let shown: Vec<&popup::Entry> = entries.iter().collect();
         let selected = app.popup_selected.min(shown.len().saturating_sub(1));
-        popup::draw_with(frame, areas[0], &shown, selected, app.theme.accent, '@');
+        popup::draw_with(frame, areas[0], &shown, selected, app.theme.accent, "@");
     }
 
     match &app.overlay {
@@ -93,14 +101,14 @@ pub fn draw(frame: &mut Frame, app: &App) {
             "Paste the key and press enter; characters are not shown. It goes to your OS credential store (or an owner-only fallback file), never to a config file. esc cancels.",
             app.theme.accent,
         ),
-        Some(Overlay::Confirm(text, _)) => views::draw_confirm(frame, areas[0], text, app.theme.accent),
+        Some(Overlay::Confirm(text, _)) => views::draw_confirm(frame, areas[0], text, app.confirm_choice, app.theme.accent),
         None => {}
     }
 
     if let Some(review) = &app.plan_review
         && review.decided.is_none()
     {
-        views::draw_plan(frame, areas[0], review, app.theme.accent);
+        views::draw_plan(frame, areas[0], review, app.plan_choice, app.theme.accent);
     }
 }
 
@@ -182,9 +190,9 @@ fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-fn scroll_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+fn scroll_lines(app: &App, width: usize) -> (Vec<Line<'static>>, Option<usize>) {
     if app.transcript {
-        return transcript_lines(app, width);
+        return (transcript_lines(app, width), None);
     }
     let mut lines = Vec::new();
     if app.theme.banner {
@@ -195,14 +203,18 @@ fn scroll_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         lines.extend(block_lines(block, app.theme.accent, width));
         lines.push(Line::raw(""));
     }
+    let mut menu = None;
     if let Some(request) = &app.pending {
-        lines.extend(permission_lines(request, app.pending_expanded));
+        let body = permission_lines(request, app.pending_expanded, app.permission_choice);
+        let options = permission_options(&request.pattern).len();
+        menu = Some(lines.len() + body.len() - options - 1);
+        lines.extend(body);
     }
-    lines
+    (lines, menu)
 }
 
 fn scrollback(frame: &mut Frame, app: &App, area: Rect) {
-    let mut lines = scroll_lines(app, area.width as usize);
+    let (mut lines, menu) = scroll_lines(app, area.width as usize);
 
     let width = area.width.max(1) as usize;
     let rows: Vec<usize> = lines.iter().map(|line| line.width().max(1).div_ceil(width)).collect();
@@ -228,6 +240,16 @@ fn scrollback(frame: &mut Frame, app: &App, area: Rect) {
                 if row < offset || row >= offset.saturating_add(area.height) {
                     offset = row.saturating_sub(area.height / 2).min(bottom);
                 }
+            }
+        }
+    }
+
+    if let (Some(first), Some(request)) = (menu, &app.pending) {
+        for k in 0..permission_options(&request.pattern).len() {
+            let at = first + k;
+            let top = rows[..at].iter().sum::<usize>();
+            if let Some(y) = top.checked_sub(offset as usize).filter(|y| *y < area.height as usize) {
+                hits::row(area, area.y + y as u16, Hit::Permission(k));
             }
         }
     }
@@ -596,7 +618,7 @@ fn diff_lines(preview: &zarn_tools::diff::Preview, expanded: bool) -> Vec<Line<'
     lines
 }
 
-fn permission_lines(request: &crate::state::PermissionRequest, expanded: bool) -> Vec<Line<'static>> {
+fn permission_lines(request: &crate::state::PermissionRequest, expanded: bool, choice: usize) -> Vec<Line<'static>> {
     let warn = Style::default().fg(theme::warn());
     let title = match &request.preview {
         Some(p) if p.new_file => format!("new file {} ({})", p.path, p.summary()),
@@ -618,16 +640,43 @@ fn permission_lines(request: &crate::state::PermissionRequest, expanded: bool) -
             }
         }
     }
+    lines.extend(menu_lines(&permission_options(&request.pattern), choice, warn));
+    let expand = if request.preview.is_some() { " · e expands the diff" } else { "" };
     lines.push(Line::styled(
-        format!("  [y] once   [a] allow {} for this session", request.pattern),
-        warn,
-    ));
-    let expand = if request.preview.is_some() { "   [e] expand" } else { "" };
-    lines.push(Line::styled(
-        format!("  save the rule: [p] project   [l] just for me   [u] user{expand}   [n] no"),
-        warn,
+        format!("  ↑↓ choose · enter confirm · or press [y] [a] [p] [l] [u] [n]{expand}"),
+        Style::default().fg(theme::dim()),
     ));
     lines
+}
+
+pub fn permission_options(pattern: &str) -> Vec<String> {
+    vec![
+        "Yes, once [y]".to_string(),
+        format!("Yes, allow {pattern} for this session [a]"),
+        "Yes, and save the rule for this project [p]".to_string(),
+        "Yes, and save the rule just for me in this project [l]".to_string(),
+        "Yes, and save the rule for all my projects [u]".to_string(),
+        "No [n]".to_string(),
+    ]
+}
+
+pub fn menu_lines(options: &[String], choice: usize, accent: Style) -> Vec<Line<'static>> {
+    options
+        .iter()
+        .enumerate()
+        .map(|(i, option)| {
+            let chosen = i == choice;
+            let style = if chosen {
+                accent.add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            Line::from(vec![
+                Span::styled(if chosen { "  › " } else { "    " }, accent),
+                Span::styled(format!("{}. {option}", i + 1), style),
+            ])
+        })
+        .collect()
 }
 
 fn status(frame: &mut Frame, app: &App, area: Rect) {
@@ -725,7 +774,7 @@ fn search_label(app: &App, search: &crate::state::Search, width: usize) -> Strin
     if search.typing {
         return format!("search: {}▏ (enter to find, esc to stop)", search.query);
     }
-    let hits = search_hits(&scroll_lines(app, width), &search.query).len();
+    let hits = search_hits(&scroll_lines(app, width).0, &search.query).len();
     if hits == 0 {
         format!("search '{}': no matches", search.query)
     } else {
@@ -773,7 +822,14 @@ fn input(frame: &mut Frame, app: &App, area: Rect) {
     let inner = border.inner(area);
 
     frame.render_widget(border, area);
-    frame.render_widget(Paragraph::new(app.input.clone()), inner);
+    let mut lines: Vec<Line> = app.input.split('\n').map(|l| Line::raw(l.to_string())).collect();
+    if let Some(hint) = app.usage_hint()
+        && let Some(last) = lines.last_mut()
+    {
+        let gap = if app.input.ends_with(' ') { "" } else { " " };
+        last.spans.push(Span::styled(format!("{gap}{hint}"), Style::default().fg(theme::dim())));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 
     if app.pending.is_none() && app.overlay.is_none() {
         let before: String = app.input.chars().take(app.cursor).collect();

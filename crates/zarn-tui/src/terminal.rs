@@ -68,13 +68,13 @@ pub fn mouse_check(on: bool) -> Check {
         Check::new(
             "mouse",
             Status::Ok,
-            "capture on: the wheel scrolls the scrollback, but native text selection now needs shift (option on macOS Terminal); turn it off under /config → General → mouse scrolling",
+            "capture on: the wheel scrolls the conversation and menus take clicks; native text selection now needs shift (option on macOS Terminal); turn it off under /config → General → mouse",
         )
     } else {
         Check::new(
             "mouse",
             Status::Ok,
-            "capture off: native text selection works; scroll with pgup/pgdn, or turn on /config → General → mouse scrolling at the cost of plain selection",
+            "capture off: native text selection works, but most terminals turn the wheel into up/down keys, which walk the prompt history; scroll with pgup/pgdn, or turn on /config → General → mouse",
         )
     }
 }

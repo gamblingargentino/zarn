@@ -14,7 +14,7 @@
 │  theme    │{model} {mode} {profile} {context} {cost} {cwd} {branch}; empty resets    │           │
 │  notificat│                                                                          │ts         │
 │› status li╰──────────────────────────────────────────────────────────────────────────╯} {cwd} {b…│
-│  mouse scrolling       off  captures the mouse, so native text selection needs shift; see /doctor│
+│  mouse                 on  wheel scrolls the conversation and menus take clicks; text selection …│
 │                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │

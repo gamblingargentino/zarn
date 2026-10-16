@@ -128,6 +128,41 @@ pub async fn login(provider: &str) -> Result<()> {
     Ok(())
 }
 
+pub async fn setup(port: Option<u16>, no_browser: bool) -> Result<()> {
+    use zarn_config::webkeys::{self, Change};
+    let store = KeyStore::shared();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let mut options = webkeys::Options::new(store);
+    options.port = port;
+    options.on_change = Some(std::sync::Arc::new(move |change| {
+        let _ = tx.send(change);
+    }));
+    let running = webkeys::start(options)?;
+    println!("API key setup is open at\n\n  {}\n", running.url);
+    if !no_browser && webkeys::open_browser(&running.url) {
+        println!("It should open in your browser now. If it does not, open the link above on this machine.");
+    } else {
+        println!("Open the link above in a browser on this machine.");
+    }
+    println!("Click Done on the page or press ctrl+c here when you are finished.");
+    loop {
+        tokio::select! {
+            change = rx.recv() => match change {
+                Some(Change::Saved { provider, place }) => println!("{provider}: key saved to the {place}"),
+                Some(Change::Removed(provider)) => println!("{provider}: key removed"),
+                Some(Change::Added(provider)) => println!("{provider}: endpoint added"),
+                Some(Change::Closed) | None => break,
+            },
+            _ = tokio::signal::ctrl_c() => {
+                running.stop();
+                break;
+            }
+        }
+    }
+    println!("The setup page is closed.");
+    Ok(())
+}
+
 pub fn logout(provider: &str) -> Result<()> {
     let store = KeyStore::shared();
     if ops::logout(&store, provider)? {

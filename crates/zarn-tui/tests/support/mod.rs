@@ -105,6 +105,7 @@ impl Env {
             std::env::set_var("ZARN_DATA_DIR", root.join("data"));
             std::env::remove_var("ZARN_PROFILE");
             std::env::remove_var("ZARN_MODEL");
+            std::env::set_var("ZARN_NO_BROWSER", "1");
         }
         let store = Arc::new(KeyStore::new(
             Arc::new(MemoryBackend::new()),

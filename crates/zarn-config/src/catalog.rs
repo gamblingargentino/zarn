@@ -74,6 +74,15 @@ pub fn kind(id: &str) -> Option<&'static Kind> {
     KINDS.iter().find(|k| k.id == id)
 }
 
+pub fn key_page(id: &str) -> Option<&'static str> {
+    match kind(id)?.id {
+        "anthropic" => Some("https://console.anthropic.com/settings/keys"),
+        "openai" => Some("https://platform.openai.com/api-keys"),
+        "google" => Some("https://aistudio.google.com/apikey"),
+        _ => None,
+    }
+}
+
 pub fn needs_key(spec: &ProviderSpec) -> bool {
     match kind(&spec.kind) {
         Some(k) if k.id == "openai" => spec

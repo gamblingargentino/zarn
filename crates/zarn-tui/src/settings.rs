@@ -868,8 +868,8 @@ impl Panel {
                     RowKind::StatusLine,
                 )
                 .note("template with {model} {mode} {profile} {context} {cost} {cwd} {branch}"),
-                Row::new("mouse scrolling", on_off(cfg.general.mouse()), RowKind::Mouse)
-                    .note("captures the mouse, so native text selection needs shift; see /doctor"),
+                Row::new("mouse", on_off(cfg.general.mouse()), RowKind::Mouse)
+                    .note("wheel scrolls the conversation and menus take clicks; text selection needs shift"),
             ],
         }
     }
@@ -891,6 +891,30 @@ impl Panel {
         let i = self.tab.index();
         let current = self.cursor[i].min(len - 1) as isize;
         self.cursor[i] = (current + delta).clamp(0, len as isize - 1) as usize;
+    }
+
+    pub fn select_tab(&mut self, index: usize) {
+        if self.editor.is_none()
+            && let Some(tab) = TABS.get(index)
+        {
+            self.tab = *tab;
+            self.message = None;
+        }
+    }
+
+    pub fn click_row(&mut self, index: usize) -> Option<Effect> {
+        if self.editor.is_some() || index >= self.rows().len() {
+            return None;
+        }
+        self.cursor[self.tab.index()] = index;
+        self.activate()
+    }
+
+    pub fn picker_mut(&mut self) -> Option<&mut Picker> {
+        match &mut self.editor {
+            Some(Editor::Pick(picker, _)) => Some(picker),
+            _ => None,
+        }
     }
 
     fn switch_tab(&mut self, delta: isize) {
@@ -1429,7 +1453,7 @@ impl Panel {
             RowKind::Mouse => {
                 let value = !cfg.general.mouse();
                 let result = ops::set_general(&mut self.layers, GeneralField::Mouse, |g| g.mouse = Some(value));
-                self.saved(format!("mouse scrolling {}", on_off(value)), result)
+                self.saved(format!("mouse {}", on_off(value)), result)
             }
             RowKind::StatusLine => {
                 let mut form = Form::new(

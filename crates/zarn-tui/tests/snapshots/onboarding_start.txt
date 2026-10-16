@@ -11,7 +11,8 @@
 │                                                                                        │
 │            ╭ Which provider do you want to use? ──────────────────────────╮            │
 │            │filter                                                        │            │
-│            │› Anthropic (Claude)                                          │            │
+│            │› Set up in your browser (a page on localhost)                │            │
+│            │  Anthropic (Claude)                                          │            │
 │            │  OpenAI                                                      │            │
 │            │  Google (Gemini)                                             │            │
 │            │  OpenAI-compatible (Groq, OpenRouter, Together, vLLM, LM Stu…│            │
@@ -19,7 +20,6 @@
 │            │  Skip setup for now                                          │            │
 │            │                                                              │            │
 │            ╰──────────────────────────────────────────────────────────────╯            │
-│                                                                                        │
 │                                                                                        │
 │                                                                                        │
 │↑↓ choose · enter select                                                                │

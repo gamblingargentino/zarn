@@ -96,6 +96,7 @@ async fn run_command(command: &Command) -> Result<()> {
             ConfigAction::Check => commands::config_check(),
         },
         Command::Login { provider } => commands::login(provider).await,
+        Command::Setup { port, no_browser } => commands::setup(*port, *no_browser).await,
         Command::Logout { provider } => commands::logout(provider),
         Command::Providers { action } => match action {
             None | Some(ProvidersAction::List) => commands::providers_list().await,

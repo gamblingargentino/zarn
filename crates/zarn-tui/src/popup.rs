@@ -64,6 +64,103 @@ pub const BUILTINS: &[(&str, &str, &str)] = &[
     ("quit", "", "exit zarn"),
 ];
 
+pub const SUBCOMMANDS: &[(&str, &str, &str, &str)] = &[
+    ("provider", "list", "", "list providers and their keys"),
+    ("provider", "add", "", "add a provider step by step"),
+    ("provider", "switch", "[name]", "make another provider the default"),
+    ("mcp", "list", "", "list MCP servers and their state"),
+    ("mcp", "add", "<name> <command> [args]", "add an MCP server"),
+    ("mcp", "remove", "<name>", "remove an MCP server"),
+    ("mcp", "restart", "<name>", "restart an MCP server"),
+    ("mcp", "login", "<name>", "sign in to an MCP server"),
+    ("mcp", "logout", "<name>", "forget an MCP server sign-in"),
+    ("agents", "list", "", "list subagents"),
+    ("agents", "create", "", "create a subagent"),
+    ("agents", "edit", "<name>", "edit a subagent"),
+    ("limits", "session", "<usd|off>", "cap the spend of this session"),
+    ("limits", "day", "<usd|off>", "cap the spend per day"),
+    ("tasks", "cancel", "<id>", "cancel a background agent"),
+    ("loop", "list", "", "list the running loops"),
+    ("loop", "stop", "<id>", "stop a loop"),
+    ("loop", "5m", "<prompt>", "every 5 minutes"),
+    ("loop", "1h", "<prompt>", "every hour"),
+    ("permissions", "edit", "", "edit the rules in the settings panel"),
+    ("models", "refresh", "", "query every provider again"),
+    ("login", "web", "", "set up API keys in your browser"),
+    ("theme", "dark", "", "dark background"),
+    ("theme", "light", "", "light background"),
+    ("theme", "colorblind", "", "colorblind-safe colors"),
+    ("theme", "auto", "", "follow the terminal"),
+];
+
+pub fn requires_arguments(usage: &str) -> bool {
+    usage.starts_with('<') && !usage.contains(" | ")
+}
+
+pub fn argument_query(input: &str) -> Option<(String, &str)> {
+    let rest = input.strip_prefix('/')?;
+    let (command, args) = rest.split_once(' ')?;
+    if command.is_empty() || args.contains('\n') {
+        return None;
+    }
+    let mut words: Vec<&str> = args.split(' ').collect();
+    let partial = words.pop().unwrap_or("");
+    if words.iter().any(|w| w.is_empty()) || words.len() > 1 {
+        return None;
+    }
+    let mut key = command.to_string();
+    for word in words {
+        key.push(' ');
+        key.push_str(word);
+    }
+    Some((key, partial))
+}
+
+pub fn arguments(key: &str, dynamic: &std::collections::BTreeMap<String, Vec<(String, String)>>) -> Vec<Entry> {
+    let mut out: Vec<Entry> = SUBCOMMANDS
+        .iter()
+        .filter(|(command, _, _, _)| *command == key)
+        .map(|(_, name, usage, description)| Entry {
+            name: (*name).to_string(),
+            usage: (*usage).to_string(),
+            description: (*description).to_string(),
+            origin: Origin::Builtin,
+        })
+        .collect();
+    for (name, description) in dynamic.get(key).into_iter().flatten() {
+        if out.iter().any(|e| &e.name == name) {
+            continue;
+        }
+        out.push(Entry {
+            name: name.clone(),
+            usage: String::new(),
+            description: description.clone(),
+            origin: Origin::Custom,
+        });
+    }
+    out
+}
+
+pub fn usage_hint(
+    input: &str,
+    entries: &[Entry],
+) -> Option<String> {
+    let rest = input.strip_prefix('/')?;
+    let (command, args) = rest.split_once(' ')?;
+    if args.trim().is_empty() {
+        let entry = entries.iter().find(|e| e.name == command)?;
+        return (!entry.usage.is_empty()).then(|| entry.usage.clone());
+    }
+    let (sub, tail) = args.split_once(' ')?;
+    if !tail.trim().is_empty() {
+        return None;
+    }
+    SUBCOMMANDS
+        .iter()
+        .find(|(c, name, usage, _)| *c == command && *name == sub && !usage.is_empty())
+        .map(|(_, _, usage, _)| (*usage).to_string())
+}
+
 pub fn builtin_entries() -> Vec<Entry> {
     BUILTINS
         .iter()
@@ -149,7 +246,7 @@ pub fn split(line: &str) -> Option<(String, String)> {
 }
 
 pub fn draw(frame: &mut Frame, area: Rect, shown: &[&Entry], selected: usize, accent: Color) {
-    draw_with(frame, area, shown, selected, accent, '/');
+    draw_with(frame, area, shown, selected, accent, "/");
 }
 
 pub fn draw_with(
@@ -158,7 +255,7 @@ pub fn draw_with(
     shown: &[&Entry],
     selected: usize,
     accent: Color,
-    prefix: char,
+    prefix: &str,
 ) {
     if shown.is_empty() || area.height < 3 {
         return;
@@ -169,10 +266,15 @@ pub fn draw_with(
     let rect = Rect {
         x: area.x,
         y: area.y + area.height - height,
-        width: area.width.min(if prefix == '/' { 72 } else { 90 }),
+        width: area.width.min(if prefix == "@" { 90 } else { 72 }),
         height,
     };
-    let name_width = shown.iter().map(|e| e.name.len()).max().unwrap_or(0) + 1;
+    let name_width = shown
+        .iter()
+        .map(|e| e.name.chars().count() + if e.usage.is_empty() || !prefix.is_empty() { 0 } else { e.usage.chars().count() + 1 })
+        .max()
+        .unwrap_or(0)
+        + 1;
     let lines: Vec<Line> = shown
         .iter()
         .enumerate()
@@ -188,11 +290,30 @@ pub fn draw_with(
             };
             Line::from(vec![
                 Span::styled(marker, Style::default().fg(accent)),
-                Span::styled(format!("{prefix}{:<name_width$}", entry.name), name_style),
+                Span::styled(
+                    if prefix.is_empty() && !entry.usage.is_empty() {
+                        format!("{:<name_width$}", format!("{} {}", entry.name, entry.usage))
+                    } else {
+                        format!("{prefix}{:<name_width$}", entry.name)
+                    },
+                    name_style,
+                ),
                 Span::styled(entry.description.clone(), Style::default().fg(theme::dim())),
             ])
         })
         .collect();
+    for (k, i) in (start..shown.len()).take(rows).enumerate() {
+        crate::hits::row(
+            Rect {
+                x: rect.x + 1,
+                y: rect.y + 1,
+                width: rect.width.saturating_sub(2),
+                height: rect.height.saturating_sub(2),
+            },
+            rect.y + 1 + k as u16,
+            crate::hits::Hit::Popup(i),
+        );
+    }
     frame.render_widget(Clear, rect);
     frame.render_widget(
         Paragraph::new(lines).block(

@@ -1,6 +1,3 @@
-write big.txt (+80 -80)
-  @@ -1,80 +1,80 @@
-   1 - old 1
    2 - old 2
    3 - old 3
    4 - old 4
@@ -30,10 +27,13 @@ write big.txt (+80 -80)
   28 - old 28
   29 - old 29
   … 131 more diff lines ([e] expands)
-  [y] once   [a] allow write(big.txt) for this session
-  save the rule: [p] project   [l] just for me   [u] user   [e] expand   [n] no
-
-
+  › 1. Yes, once [y]
+    2. Yes, allow write(big.txt) for this session [a]
+    3. Yes, and save the rule for this project [p]
+    4. Yes, and save the rule just for me in this project [l]
+    5. Yes, and save the rule for all my projects [u]
+    6. No [n]
+  ↑↓ choose · enter confirm · or press [y] [a] [p] [l] [u] [n] · e expands the diff
 default mode  ·  m  ·  0 in / 0 out  ·  no rate configured
 ╭────────────────────────────────────────────────────────────────────────────────────────╮
 │                                                                                        │

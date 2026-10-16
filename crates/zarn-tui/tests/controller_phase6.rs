@@ -218,7 +218,9 @@ async fn mcp_resources_prompts_and_tool_list_changes_work_in_the_chat() {
     assert!(sent.ends_with("read @docs:docs://readme please"));
 
     c.type_line("/docs:summarize");
-    assert!(notices(&c).last().unwrap().contains("usage: /docs:summarize <topic> [style]"));
+    assert_eq!(c.app().input, "/docs:summarize ", "a command with required arguments waits for them");
+    assert_eq!(c.app().usage_hint().as_deref(), Some("<topic> [style]"));
+    c.app_mut().set_input("");
     turn(&mut c, "/docs:summarize rust terse").await;
     c.settle(Duration::from_secs(5)).await;
     let sent = last_user_text(&chat_bodies(&mock).await.pop().unwrap());
