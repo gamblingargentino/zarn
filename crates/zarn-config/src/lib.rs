@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use zarn_providers::ProviderSpec;
+use zarn_tools::mcp::ServerConfig;
 use zarn_tools::permissions::Policy;
 
 pub const LOCAL_PATH: &str = ".zarn/config.toml";
@@ -49,6 +50,8 @@ pub struct Config {
     pub profiles: HashMap<String, ProfileSpec>,
     #[serde(default)]
     pub permissions: HashMap<String, Policy>,
+    #[serde(default)]
+    pub mcp: HashMap<String, ServerConfig>,
 }
 
 impl Config {
@@ -71,6 +74,9 @@ impl Config {
         }
         for (name, policy) in other.permissions {
             self.permissions.entry(name).or_insert(policy);
+        }
+        for (name, server) in other.mcp {
+            self.mcp.entry(name).or_insert(server);
         }
     }
 

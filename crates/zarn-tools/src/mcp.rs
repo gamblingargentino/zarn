@@ -2,7 +2,7 @@ use anyhow::{Result, anyhow, bail};
 use async_trait::async_trait;
 use eventsource_stream::Eventsource;
 use futures::StreamExt;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::process::Stdio;
@@ -19,7 +19,7 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(120);
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(30);
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
-#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct ServerConfig {
     #[serde(default)]
     pub command: Option<String>,
@@ -34,6 +34,33 @@ pub struct ServerConfig {
 }
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+
+fn piped(command: &mut tokio::process::Command) -> &mut tokio::process::Command {
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+}
+
+fn spawn_child(command: &str, config: &ServerConfig) -> std::io::Result<Child> {
+    piped(
+        tokio::process::Command::new(command)
+            .args(&config.args)
+            .envs(&config.env),
+    )
+    .spawn()
+}
+
+fn spawn_child_through_cmd_exe(command: &str, config: &ServerConfig) -> std::io::Result<Child> {
+    piped(
+        tokio::process::Command::new("cmd")
+            .arg("/c")
+            .arg(command)
+            .args(&config.args)
+            .envs(&config.env),
+    )
+    .spawn()
+}
 
 enum Transport {
     Stdio {
@@ -80,13 +107,13 @@ impl McpClient {
     }
 
     async fn spawn_stdio(command: &str, config: &ServerConfig) -> Result<Transport> {
-        let mut child = tokio::process::Command::new(command)
-            .args(&config.args)
-            .envs(&config.env)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
+        let mut child = match spawn_child(command, config) {
+            Ok(child) => child,
+            Err(err) if cfg!(windows) && err.kind() == std::io::ErrorKind::NotFound => {
+                spawn_child_through_cmd_exe(command, config)?
+            }
+            Err(err) => return Err(err.into()),
+        };
 
         let stdin = child.stdin.take().ok_or_else(|| anyhow!("no stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?;

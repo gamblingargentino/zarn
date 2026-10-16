@@ -3923,6 +3923,7 @@ dependencies = [
  "tiktoken-rs",
  "tokio",
  "tokio-util",
+ "toml",
  "tracing",
  "zarn-core",
 ]

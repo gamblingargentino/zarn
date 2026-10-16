@@ -147,6 +147,21 @@ fn cmd_config_check() -> Result<()> {
         println!("  {tool:<8} {policy:?}");
     }
 
+    let mut servers: Vec<_> = cfg.mcp.iter().collect();
+    servers.sort_by_key(|(name, _)| name.as_str());
+    if !servers.is_empty() {
+        println!("\nmcp servers:");
+        for (name, server) in servers {
+            match (&server.command, &server.url) {
+                (Some(command), _) => {
+                    println!("  {name:<12} stdio  {command} {}", server.args.join(" "))
+                }
+                (None, Some(url)) => println!("  {name:<12} http   {url}"),
+                (None, None) => println!("  {name:<12} INVALID: neither command nor url"),
+            }
+        }
+    }
+
     println!("\nconfig is valid");
     Ok(())
 }
@@ -196,6 +211,7 @@ async fn cmd_providers() -> Result<()> {
 
 async fn run_agent(args: &Args) -> Result<()> {
     let mut cfg = Config::load().unwrap_or_default();
+    let mcp = std::mem::take(&mut cfg.mcp);
 
     let profile_name = args.profile
         .clone()
@@ -232,7 +248,11 @@ async fn run_agent(args: &Args) -> Result<()> {
         .or_else(|| std::env::var("ZARN_MODEL").ok())
         .unwrap_or_else(|| "gpt-4o-mini".to_string());
 
-    let tools = Arc::new(zarn_tools::builtins());
+    let mut registry = zarn_tools::builtins();
+    for tool in zarn_tools::mcp::connect_all(&mcp).await {
+        registry.register(tool);
+    }
+    let tools = Arc::new(registry);
     let ctx = Arc::new(Ctx::new(std::env::current_dir()?));
     let config = AgentConfig {
         model,
@@ -259,7 +279,7 @@ async fn run_agent(args: &Args) -> Result<()> {
         }
         RunMode::OneShot(prompt) => {
             let agent = Agent::new(provider, tools, ctx, config)
-                .with_gate(Arc::new(Permissions::headless()));
+                .with_gate(Arc::new(Permissions::headless().with_tools(cfg.permissions)));
 
             let (tx, mut rx) = tokio::sync::mpsc::channel(256);
             let printer = tokio::spawn(async move {
