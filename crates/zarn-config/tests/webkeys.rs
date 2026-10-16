@@ -44,13 +44,28 @@ async fn open() -> Page {
         .with_priority(2)
         .mount(&mock)
         .await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .and(header("authorization", format!("Bearer {BAD}").as_str()))
+        .respond_with(ResponseTemplate::new(401).set_body_string("{\"error\":{\"message\":\"invalid key\"}}"))
+        .with_priority(1)
+        .mount(&mock)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            "{\"data\":[{\"id\":\"m\"},{\"id\":\"m-large\",\"context_length\":128000},{\"id\":\"text-embedding-3\"}]}",
+        ))
+        .with_priority(2)
+        .mount(&mock)
+        .await;
     let dir = tempfile::tempdir().unwrap();
     let project = dir.path().join("project.toml");
     let user = dir.path().join("user.toml");
     std::fs::write(
         &user,
         format!(
-            "[providers.mock]\nkind = \"openai-compat\"\nbase_url = \"{}\"\n\n[profiles.default]\nprovider = \"mock\"\nmodel = \"m\"\n",
+            "[providers.mock]\nkind = \"openai-compat\"\nbase_url = \"{0}\"\n\n[providers.claude]\nkind = \"anthropic\"\nbase_url = \"{0}\"\n\n[profiles.default]\nprovider = \"mock\"\nmodel = \"m\"\n",
             mock.uri()
         ),
     )
@@ -65,6 +80,7 @@ async fn open() -> Page {
         user: Some(user.clone()),
         on_change: Some(Arc::new(move |c| seen.lock().unwrap().push(c))),
         idle: Duration::from_secs(60),
+        cache: dir.path().join("discovery"),
     })
     .unwrap();
     let token = running.url.split("token=").nth(1).unwrap().to_string();
@@ -199,17 +215,22 @@ async fn the_link_sets_a_cookie_and_nothing_works_without_it_or_from_another_hos
 }
 
 #[tokio::test]
-async fn a_key_is_tested_then_saved_and_never_shown_back() {
+async fn a_key_is_checked_saved_and_its_models_loaded_and_it_is_never_shown_back() {
     let page = open().await;
     let saved = page.post("/save", &[("provider", "mock"), ("key", GOOD), ("test", "1")]).await;
     assert_eq!(saved.status(), 303);
     let home = page.home().await;
-    assert!(home.contains("mock: key tested and saved"), "{home}");
+    assert!(home.contains("mock: key saved to the"), "{home}");
+    assert!(home.contains("3 models found") && home.contains("using m"), "{home}");
+    assert!(home.contains("<option value=\"m-large\">m-large</option>"), "{home}");
+    assert!(!home.contains("<option value=\"text-embedding-3\""), "embedding models are not offered for chat");
     assert!(!home.contains(GOOD), "the key never comes back to the browser");
     assert!(page.store.has("mock", None).is_some());
     let sent = page.mock.received_requests().await.unwrap();
-    assert!(sent.iter().any(|r| r.headers.get("authorization").is_some_and(|v| v == &format!("Bearer {GOOD}"))));
+    assert!(sent.iter().any(|r| r.url.path() == "/models" && r.headers.get("authorization").is_some_and(|v| v == &format!("Bearer {GOOD}"))));
     assert!(matches!(&page.changes.lock().unwrap()[..], [Change::Saved { provider, .. }] if provider == "mock"));
+    let cached = zarn_config::quota::cached_models(&page._dir.path().join("discovery"), "mock");
+    assert_eq!(cached.len(), 3);
 
     let rejected = page.post("/save", &[("provider", "mock"), ("key", BAD), ("test", "1")]).await;
     assert_eq!(rejected.status(), 303);
@@ -217,12 +238,43 @@ async fn a_key_is_tested_then_saved_and_never_shown_back() {
     assert!(home.contains("the key was not saved"), "{home}");
     assert!(!home.contains(BAD));
     let (stored, _) = page.store.resolve("mock", None).unwrap();
-    assert_eq!(stored, GOOD, "a key that fails its test does not replace the working one");
+    assert_eq!(stored, GOOD, "a key that fails its check does not replace the working one");
+
+    page.post("/use", &[("provider", "mock"), ("model", "m-large")]).await;
+    assert!(page.home().await.contains("profile default now uses mock · m-large"));
+    let cfg = Layers::load_from(page.project.clone(), Some(page.user.clone())).unwrap().merged();
+    assert_eq!(cfg.profiles["default"].model.as_deref(), Some("m-large"));
+    assert!(page.changes.lock().unwrap().contains(&Change::Updated("mock".into())));
 
     let removed = page.post("/remove", &[("provider", "mock")]).await;
     assert_eq!(removed.status(), 303);
     assert!(page.store.has("mock", None).is_none());
     assert!(page.home().await.contains("mock: key removed"));
+}
+
+#[tokio::test]
+async fn a_key_is_matched_to_its_provider_and_an_ambiguous_one_goes_nowhere() {
+    let page = open().await;
+    let claude_key = "sk-ant-test-key-not-real";
+    page.post("/save", &[("provider", "auto"), ("key", claude_key), ("test", "1")]).await;
+    let home = page.home().await;
+    assert!(home.contains("claude: key saved to the"), "{home}");
+    assert!(page.store.has("claude", None).is_some(), "the configured anthropic provider got the key");
+    let sent = page.mock.received_requests().await.unwrap();
+    assert!(sent.iter().any(|r| r.headers.get("x-api-key").is_some_and(|v| v == claude_key)));
+
+    let before = page.mock.received_requests().await.unwrap().len();
+    page.post("/save", &[("provider", "auto"), ("key", "sk-test-key-not-real")]).await;
+    let home = page.home().await;
+    assert!(home.contains("could belong to OpenAI, DeepSeek, Moonshot (Kimi), Alibaba Qwen (DashScope)"), "{home}");
+    page.post("/save", &[("provider", "auto"), ("key", "test-key-not-real")]).await;
+    assert!(page.home().await.contains("cannot tell which provider"));
+    assert_eq!(page.mock.received_requests().await.unwrap().len(), before, "an unrecognised key is sent nowhere");
+
+    page.post("/models", &[("provider", "mock")]).await;
+    assert!(page.home().await.contains("mock: 3 models found"));
+    let home = page.home().await;
+    assert!(home.contains("Detect from the key") && home.contains("OpenRouter") && home.contains("Groq") && home.contains("xAI"));
 }
 
 #[tokio::test]
@@ -236,13 +288,19 @@ async fn a_new_catalog_provider_and_a_custom_endpoint_are_added_to_the_config() 
 
     page.post(
         "/custom",
-        &[("name", "groq"), ("base_url", &page.mock.uri()), ("model", "m"), ("key", GOOD), ("test", "1")],
+        &[("name", "selfhosted"), ("base_url", &page.mock.uri()), ("key", GOOD), ("test", "1")],
     )
     .await;
     let home = page.home().await;
-    assert!(home.contains("groq added"), "{home}");
+    assert!(home.contains("selfhosted added · 3 models found · using m"), "{home}");
     let cfg = Layers::load_from(page.project.clone(), Some(page.user.clone())).unwrap().merged();
-    assert_eq!(cfg.providers.get("groq").and_then(|p| p.base_url.clone()), Some(page.mock.uri()));
+    assert_eq!(cfg.providers.get("selfhosted").and_then(|p| p.base_url.clone()), Some(page.mock.uri()));
+
+    page.post("/save", &[("provider", "groq"), ("key", "gsk_test-key-not-real")]).await;
+    let cfg = Layers::load_from(page.project.clone(), Some(page.user.clone())).unwrap().merged();
+    let groq = cfg.providers.get("groq").expect("groq added from its preset");
+    assert_eq!(groq.kind, "openai-compat");
+    assert_eq!(groq.base_url.as_deref(), Some("https://api.groq.com/openai/v1"));
 
     page.post("/custom", &[("name", "../x"), ("base_url", "http://h")]).await;
     assert!(page.home().await.contains("not a valid name"));

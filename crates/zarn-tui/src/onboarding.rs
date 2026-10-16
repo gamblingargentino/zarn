@@ -145,10 +145,10 @@ impl Onboarding {
             choices.insert(0, Choice::plain(self.model.clone()));
         }
         let picker = Picker::new("Which model?", choices)
-            .custom("type any model name, then enter")
+            .custom("loading the models this key can use; or type any model name, then enter")
             .select_value(&self.model);
         self.step = Step::Model(picker);
-        (kind.id == "ollama").then_some(Effect::ListModels)
+        Some(Effect::ListModels)
     }
 
     fn start_test(&mut self) -> Option<Effect> {
@@ -160,11 +160,17 @@ impl Onboarding {
     pub fn set_models(&mut self, models: Vec<String>) {
         if let Step::Model(picker) = &mut self.step {
             let mut choices = picker.choices.clone();
-            for model in models {
+            let mut found = 0;
+            for model in models.into_iter().filter(|m| ops::is_chat_model(m)) {
+                found += 1;
                 if !choices.iter().any(|c| c.value == model) {
                     choices.push(Choice::plain(model));
                 }
             }
+            picker.hint = match found {
+                0 => "the provider listed no models; type a model name, then enter".to_string(),
+                n => format!("{n} models this key can use · type to filter, or name any model"),
+            };
             picker.set_choices(choices);
         }
     }

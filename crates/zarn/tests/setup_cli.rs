@@ -51,3 +51,33 @@ fn zarn_setup_serves_the_key_page_until_done() {
     assert!(config.contains("[providers.google]"), "{config}");
     assert!(!config.contains("test-key-not-real"));
 }
+
+#[test]
+fn zarn_login_works_out_the_provider_from_the_key_and_loads_its_models() {
+    let mock = Mock::start(std::sync::Arc::new(|seen: &Seen| {
+        if seen.line.starts_with("GET /v1/models") {
+            (200, "application/json".into(), "{\"data\":[{\"id\":\"claude-a\",\"max_input_tokens\":200000},{\"id\":\"claude-b\"}]}".into())
+        } else {
+            (404, "application/json".into(), "{}".into())
+        }
+    }));
+    let home = Home::new();
+    home.config(&format!(
+        "[providers.claude]\nkind = \"anthropic\"\nbase_url = \"{}\"\n\n[profiles.default]\nprovider = \"claude\"\n",
+        mock.base()
+    ));
+    let key = "sk-ant-test-key-not-real";
+    let out = home.run(&["login"], &format!("{key}\n"));
+    let text = stdout(&out);
+    assert!(out.status.success(), "{text}{}", stderr(&out));
+    assert!(text.contains("key for claude saved to"), "{text}");
+    assert!(text.contains("check: OK · 2 models · using claude-a"), "{text}");
+    assert!(!text.contains(key));
+    assert!(mock.requests().iter().any(|r| r.headers.to_lowercase().contains(&format!("x-api-key: {key}"))));
+    let config = std::fs::read_to_string(home.root().join("cfg/config.toml")).unwrap();
+    assert!(config.contains("model = \"claude-a\""), "{config}");
+
+    let unknown = home.run(&["login"], "test-key-not-real\n");
+    assert!(!unknown.status.success());
+    assert!(stderr(&unknown).contains("zarn login <provider>"), "{}", stderr(&unknown));
+}

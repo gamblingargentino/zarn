@@ -25,6 +25,7 @@ pub enum Change {
     Saved { provider: String, place: String },
     Removed(String),
     Added(String),
+    Updated(String),
     Closed,
 }
 
@@ -37,6 +38,7 @@ pub struct Options {
     pub user: Option<PathBuf>,
     pub on_change: Option<OnChange>,
     pub idle: Duration,
+    pub cache: PathBuf,
 }
 
 impl Options {
@@ -48,6 +50,7 @@ impl Options {
             user: paths::user_config(),
             on_change: None,
             idle: IDLE,
+            cache: crate::quota::cache_dir(),
         }
     }
 }
@@ -90,6 +93,7 @@ struct State {
     project: PathBuf,
     user: Option<PathBuf>,
     flash: Mutex<Option<(String, bool)>>,
+    cache: PathBuf,
     on_change: Option<OnChange>,
     stop: watch::Sender<bool>,
     last: Mutex<Instant>,
@@ -190,6 +194,7 @@ pub fn start(options: Options) -> Result<Running> {
         project: options.project,
         user: options.user,
         flash: Mutex::new(None),
+        cache: options.cache,
         on_change: options.on_change,
         stop: stop.clone(),
         last: Mutex::new(Instant::now()),
@@ -485,6 +490,8 @@ async fn route(request: &Request, state: &State) -> String {
                 "/save" => save(state, &field("provider"), &field("key"), !field("test").is_empty()).await,
                 "/custom" => custom(state, &form_value(&form, "name"), &form_value(&form, "base_url"), &form_value(&form, "model"), &field("key"), !field("test").is_empty()).await,
                 "/remove" => remove(state, &field("provider")),
+                "/use" => use_model(state, &field("provider"), &field("model")),
+                "/models" => refresh_models(state, &field("provider")).await,
                 "/test" => test(state, &field("provider")).await,
                 "/done" => {
                     let _ = state.stop.send(true);
@@ -509,17 +516,7 @@ fn form_value(form: &[(String, String)], name: &str) -> String {
         .unwrap_or_default()
 }
 
-fn test_model(cfg: &crate::Config, name: &str, kind: &str) -> String {
-    ops::model_for(cfg, name)
-        .filter(|m| !m.is_empty())
-        .or_else(|| catalog::suggested_models(kind).first().map(|m| m.to_string()))
-        .unwrap_or_default()
-}
-
 async fn save(state: &State, provider: &str, key: &str, check: bool) {
-    if provider.is_empty() {
-        return state.flash("pick a provider", true);
-    }
     if key.is_empty() {
         return state.flash("paste a key first", true);
     }
@@ -528,41 +525,19 @@ async fn save(state: &State, provider: &str, key: &str, check: bool) {
         Ok(layers) => layers,
         Err(err) => return state.flash(format!("config error: {err:#}"), true),
     };
-    let cfg = layers.merged();
-    let spec = match cfg.providers.get(provider) {
-        Some(spec) => spec.clone(),
-        None => match catalog::kind(provider) {
-            Some(kind) => ProviderDraft {
-                name: kind.id.to_string(),
-                kind: kind.id.to_string(),
-                ..ProviderDraft::default()
-            }
-            .spec(),
-            None => return state.flash(format!("unknown provider '{provider}'"), true),
-        },
+    let provider = match ops::resolve_provider(&layers.merged(), provider, key) {
+        Ok(provider) => provider,
+        Err(err) => return state.flash(err, true),
     };
-    if check {
-        let model = test_model(&cfg, provider, &spec.kind);
-        let mut probe = spec.clone();
-        probe.api_key = Some(key.to_string());
-        if let Err(err) = ops::test_provider(&probe, &model).await {
-            return state.flash(
-                format!("the key was not saved: a test request to {provider} failed: {}", redact(&err)),
-                true,
-            );
-        }
-    }
-    match ops::login(&mut layers, &state.store, provider, key) {
-        Ok(source) => {
-            let place = source.describe(&state.store);
-            let tested = if check { "tested and " } else { "" };
-            state.flash(format!("{provider}: key {tested}saved to the {place}"), false);
+    match ops::connect(&mut layers, &state.store, &state.cache, &provider, key, check).await {
+        Ok(done) => {
+            state.flash(done.summary(), false);
             state.changed(Change::Saved {
-                provider: provider.to_string(),
-                place,
+                provider: done.provider.clone(),
+                place: done.place,
             });
         }
-        Err(err) => state.flash(redact(&format!("{err:#}")), true),
+        Err(err) => state.flash(redact(&format!("{provider}: {err:#}")), true),
     }
 }
 
@@ -579,17 +554,32 @@ async fn custom(state: &State, name: &str, base_url: &str, model: &str, key: &st
     if !key.is_empty() {
         register_secret(key);
     }
-    let draft = ProviderDraft {
+    let mut draft = ProviderDraft {
         name: name.to_string(),
         kind: "openai-compat".into(),
-        base_url: Some(base_url.to_string()),
+        base_url: Some(base_url.trim_end_matches('/').to_string()),
         api_key_env: None,
         model: Some(model.to_string()).filter(|m| !m.is_empty()),
     };
+    let mut models = Vec::new();
     if check {
         let mut probe = draft.spec();
         probe.api_key = Some(key.to_string()).filter(|k| !k.is_empty());
-        if let Err(err) = ops::test_provider(&probe, model).await {
+        if let Ok(Ok(found)) =
+            tokio::time::timeout(ops::TEST_TIMEOUT, zarn_providers::discovery::models(name, &probe)).await
+        {
+            models = found;
+        }
+        if draft.model.is_none() {
+            draft.model = ops::pick_model(&probe, &models);
+        }
+        let Some(test) = draft.model.clone() else {
+            return state.flash(
+                format!("nothing was saved: {base_url} did not list any models; enter a model name"),
+                true,
+            );
+        };
+        if let Err(err) = ops::test_provider(&probe, &test).await {
             return state.flash(
                 format!("nothing was saved: a test request to {base_url} failed: {}", redact(&err)),
                 true,
@@ -604,14 +594,59 @@ async fn custom(state: &State, name: &str, base_url: &str, model: &str, key: &st
         return state.flash(format!("{err:#}"), true);
     }
     let mut message = format!("{name} added");
+    if !models.is_empty() {
+        ops::cache_models(&state.cache, name, &draft.spec(), &models);
+        message.push_str(&format!(" · {} models found", models.len()));
+    }
+    if let Some(model) = &draft.model {
+        message.push_str(&format!(" · using {model}"));
+    }
     if !key.is_empty() {
         match state.store.save(name, key) {
-            Ok(source) => message.push_str(&format!("; its key is in the {}", source.describe(&state.store))),
+            Ok(source) => message.push_str(&format!(" · key saved to the {}", source.describe(&state.store))),
             Err(err) => return state.flash(format!("{name} was added but the key was not saved: {err}"), true),
         }
     }
     state.flash(message, false);
     state.changed(Change::Added(name.to_string()));
+}
+
+fn use_model(state: &State, provider: &str, model: &str) {
+    if model.is_empty() {
+        return state.flash("pick a model", true);
+    }
+    let mut layers = match state.layers() {
+        Ok(layers) => layers,
+        Err(err) => return state.flash(format!("config error: {err:#}"), true),
+    };
+    match ops::use_model(&mut layers, provider, model) {
+        Ok(profile) => {
+            state.flash(format!("profile {profile} now uses {provider} · {model}"), false);
+            state.changed(Change::Updated(provider.to_string()));
+        }
+        Err(err) => state.flash(format!("{err:#}"), true),
+    }
+}
+
+async fn refresh_models(state: &State, provider: &str) {
+    let layers = match state.layers() {
+        Ok(layers) => layers,
+        Err(err) => return state.flash(format!("config error: {err:#}"), true),
+    };
+    let cfg = layers.merged();
+    let spec = match ops::spec_with_key(&cfg, &state.store, provider) {
+        Ok(spec) => spec,
+        Err(err) => return state.flash(format!("{err:#}"), true),
+    };
+    match tokio::time::timeout(ops::TEST_TIMEOUT, zarn_providers::discovery::models(provider, &spec)).await {
+        Ok(Ok(found)) => {
+            ops::cache_models(&state.cache, provider, &spec, &found);
+            state.flash(format!("{provider}: {} models found", found.len()), false);
+            state.changed(Change::Updated(provider.to_string()));
+        }
+        Ok(Err(err)) => state.flash(format!("{provider}: could not list models: {}", redact(&err)), true),
+        Err(_) => state.flash(format!("{provider}: no answer while listing models"), true),
+    }
 }
 
 fn remove(state: &State, provider: &str) {
@@ -666,6 +701,8 @@ button.danger{background:transparent;color:var(--bad);border-color:var(--line);f
 .flash{padding:12px 16px;border-radius:10px;margin:16px 0;border:1px solid}.flash.ok{border-color:var(--ok);color:var(--ok)}.flash.bad{border-color:var(--bad);color:var(--bad)}
 .hint{font-size:13px;color:var(--dim);margin-top:6px}a{color:var(--accent)}
 .done{text-align:center;background:transparent;border:none}
+form.pick{display:flex;gap:6px;margin:0}form.pick select{padding:6px 8px;min-width:0;max-width:240px}
+details{margin-top:14px}summary{cursor:pointer}
 "#;
 
 fn home(state: &State) -> String {
@@ -692,8 +729,39 @@ fn home(state: &State) -> String {
     if rows.is_empty() {
         body.push_str("<p class=\"dim\">None yet. Add a key below to get started.</p>");
     } else {
-        body.push_str("<table><tr><th>Name</th><th>Kind</th><th>Key</th><th></th></tr>");
+        let cfg = layers.as_ref().map(|l| l.merged()).unwrap_or_default();
+        body.push_str("<table><tr><th>Name</th><th>Kind</th><th>Key</th><th>Model</th><th></th></tr>");
         for row in &rows {
+            let current = ops::model_for(&cfg, &row.name).unwrap_or_default();
+            let cached = crate::quota::cached_models(&state.cache, &row.name);
+            let mut choices: Vec<String> = ops::chat_models(&cached).iter().map(|m| m.id.clone()).collect();
+            if !current.is_empty() && !choices.contains(&current) {
+                choices.insert(0, current.clone());
+            }
+            let fetch = format!(
+                "<form method=\"post\" action=\"/models\">{csrf}<input type=\"hidden\" name=\"provider\" value=\"{name}\"><button class=\"quiet\">{label}</button></form>",
+                name = escape(&row.name),
+                label = if cached.is_empty() { "Fetch models" } else { "Refresh" }
+            );
+            let model_cell = if choices.is_empty() {
+                format!("<span class=\"dim\">{}</span>", if current.is_empty() { "not set".to_string() } else { escape(&current) })
+            } else {
+                let options: String = choices
+                    .iter()
+                    .map(|m| {
+                        format!(
+                            "<option value=\"{0}\"{1}>{0}</option>",
+                            escape(m),
+                            if *m == current { " selected" } else { "" }
+                        )
+                    })
+                    .collect();
+                format!(
+                    "<form method=\"post\" action=\"/use\" class=\"pick\">{csrf}<input type=\"hidden\" name=\"provider\" value=\"{name}\"><select name=\"model\" aria-label=\"model for {name}\">{options}</select><button class=\"quiet\">Use</button></form><div class=\"hint\">{count} chat models</div>",
+                    name = escape(&row.name),
+                    count = choices.len()
+                )
+            };
             let has_key = row.key.is_some();
             let status = if has_key || !row.needs_key { "status-ok" } else { "status-bad" };
             let default = if row.is_default { " <span class=\"dim\">· default</span>" } else { "" };
@@ -707,8 +775,9 @@ fn home(state: &State) -> String {
                     name = escape(&row.name)
                 ));
             }
+            actions.insert_str(0, &fetch);
             body.push_str(&format!(
-                "<tr><td><strong>{}</strong>{default}</td><td class=\"dim\">{}</td><td class=\"{status}\">{}</td><td><div class=\"actions\">{actions}</div></td></tr>",
+                "<tr><td><strong>{}</strong>{default}</td><td class=\"dim\">{}</td><td class=\"{status}\">{}</td><td>{model_cell}</td><td><div class=\"actions\">{actions}</div></td></tr>",
                 escape(&row.name),
                 escape(&row.kind),
                 escape(&row.key_label()),
@@ -718,17 +787,18 @@ fn home(state: &State) -> String {
     }
     body.push_str("</section>");
 
-    let mut options = String::new();
+    let mut options = String::from("<option value=\"auto\" selected>Detect from the key</option><optgroup label=\"Your providers\">");
     let mut helps = Vec::new();
-    for row in rows.iter().filter(|r| r.needs_key || r.kind == "openai-compat") {
+    for row in rows.iter().filter(|r| r.needs_key || r.kind.contains("openai-compat")) {
         options.push_str(&format!(
             "<option value=\"{0}\">{0} ({1})</option>",
             escape(&row.name),
             escape(&row.kind)
         ));
     }
+    options.push_str("</optgroup><optgroup label=\"Add a provider\">");
     for kind in catalog::KINDS.iter().filter(|k| k.needs_key) {
-        if let Some(page) = catalog::key_page(kind.id) {
+        if let Some(page) = kind.key_page {
             helps.push(format!("<a href=\"{page}\" target=\"_blank\" rel=\"noreferrer noopener\">{}</a>", escape(kind.label)));
         }
         if rows.iter().any(|r| r.name == kind.id) {
@@ -740,20 +810,21 @@ fn home(state: &State) -> String {
             escape(kind.label)
         ));
     }
+    options.push_str("</optgroup>");
     body.push_str(&format!(
-        "<section><h2>Add or replace a key</h2><form method=\"post\" action=\"/save\" autocomplete=\"off\">{csrf}\
-<label for=\"provider\">Provider</label><select id=\"provider\" name=\"provider\">{options}</select>\
+        "<section><h2>Add or replace a key</h2><p class=\"dim\">Paste a key. zarn recognises most providers from the key itself, fills in their address, checks the key and loads every model it can use.</p><form method=\"post\" action=\"/save\" autocomplete=\"off\">{csrf}\
 <label for=\"key\">API key</label><input id=\"key\" type=\"password\" name=\"key\" autocomplete=\"off\" spellcheck=\"false\" placeholder=\"paste the key\" required>\
-<div class=\"hint\">Get a key: {}</div>\
-<label class=\"check\"><input type=\"checkbox\" name=\"test\" value=\"1\" checked> Send one small test request before saving</label>\
-<div class=\"row\"><button>Save key</button></div></form></section>",
+<label for=\"provider\">Provider</label><select id=\"provider\" name=\"provider\">{options}</select>\
+<label class=\"check\"><input type=\"checkbox\" name=\"test\" value=\"1\" checked> Check the key and load its models before saving</label>\
+<div class=\"row\"><button>Save key</button></div></form>\
+<details><summary class=\"hint\">Where do I get a key?</summary><div class=\"hint\">{}</div></details></section>",
         helps.join(" · ")
     ));
     body.push_str(&format!(
-        "<section><h2>Custom OpenAI-compatible endpoint</h2><p class=\"dim\">Groq, OpenRouter, Together, vLLM, LM Studio and other servers that speak the OpenAI API.</p><form method=\"post\" action=\"/custom\" autocomplete=\"off\">{csrf}\
-<label for=\"name\">Name</label><input id=\"name\" type=\"text\" name=\"name\" placeholder=\"groq\" required>\
-<label for=\"base_url\">Base URL</label><input id=\"base_url\" type=\"url\" name=\"base_url\" placeholder=\"https://api.groq.com/openai/v1\" required>\
-<label for=\"model\">Model</label><input id=\"model\" type=\"text\" name=\"model\" placeholder=\"llama-3.3-70b-versatile\">\
+        "<section><h2>Your own OpenAI-compatible server</h2><p class=\"dim\">Only for servers that are not in the list above: vLLM, a company proxy, a self-hosted gateway. Leave the model empty to use the first one the server lists.</p><form method=\"post\" action=\"/custom\" autocomplete=\"off\">{csrf}\
+<label for=\"name\">Name</label><input id=\"name\" type=\"text\" name=\"name\" placeholder=\"my-server\" required>\
+<label for=\"base_url\">Base URL</label><input id=\"base_url\" type=\"url\" name=\"base_url\" placeholder=\"http://localhost:8000/v1\" required>\
+<label for=\"model\">Model (optional)</label><input id=\"model\" type=\"text\" name=\"model\" placeholder=\"loaded from the server\">\
 <label for=\"ckey\">API key (leave empty if none)</label><input id=\"ckey\" type=\"password\" name=\"key\" autocomplete=\"off\" spellcheck=\"false\">\
 <label class=\"check\"><input type=\"checkbox\" name=\"test\" value=\"1\" checked> Send one small test request before saving</label>\
 <div class=\"row\"><button>Add endpoint</button></div></form></section>"

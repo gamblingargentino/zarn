@@ -93,3 +93,40 @@ async fn login_web_opens_the_page_and_a_saved_key_applies_at_once() {
     assert!(!page.contains("test-key-not-real"));
     assert!(!screen(&c, 100, 30).join("\n").contains("test-key-not-real"));
 }
+
+#[tokio::test]
+async fn login_auto_recognises_the_key_checks_it_and_loads_the_models() {
+    let chat = echo_server("ok").await;
+    let models = wiremock::MockServer::start().await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/models"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+            "{\"data\":[{\"id\":\"claude-a\"},{\"id\":\"claude-b\"},{\"id\":\"claude-embed\"}]}",
+        ))
+        .mount(&models)
+        .await;
+    let env = Env::new(&format!(
+        "{}\n[providers.claude]\nkind = \"anthropic\"\nbase_url = \"{}\"\n",
+        provider_config(&chat.uri(), ""),
+        models.uri()
+    ))
+    .await;
+    let mut c = env.controller();
+    c.type_line("/login auto");
+    assert!(screen(&c, 100, 30).join("\n").contains("API key (any provider)"));
+    c.paste("sk-ant-test-key-not-real");
+    c.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    wait_for(&mut c, Duration::from_secs(10), |c| notices(c).iter().any(|n| n.contains("models found"))).await;
+    let said = notices(&c);
+    assert!(said.iter().any(|n| n.contains("claude: key saved to the") && n.contains("3 models found")), "{said:?}");
+    assert!(env.store.has("claude", None).is_some());
+    assert!(!screen(&c, 100, 30).join("\n").contains("sk-ant-test-key-not-real"));
+    c.app_mut().set_input("/login ");
+    assert!(c.app().popup_matches().iter().any(|e| e.name == "auto"));
+
+    c.app_mut().set_input("");
+    c.type_line("/login auto");
+    c.paste("sk-test-key-not-real");
+    c.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(notices(&c).last().unwrap().contains("could belong to OpenAI"), "{:?}", notices(&c));
+}

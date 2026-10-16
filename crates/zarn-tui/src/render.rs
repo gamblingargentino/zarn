@@ -96,9 +96,9 @@ fn draw_screen(frame: &mut Frame, app: &App) {
         Some(Overlay::Secret { input, provider }) => views::draw_secret(
             frame,
             areas[0],
-            &format!("API key for {provider}"),
+            &if provider == "auto" { "API key (any provider)".to_string() } else { format!("API key for {provider}") },
             input,
-            "Paste the key and press enter; characters are not shown. It goes to your OS credential store (or an owner-only fallback file), never to a config file. esc cancels.",
+            "Paste the key and press enter; characters are not shown. zarn checks it, loads the models it can use and stores it in your OS credential store (or an owner-only fallback file), never in a config file. esc cancels.",
             app.theme.accent,
         ),
         Some(Overlay::Confirm(text, _)) => views::draw_confirm(frame, areas[0], text, app.confirm_choice, app.theme.accent),

@@ -122,6 +122,7 @@ enum UiEvent {
     Doctor(String),
     Notice(String),
     WebKeys(zarn_config::webkeys::Change),
+    LoginDone(Result<String, String>),
     Title(Result<String, String>),
     Quota {
         reports: Vec<zarn_config::quota::Report>,
@@ -1420,20 +1421,32 @@ impl Controller {
                 }
             }
             Action::Login(provider, secret) => {
-                let store = self.store.clone();
-                let result = match self.layers() {
-                    Some(layers) => ops::login(layers, &store, &provider, secret.expose()),
-                    None => return true,
-                };
+                let key = secret.expose().to_string();
                 drop(secret);
-                match result {
-                    Ok(source) => {
-                        let place = source.describe(&self.store);
-                        self.app.notice(format!("key for {provider} saved to {place}"));
-                        self.rebuild();
+                zarn_config::auth::register_secret(&key);
+                let Some(layers) = self.layers.clone() else {
+                    return true;
+                };
+                let provider = match ops::resolve_provider(&layers.merged(), &provider, &key) {
+                    Ok(provider) => provider,
+                    Err(err) => {
+                        self.app.notice(format!("{err}: /login <provider>"));
+                        return true;
                     }
-                    Err(err) => self.app.notice(format!("login failed: {err:#}")),
-                }
+                };
+                self.app.notice(format!("checking the {provider} key and loading its models…"));
+                let store = self.store.clone();
+                let tx = self.ui_tx.clone();
+                tokio::spawn(async move {
+                    let mut layers = layers;
+                    let cache = zarn_config::quota::cache_dir();
+                    let result = ops::connect(&mut layers, &store, &cache, &provider, &key, true)
+                        .await
+                        .map(|done| done.summary())
+                        .map_err(|err| zarn_config::auth::redact(&format!("login failed: {provider}: {err:#}")));
+                    drop(key);
+                    let _ = tx.send(UiEvent::LoginDone(result)).await;
+                });
             }
         }
         true
@@ -2506,6 +2519,11 @@ impl Controller {
             UiEvent::Doctor(report) => self.app.notice(report),
             UiEvent::Notice(text) => self.app.notice(text),
             UiEvent::WebKeys(change) => self.web_change(change),
+            UiEvent::LoginDone(Ok(summary)) => {
+                self.app.notice(summary);
+                self.rebuild();
+            }
+            UiEvent::LoginDone(Err(err)) => self.app.notice(err),
             UiEvent::Title(Ok(title)) => {
                 self.title = Some(title.clone());
                 if let Some(session) = self.session.as_mut()
@@ -2916,6 +2934,7 @@ impl Controller {
             }
             Change::Removed(provider) => self.app.notice(format!("{provider}: key removed from the setup page")),
             Change::Added(provider) => self.app.notice(format!("{provider}: endpoint added from the setup page")),
+            Change::Updated(provider) => self.app.notice(format!("{provider}: settings changed from the setup page")),
         }
         if onboarding {
             self.app.mode = Mode::Chat;
@@ -3329,6 +3348,10 @@ impl Controller {
                     picker.choices.insert(
                         0,
                         Choice::new("web", "web").with_detail("set up keys in your browser on a localhost page"),
+                    );
+                    picker.choices.insert(
+                        1,
+                        Choice::new("auto", "auto").with_detail("paste any key; zarn works out the provider from it"),
                     );
                     self.app.overlay = Some(Overlay::Pick(picker, ChatPick::Login));
                 }

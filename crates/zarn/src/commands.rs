@@ -112,18 +112,33 @@ fn print_saved(store: &KeyStore, provider: &str, source: &zarn_config::auth::Key
     }
 }
 
-pub async fn login(provider: &str) -> Result<()> {
+pub async fn login(provider: Option<&str>) -> Result<()> {
     let store = KeyStore::shared();
     let mut layers = layers()?;
-    let Some(key) = ask_key(provider)? else {
+    let Some(key) = ask_key(provider.unwrap_or("any provider (zarn works out which)"))? else {
         bail!("no key given; nothing changed");
     };
-    let source = ops::login(&mut layers, &store, provider, &key)?;
+    let provider = ops::resolve_provider(&layers.merged(), provider.unwrap_or("auto"), &key)
+        .map_err(|err| anyhow::anyhow!("{err}: zarn login <provider>"))?;
+    let cache = zarn_config::quota::cache_dir();
+    let done = ops::connect(&mut layers, &store, &cache, &provider, &key, false).await?;
     drop(key);
-    print_saved(&store, provider, &source);
-    match ops::test_named(&layers, &store, provider).await {
-        Ok(ok) => println!("test: {ok}"),
-        Err(err) => println!("test FAILED: {err}"),
+    println!("key for {provider} saved to {}", done.place);
+    if let Some(notice) = store.fallback_notice() {
+        eprintln!("{notice}");
+    }
+    let cfg = layers.merged();
+    let spec = ops::spec_with_key(&cfg, &store, &provider)?;
+    match ops::check_key(&provider, &spec, ops::model_for(&cfg, &provider).as_deref()).await {
+        Ok(models) => {
+            let model = ops::adopt_models(&mut layers, &cache, &provider, &spec, &models)?;
+            let mut line = format!("check: OK · {} models", models.len());
+            if let Some(model) = model {
+                line.push_str(&format!(" · using {model}"));
+            }
+            println!("{line}");
+        }
+        Err(err) => println!("check FAILED: {err}"),
     }
     Ok(())
 }
@@ -151,6 +166,7 @@ pub async fn setup(port: Option<u16>, no_browser: bool) -> Result<()> {
                 Some(Change::Saved { provider, place }) => println!("{provider}: key saved to the {place}"),
                 Some(Change::Removed(provider)) => println!("{provider}: key removed"),
                 Some(Change::Added(provider)) => println!("{provider}: endpoint added"),
+                Some(Change::Updated(provider)) => println!("{provider}: settings changed"),
                 Some(Change::Closed) | None => break,
             },
             _ = tokio::signal::ctrl_c() => {

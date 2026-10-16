@@ -24,11 +24,25 @@ The result is in `target/dist/release/`.
 zarn ships with no provider and no key. The first time you run `zarn` it opens
 a setup flow. The first choice, "Set up in your browser", opens a page on
 `http://localhost:9276` (the next free port up to 9299 if that one is busy):
-pick a provider, paste the key, press Save. zarn sends one small test request,
-stores the key in your OS credential store and opens the prompt as soon as the
-key works. You can also stay in the terminal: pick a provider, paste your key
-(it is never shown on screen) and pick a model. Either way nothing is saved
-until the test request succeeds.
+paste the key and press Save. zarn recognises the provider from the key,
+fills in its address, checks the key by listing the models it can use, stores
+the key in your OS credential store, picks a model and opens the prompt. Every
+listed model is then offered on the page, in `/model` and in the `/model `
+completion list. You can also stay in the terminal: pick a provider, paste
+your key (it is never shown on screen) and pick from the models the key can
+use. Either way nothing is saved until the key works.
+
+Built in, with their addresses filled in: Anthropic, OpenAI, Google Gemini,
+OpenRouter, Groq, DeepSeek, Mistral, xAI, Together AI, Fireworks AI,
+Cerebras, Moonshot (Kimi), Alibaba Qwen, Z.ai (GLM), Perplexity, NVIDIA NIM,
+Hugging Face, Ollama and LM Studio. Any other OpenAI-compatible server only
+needs a name and a base URL.
+
+zarn works out the provider from keys with a unique format (`sk-ant-`,
+`sk-or-`, `sk-proj-`, `gsk_`, `AIza`, `xai-`, `pplx-`, `nvapi-`, `hf_`,
+`csk-`, `fw_`, `tgp_` and Z.ai keys). A plain `sk-` key could belong to
+OpenAI, DeepSeek, Moonshot or Qwen, so zarn asks which one instead of
+sending your key to all of them to find out.
 
 The setup page only listens on 127.0.0.1, only works from the link zarn prints
 (it carries a one-time token), refuses other hosts and other sites' forms, and
@@ -40,7 +54,7 @@ Everything after that is done from inside zarn, with no hand-edited files:
 | Command | What it does |
 | --- | --- |
 | `/config` | settings panel: providers, models, skills, MCP, agents, modes, quota, permissions, hooks, plugins, general |
-| `/login [provider\|web]`, `/logout [provider]` | add, replace or remove a key; `web` opens the browser setup page |
+| `/login [provider\|auto\|web]`, `/logout [provider]` | add, replace or remove a key and load its models; `auto` works out the provider from the key, `web` opens the browser setup page |
 | `/provider list\|add\|switch` | manage providers |
 | `/model [name]`, `/models [refresh]` | pick a model; list every provider's models, limits and credits |
 | `/profile` (ctrl+p) | pick a profile for this session |
@@ -65,8 +79,9 @@ The same operations exist on the command line:
 
 ```sh
 zarn setup                     # the browser page on localhost:9276
-zarn login anthropic
-zarn providers add --kind openai-compat --base-url https://api.groq.com/openai/v1
+zarn login                     # paste any key; zarn works out the provider
+zarn login groq
+zarn providers add --kind openai-compat --base-url http://localhost:8000/v1
 zarn providers list | test <name> | remove <name>
 zarn models [--provider NAME] [--refresh]
 zarn limits [--session 5] [--day 20]

@@ -8,6 +8,7 @@ use std::time::Duration;
 use zarn_core::provider::Event;
 use zarn_core::types::{Message, Request};
 use zarn_providers::ProviderSpec;
+use zarn_providers::discovery::ModelInfo;
 use zarn_tools::mcp::ServerConfig;
 use zarn_tools::permissions::Policy;
 
@@ -24,11 +25,10 @@ pub struct ProviderDraft {
 
 impl ProviderDraft {
     pub fn spec(&self) -> ProviderSpec {
-        let default_base = catalog::kind(&self.kind)
-            .and_then(|k| k.default_base_url)
-            .map(str::to_string);
+        let preset = catalog::kind(&self.kind);
+        let default_base = preset.and_then(|k| k.default_base_url).map(str::to_string);
         ProviderSpec {
-            kind: self.kind.clone(),
+            kind: preset.map(|k| k.backend.to_string()).unwrap_or_else(|| self.kind.clone()),
             base_url: self
                 .base_url
                 .clone()
@@ -75,7 +75,7 @@ pub fn providers(layers: &Layers, store: &KeyStore) -> Vec<ProviderRow> {
         .iter()
         .map(|(name, spec)| ProviderRow {
             name: name.clone(),
-            kind: spec.kind.clone(),
+            kind: catalog::label_for(spec),
             base_url: spec.base_url.clone(),
             api_key_env: spec.api_key_env.clone(),
             key: store.has_with(name, spec.api_key_env.as_deref(), spec.api_key_helper.as_deref()),
@@ -261,7 +261,7 @@ pub fn model_for(cfg: &Config, name: &str) -> Option<String> {
         .or_else(|| {
             cfg.providers
                 .get(name)
-                .and_then(|spec| catalog::suggested_models(&spec.kind).first())
+                .and_then(|spec| catalog::suggested_for(spec).first())
                 .map(|m| m.to_string())
         })
 }
@@ -311,25 +311,251 @@ pub async fn test_provider(spec: &ProviderSpec, model: &str) -> Result<String, S
 }
 
 pub async fn list_models(spec: &ProviderSpec) -> Vec<String> {
-    let mut models: Vec<String> = catalog::suggested_models(&spec.kind)
+    let mut models: Vec<String> = catalog::suggested_for(spec)
         .iter()
         .map(|m| m.to_string())
         .collect();
-    if spec.kind == "ollama" {
-        let base = spec
-            .base_url
-            .clone()
-            .unwrap_or_else(|| "http://localhost:11434".to_string());
-        let probe = zarn_providers::OllamaProvider::new(base);
-        if let Ok(Ok(found)) = tokio::time::timeout(Duration::from_secs(5), probe.models()).await {
-            for model in found {
-                if !models.contains(&model) {
-                    models.push(model);
-                }
+    let usable = !catalog::needs_key(spec) || spec.api_key.as_deref().is_some_and(|k| !k.is_empty());
+    if usable
+        && let Ok(Ok(found)) =
+            tokio::time::timeout(Duration::from_secs(10), zarn_providers::discovery::models("setup", spec)).await
+    {
+        for model in found {
+            if !models.contains(&model.id) {
+                models.push(model.id);
             }
         }
     }
     models
+}
+
+const NOT_CHAT: &[&str] = &[
+    "embed", "whisper", "tts", "dall-e", "image", "moderation", "audio", "rerank", "guard", "transcribe",
+    "speech", "realtime", "search-preview", "omni-moderation", "babbage", "davinci",
+];
+
+pub fn is_chat_model(id: &str) -> bool {
+    let id = id.to_lowercase();
+    !NOT_CHAT.iter().any(|word| id.contains(word))
+}
+
+pub fn chat_models(found: &[ModelInfo]) -> Vec<&ModelInfo> {
+    found.iter().filter(|m| is_chat_model(&m.id)).collect()
+}
+
+pub fn pick_model(spec: &ProviderSpec, found: &[ModelInfo]) -> Option<String> {
+    let suggested = catalog::suggested_for(spec);
+    if let Some(model) = suggested.iter().find(|m| found.iter().any(|f| f.id == **m)) {
+        return Some(model.to_string());
+    }
+    chat_models(found)
+        .first()
+        .map(|m| m.id.clone())
+        .or_else(|| suggested.first().map(|m| m.to_string()))
+}
+
+fn rejected(err: &str) -> bool {
+    err.contains("the key was rejected") || err.contains("not allowed")
+}
+
+pub async fn check_key(name: &str, spec: &ProviderSpec, hint: Option<&str>) -> Result<Vec<ModelInfo>, String> {
+    let listed = tokio::time::timeout(TEST_TIMEOUT, zarn_providers::discovery::models(name, spec))
+        .await
+        .unwrap_or_else(|_| Err(format!("{name}: no answer within {} seconds", TEST_TIMEOUT.as_secs())));
+    match listed {
+        Ok(found) if !found.is_empty() => Ok(found),
+        Err(err) if rejected(&err) => Err(redact(&err)),
+        _ => {
+            let model = hint
+                .filter(|m| !m.is_empty())
+                .map(str::to_string)
+                .or_else(|| catalog::suggested_for(spec).first().map(|m| m.to_string()))
+                .unwrap_or_default();
+            if model.is_empty() {
+                return Err(format!(
+                    "{name}: could not list models with this key, and there is no known model to test it against"
+                ));
+            }
+            test_provider(spec, &model).await.map(|_| {
+                let mut known: Vec<ModelInfo> = catalog::suggested_for(spec)
+                    .iter()
+                    .map(|m| ModelInfo {
+                        id: m.to_string(),
+                        ..ModelInfo::default()
+                    })
+                    .collect();
+                if !known.iter().any(|m| m.id == model) {
+                    known.insert(
+                        0,
+                        ModelInfo {
+                            id: model.clone(),
+                            ..ModelInfo::default()
+                        },
+                    );
+                }
+                known
+            })
+        }
+    }
+}
+
+pub fn cache_models(dir: &std::path::Path, name: &str, spec: &ProviderSpec, models: &[ModelInfo]) {
+    let mut report = crate::quota::load_cached(dir, name).unwrap_or(crate::quota::Report {
+        provider: name.to_string(),
+        kind: spec.kind.clone(),
+        fetched_at: 0,
+        models: Ok(Vec::new()),
+        limits: Err("not probed yet".into()),
+        credits: Err("not probed yet".into()),
+    });
+    report.kind = spec.kind.clone();
+    report.fetched_at = crate::quota::now();
+    report.models = Ok(models.to_vec());
+    let _ = crate::quota::save(dir, &report);
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Connected {
+    pub provider: String,
+    pub place: String,
+    pub models: Vec<ModelInfo>,
+    pub model: Option<String>,
+    pub checked: bool,
+}
+
+impl Connected {
+    pub fn summary(&self) -> String {
+        let mut parts = vec![format!("{}: key saved to the {}", self.provider, self.place)];
+        if self.checked {
+            parts.push(match self.models.len() {
+                0 => "the key works".to_string(),
+                1 => "1 model found".to_string(),
+                n => format!("{n} models found"),
+            });
+        }
+        if let Some(model) = &self.model {
+            parts.push(format!("using {model}"));
+        }
+        parts.join(" · ")
+    }
+}
+
+pub fn spec_for(cfg: &Config, provider: &str) -> Result<ProviderSpec> {
+    if let Some(spec) = cfg.providers.get(provider) {
+        return Ok(spec.clone());
+    }
+    let kind = catalog::kind(provider).with_context(|| format!("unknown provider '{provider}'"))?;
+    Ok(ProviderDraft {
+        name: kind.id.to_string(),
+        kind: kind.id.to_string(),
+        ..ProviderDraft::default()
+    }
+    .spec())
+}
+
+pub async fn connect(
+    layers: &mut Layers,
+    store: &KeyStore,
+    cache: &std::path::Path,
+    provider: &str,
+    key: &str,
+    check: bool,
+) -> Result<Connected> {
+    crate::auth::register_secret(key);
+    let provider = catalog::kind(provider)
+        .filter(|_| !layers.merged().providers.contains_key(provider))
+        .map(|k| k.id.to_string())
+        .unwrap_or_else(|| provider.to_string());
+    let spec = spec_for(&layers.merged(), &provider)?;
+    let mut probe = spec.clone();
+    probe.api_key = Some(key.to_string());
+    let models = if check {
+        check_key(&provider, &probe, model_for(&layers.merged(), &provider).as_deref())
+            .await
+            .map_err(|err| anyhow!("the key was not saved: {}", redact(&err)))?
+    } else {
+        Vec::new()
+    };
+    let source = login(layers, store, &provider, key)?;
+    let model = adopt_models(layers, cache, &provider, &spec, &models)?;
+    Ok(Connected {
+        provider,
+        place: source.describe(store),
+        models,
+        model,
+        checked: check,
+    })
+}
+
+pub fn resolve_provider(cfg: &Config, provider: &str, key: &str) -> Result<String, String> {
+    if !provider.is_empty() && provider != "auto" {
+        return Ok(provider.to_string());
+    }
+    let configured = |kind: &catalog::Kind| {
+        cfg.providers
+            .iter()
+            .find(|(_, spec)| catalog::for_spec(spec).is_some_and(|k| k.id == kind.id))
+            .map(|(name, _)| name.clone())
+            .unwrap_or_else(|| kind.id.to_string())
+    };
+    match catalog::detect(key) {
+        catalog::Detected::One(kind) => Ok(configured(kind)),
+        catalog::Detected::Several(kinds) => {
+            let names: Vec<&str> = kinds.iter().map(|k| k.label).collect();
+            Err(format!(
+                "this key could belong to {}; pick the provider from the list so the key only goes to that one",
+                names.join(", ")
+            ))
+        }
+        catalog::Detected::Unknown => Err(
+            "zarn cannot tell which provider this key is for from its format; pick the provider from the list".into(),
+        ),
+    }
+}
+
+pub fn adopt_models(
+    layers: &mut Layers,
+    cache: &std::path::Path,
+    provider: &str,
+    spec: &ProviderSpec,
+    models: &[ModelInfo],
+) -> Result<Option<String>> {
+    if !models.is_empty() {
+        cache_models(cache, provider, spec, models);
+    }
+    let cfg = layers.merged();
+    let profile = cfg.default_profile();
+    let current = cfg.profiles.get(&profile).cloned().unwrap_or_default();
+    if current.provider.as_deref() != Some(provider) {
+        return Ok(None);
+    }
+    let keep = current
+        .model
+        .clone()
+        .filter(|m| models.is_empty() || models.iter().any(|f| f.id == *m));
+    Ok(match keep {
+        Some(m) => Some(m),
+        None => match pick_model(spec, models) {
+            Some(pick) => {
+                set_profile_model(layers, &profile, &pick)?;
+                Some(pick)
+            }
+            None => current.model,
+        },
+    })
+}
+
+pub fn use_model(layers: &mut Layers, provider: &str, model: &str) -> Result<String> {
+    let cfg = layers.merged();
+    if !cfg.providers.contains_key(provider) {
+        bail!("no provider named '{provider}'");
+    }
+    let profile = cfg.default_profile();
+    if cfg.profiles.get(&profile).and_then(|p| p.provider.as_deref()) != Some(provider) {
+        set_profile_provider(layers, &profile, provider)?;
+    }
+    set_profile_model(layers, &profile, model)?;
+    Ok(profile)
 }
 
 pub async fn model_choices(name: &str, spec: &ProviderSpec) -> Vec<(String, Option<u32>)> {

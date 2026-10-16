@@ -75,10 +75,10 @@ pub enum Command {
         #[command(subcommand)]
         action: ConfigAction,
     },
-    #[command(about = "Store an API key for a provider in the OS credential store")]
+    #[command(about = "Store an API key in the OS credential store and load the models it can use")]
     Login {
-        #[arg(help = "Provider name, e.g. anthropic, openai, google, or one you added")]
-        provider: String,
+        #[arg(help = "Provider name, e.g. anthropic, openai, google, groq, openrouter, or one you added; leave it out and zarn works it out from the key")]
+        provider: Option<String>,
     },
     #[command(about = "Open a page on localhost to add, test and remove API keys in your browser")]
     Setup {

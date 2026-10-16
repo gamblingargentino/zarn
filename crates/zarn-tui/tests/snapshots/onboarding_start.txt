@@ -8,19 +8,19 @@
 │machine.                                                                                │
 │Pick a provider                                                                         │
 │                                                                                        │
-│                                                                                        │
 │            ╭ Which provider do you want to use? ──────────────────────────╮            │
 │            │filter                                                        │            │
 │            │› Set up in your browser (a page on localhost)                │            │
 │            │  Anthropic (Claude)                                          │            │
 │            │  OpenAI                                                      │            │
 │            │  Google (Gemini)                                             │            │
-│            │  OpenAI-compatible (Groq, OpenRouter, Together, vLLM, LM Stu…│            │
-│            │  Ollama (local)                                              │            │
-│            │  Skip setup for now                                          │            │
-│            │                                                              │            │
+│            │  OpenRouter (hundreds of models, one key)                    │            │
+│            │  Groq                                                        │            │
+│            │  DeepSeek                                                    │            │
+│            │  Mistral                                                     │            │
+│            │  xAI (Grok)                                                  │            │
+│            │  Together AI                                                 │            │
 │            ╰──────────────────────────────────────────────────────────────╯            │
-│                                                                                        │
 │                                                                                        │
 │↑↓ choose · enter select                                                                │
 ╰────────────────────────────────────────────────────────────────────────────────────────╯

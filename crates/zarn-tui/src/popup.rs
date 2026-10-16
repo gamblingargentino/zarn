@@ -87,6 +87,7 @@ pub const SUBCOMMANDS: &[(&str, &str, &str, &str)] = &[
     ("permissions", "edit", "", "edit the rules in the settings panel"),
     ("models", "refresh", "", "query every provider again"),
     ("login", "web", "", "set up API keys in your browser"),
+    ("login", "auto", "", "paste any key; zarn works out the provider"),
     ("theme", "dark", "", "dark background"),
     ("theme", "light", "", "light background"),
     ("theme", "colorblind", "", "colorblind-safe colors"),

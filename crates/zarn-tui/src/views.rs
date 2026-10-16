@@ -221,7 +221,7 @@ pub fn draw_secret(
     hint: &str,
     accent: Color,
 ) {
-    let rect = centered(area, 72, 7);
+    let rect = centered(area, 72, 8);
     frame.render_widget(Clear, rect);
     let block = frame_block(title, accent);
     let inner = block.inner(rect);
