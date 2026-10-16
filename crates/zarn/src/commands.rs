@@ -538,3 +538,28 @@ pub fn plugin_remove(name: &str) -> Result<()> {
     println!("removed {name}");
     Ok(())
 }
+
+pub fn schedule_add(prompt: &str, when: Option<String>, mode: Option<String>) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let entry = zarn_config::schedule::Schedules::system().add(prompt, &cwd, when, mode)?;
+    println!("stored {}; zarn does not install schedulers itself. To run it with cron, add:\n  {}", entry.id, zarn_config::schedule::cron_line(&entry));
+    println!("On Windows, point a Task Scheduler action at: zarn run-scheduled {} (start in {})", entry.id, entry.cwd.display());
+    Ok(())
+}
+
+pub fn schedule_list() -> Result<()> {
+    let all = zarn_config::schedule::Schedules::system().list();
+    if all.is_empty() {
+        println!("no scheduled prompts; zarn schedule add \"<prompt>\"");
+    }
+    for entry in all {
+        println!("{}  {}  {}\n    {}", entry.id, entry.cwd.display(), entry.prompt, zarn_config::schedule::cron_line(&entry));
+    }
+    Ok(())
+}
+
+pub fn schedule_remove(id: &str) -> Result<()> {
+    let removed = zarn_config::schedule::Schedules::system().remove(id)?;
+    println!("removed {}; also delete its line from your crontab or Task Scheduler", removed.id);
+    Ok(())
+}

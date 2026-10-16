@@ -31,7 +31,7 @@ write big.txt (+80 -80)
   29 - old 29
   … 131 more diff lines ([e] expands)
   [y] once   [a] allow write(big.txt) for this session
-  [p] save that rule to the project   [u] save it to the user config   [e] expand   [n] no
+  save the rule: [p] project   [l] just for me   [u] user   [e] expand   [n] no
 
 
 default mode  ·  m  ·  0 in / 0 out  ·  no rate configured

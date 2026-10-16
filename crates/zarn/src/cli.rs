@@ -1,4 +1,13 @@
-use clap::{Args as ClapArgs, Parser, Subcommand};
+use clap::{Args as ClapArgs, Parser, Subcommand, ValueEnum};
+use std::path::PathBuf;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum)]
+pub enum OutputFormat {
+    #[default]
+    Text,
+    Json,
+    StreamJson,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "zarn", version)]
@@ -7,8 +16,38 @@ pub struct Args {
     #[command(subcommand)]
     pub command: Option<Command>,
 
-    #[arg(long, value_name = "PROMPT", help = "Run one turn and print to stdout")]
+    #[arg(long, value_name = "PROMPT", num_args = 0..=1, default_missing_value = "", help = "Run one turn and print to stdout; without PROMPT the prompt is read from stdin")]
     pub print: Option<String>,
+
+    #[arg(long = "output-format", value_enum, default_value_t = OutputFormat::Text, help = "Output of --print: text, json (one object at the end) or stream-json (one object per event per line)")]
+    pub output_format: OutputFormat,
+
+    #[arg(long = "allowed-tools", value_name = "RULES", value_delimiter = ',', help = "Allow these tools or rules without asking, e.g. read,bash(git diff:*)")]
+    pub allowed_tools: Vec<String>,
+
+    #[arg(long = "disallowed-tools", value_name = "RULES", value_delimiter = ',', help = "Deny these tools or rules; a bare tool name also hides the tool")]
+    pub disallowed_tools: Vec<String>,
+
+    #[arg(long = "max-turns", value_name = "N", help = "Stop after N model calls")]
+    pub max_turns: Option<usize>,
+
+    #[arg(long = "add-dir", value_name = "DIR", help = "Another directory the file tools may touch (repeatable)")]
+    pub add_dir: Vec<PathBuf>,
+
+    #[arg(long = "system-prompt-file", value_name = "FILE", help = "Replace zarn's base instructions with this file; ZARN.md, skills and the mode still follow")]
+    pub system_prompt_file: Option<PathBuf>,
+
+    #[arg(long = "append-system-prompt", value_name = "TEXT", help = "Add this text to the end of the system prompt")]
+    pub append_system_prompt: Option<String>,
+
+    #[arg(long = "no-session-persistence", help = "Do not save this --print run as a session")]
+    pub no_session_persistence: bool,
+
+    #[arg(long = "fork-session", help = "With --resume or --continue, copy the history into a new session and leave the original unchanged")]
+    pub fork_session: bool,
+
+    #[arg(long, value_name = "NAME", help = "Create or reuse .zarn/worktrees/NAME on a new branch and run there")]
+    pub worktree: Option<String>,
 
     #[arg(long = "continue", help = "Resume the most recent session for this directory")]
     pub continue_session: bool,
@@ -61,6 +100,13 @@ pub enum Command {
         #[command(subcommand)]
         action: Option<McpAction>,
     },
+    #[command(about = "Store prompts for an external scheduler such as cron to run with zarn run-scheduled")]
+    Schedule {
+        #[command(subcommand)]
+        action: Option<ScheduleAction>,
+    },
+    #[command(name = "run-scheduled", about = "Run a stored prompt headlessly; meant to be called by cron or Task Scheduler")]
+    RunScheduled { id: String },
     #[command(about = "Install, list, approve and remove plugins")]
     Plugin {
         #[command(subcommand)]
@@ -95,6 +141,22 @@ pub enum Command {
         #[arg(long, help = "Skip network probes and MCP server starts")]
         offline: bool,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ScheduleAction {
+    #[command(about = "Store a prompt to run in this directory")]
+    Add {
+        prompt: String,
+        #[arg(long, value_name = "CRON", help = "The cron expression you intend to use; only shown in the suggested crontab line")]
+        when: Option<String>,
+        #[arg(long, value_name = "MODE", help = "Mode for the run (never bypass)")]
+        mode: Option<String>,
+    },
+    #[command(about = "List stored prompts with a crontab line for each")]
+    List,
+    #[command(about = "Remove a stored prompt")]
+    Remove { id: String },
 }
 
 #[derive(Subcommand, Debug)]

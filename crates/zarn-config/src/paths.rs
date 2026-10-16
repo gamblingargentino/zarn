@@ -28,6 +28,10 @@ pub fn project_config() -> PathBuf {
     project_dir().join("config.toml")
 }
 
+pub fn local_config() -> PathBuf {
+    project_dir().join(crate::layers::LOCAL_FILE)
+}
+
 pub fn data_dir() -> PathBuf {
     let sessions = zarn_core::session::data_root();
     sessions

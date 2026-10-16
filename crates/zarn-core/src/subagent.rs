@@ -17,6 +17,7 @@ pub struct AgentDef {
     pub tools: Vec<String>,
     pub model: Option<String>,
     pub instructions: String,
+    pub isolation: Option<String>,
 }
 
 pub fn parse_definition(source: &str) -> Option<AgentDef> {
@@ -39,6 +40,7 @@ pub fn parse_definition(source: &str) -> Option<AgentDef> {
             "name" => def.name = value.to_string(),
             "description" => def.description = value.to_string(),
             "model" => def.model = Some(value.to_string()).filter(|v| !v.is_empty()),
+            "isolation" => def.isolation = Some(value.to_string()).filter(|v| !v.is_empty()),
             "tools" => {
                 def.tools = value
                     .trim_start_matches('[')
@@ -260,7 +262,22 @@ impl Runner {
             model: def.model.clone().unwrap_or_else(|| self.config.model.clone()),
             ..self.config.clone()
         };
-        let mut agent = Agent::new(provider, registry, self.ctx.clone(), config);
+        let isolated = match def.isolation.as_deref() {
+            Some("worktree") => match isolate(self.ctx.cwd(), &name, &id) {
+                Ok(isolated) => Some(isolated),
+                Err(err) => {
+                    let message = format!("{name} needs its own worktree, but it could not be made: {err:#}");
+                    self.report(&id, &name, TaskState::Finished { ok: false });
+                    return Err(message);
+                }
+            },
+            _ => None,
+        };
+        let ctx = match &isolated {
+            Some(iso) => Arc::new(Ctx::new(&iso.path)),
+            None => self.ctx.clone(),
+        };
+        let mut agent = Agent::new(provider, registry, ctx, config);
         if let Some(gate) = &self.gate {
             agent = agent.with_gate(gate.clone());
         }
@@ -316,9 +333,43 @@ impl Runner {
                 }
             }
         };
+        let outcome = match isolated {
+            None => outcome,
+            Some(iso) => {
+                let note = match crate::worktree::remove_if_clean(&iso.root, &iso.path, &iso.branch, &iso.base) {
+                    Ok(true) => String::new(),
+                    Ok(false) => format!(
+                        "\n\n[{name} worked in {} on branch {}; it has changes, so it was kept]",
+                        iso.path.display(),
+                        iso.branch
+                    ),
+                    Err(err) => format!("\n\n[the worktree {} could not be cleaned up: {err:#}]", iso.path.display()),
+                };
+                outcome.map(|text| format!("{text}{note}")).map_err(|err| format!("{err}{note}"))
+            }
+        };
         self.report(&id, &name, TaskState::Finished { ok: outcome.is_ok() });
         outcome
     }
+}
+
+struct Isolated {
+    root: std::path::PathBuf,
+    path: std::path::PathBuf,
+    branch: String,
+    base: String,
+}
+
+fn isolate(cwd: &Path, agent: &str, id: &str) -> Result<Isolated> {
+    let root = crate::worktree::repo_root(cwd)?;
+    let base = crate::worktree::head(&root)?;
+    let safe: String = agent
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+        .collect();
+    let branch = format!("zarn/{safe}-{id}");
+    let path = crate::worktree::create(&root, &branch)?;
+    Ok(Isolated { root, path, branch, base })
 }
 
 pub struct TaskTool {

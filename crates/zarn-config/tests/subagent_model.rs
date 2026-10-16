@@ -22,6 +22,7 @@ fn task(providers: &Providers, model: Option<&str>) -> TaskTool {
             tools: Vec::new(),
             model: model.map(str::to_string),
             instructions: "be brief".into(),
+            isolation: None,
         }],
         Router::new(providers.clone(), "main").factory(),
         Arc::new(|_: &[String]| ToolRegistry::new()),

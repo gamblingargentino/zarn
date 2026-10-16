@@ -13,7 +13,7 @@ pub struct AgentFile {
 
 pub fn dir(scope: Scope) -> Option<PathBuf> {
     match scope {
-        Scope::Project => Some(paths::project_dir().join("agents")),
+        Scope::Project | Scope::Local => Some(paths::project_dir().join("agents")),
         Scope::User => paths::user_dir().map(|d| d.join("agents")),
     }
 }
@@ -62,6 +62,9 @@ pub fn render(def: &AgentDef) -> String {
     out.push_str(&format!("description: {}\n", def.description.replace('\n', " ")));
     if !def.tools.is_empty() {
         out.push_str(&format!("tools: {}\n", def.tools.join(", ")));
+    }
+    if let Some(isolation) = &def.isolation {
+        out.push_str(&format!("isolation: {isolation}\n"));
     }
     if let Some(model) = &def.model {
         out.push_str(&format!("model: {model}\n"));
@@ -112,6 +115,7 @@ mod tests {
             tools: vec!["read".into(), "grep".into()],
             model: None,
             instructions: "Review carefully.".into(),
+            isolation: Some("worktree".into()),
         }
     }
 

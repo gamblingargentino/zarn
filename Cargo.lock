@@ -4509,6 +4509,7 @@ dependencies = [
  "tokio-util",
  "toml",
  "tracing",
+ "wiremock",
  "zarn-core",
 ]
 

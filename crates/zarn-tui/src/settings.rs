@@ -1233,7 +1233,7 @@ impl Panel {
                             FormField::new("name", ""),
                             FormField::new("command or url", "")
                                 .hint("e.g. npx -y @modelcontextprotocol/server-filesystem . or https://host/mcp"),
-                            FormField::new("scope", "user").hint("user or project"),
+                            FormField::new("scope", "user").hint("user, project or local (just for me, not committed)"),
                         ],
                     ),
                     FormFor::NewMcp,
@@ -1789,12 +1789,13 @@ impl Panel {
                     _ => form.value("name"),
                 };
                 let scope = match form.value("scope").as_str() {
-                    "project" => Some(Scope::Project),
-                    "user" => Some(Scope::User),
                     "" => None,
-                    other => {
-                        return retry(self, form, purpose, format!("scope must be user or project, not {other}"));
-                    }
+                    other => match Scope::parse(other) {
+                        Some(scope) => Some(scope),
+                        None => {
+                            return retry(self, form, purpose, format!("scope must be user, project or local (just for me), not {other}"));
+                        }
+                    },
                 };
                 let words = split_words(&form.value("command or url"));
                 let server = match ops::parse_server(&words) {
@@ -1817,6 +1818,10 @@ impl Panel {
                     tools: agents::split_tools(&form.value("tools")),
                     model: Some(form.value("model")).filter(|m| !m.is_empty()),
                     instructions: form.value("instructions"),
+                    isolation: match &purpose {
+                        FormFor::EditAgent(i) => self.agents.get(*i).and_then(|a| a.def.isolation.clone()),
+                        _ => None,
+                    },
                 };
                 if def.description.is_empty() {
                     return retry(self, form, purpose, "an agent needs a description so the model knows when to use it".into());
@@ -1833,7 +1838,7 @@ impl Panel {
                     }
                 };
                 let dir = match scope {
-                    Scope::Project => Some(self.agent_dirs.1.clone()),
+                    Scope::Project | Scope::Local => Some(self.agent_dirs.1.clone()),
                     Scope::User => self.agent_dirs.0.clone(),
                 };
                 let Some(dir) = dir else {

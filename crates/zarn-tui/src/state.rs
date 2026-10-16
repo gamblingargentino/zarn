@@ -185,6 +185,7 @@ pub enum ChatPick {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfirmFor {
     Bypass,
+    Commit(String),
     Prompted(String),
     Rewind(usize),
 }
@@ -1209,6 +1210,10 @@ impl App {
             KeyCode::Char('p') | KeyCode::Char('P') => {
                 self.answer_permission(Answer::Pattern(pattern.clone()));
                 return save(zarn_config::layers::Scope::Project);
+            }
+            KeyCode::Char('l') | KeyCode::Char('L') => {
+                self.answer_permission(Answer::Pattern(pattern.clone()));
+                return save(zarn_config::layers::Scope::Local);
             }
             KeyCode::Char('u') | KeyCode::Char('U') => {
                 self.answer_permission(Answer::Pattern(pattern.clone()));

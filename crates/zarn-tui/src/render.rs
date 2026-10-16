@@ -624,7 +624,7 @@ fn permission_lines(request: &crate::state::PermissionRequest, expanded: bool) -
     ));
     let expand = if request.preview.is_some() { "   [e] expand" } else { "" };
     lines.push(Line::styled(
-        format!("  [p] save that rule to the project   [u] save it to the user config{expand}   [n] no"),
+        format!("  save the rule: [p] project   [l] just for me   [u] user{expand}   [n] no"),
         warn,
     ));
     lines

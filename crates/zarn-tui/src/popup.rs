@@ -33,6 +33,11 @@ pub const BUILTINS: &[(&str, &str, &str)] = &[
     ("limits", "[session|day <usd|off>]", "show or set the spend caps"),
     ("resume", "[id]", "resume an earlier session in this directory"),
     ("rename", "<title>", "rename this session"),
+    ("review", "[focus]", "review the uncommitted changes"),
+    ("commit", "", "draft a commit message from the staged diff and commit after you confirm"),
+    ("pr", "", "draft a pull request title and body from this branch; nothing is sent anywhere"),
+    ("loop", "<interval> <prompt> | list | stop <id>", "re-run a prompt on an interval in this session"),
+    ("fork", "", "continue in a new session with this history; the original stays as it is"),
     ("tasks", "[cancel <id>]", "list background agents and their results"),
     ("plugins", "", "list, approve and remove plugins"),
     ("export", "[path]", "write the conversation to Markdown with keys redacted"),
@@ -207,8 +212,10 @@ mod tests {
     #[test]
     fn typing_narrows_the_list_with_prefix_matches_first() {
         let all = entries(&[], &[]);
-        let names: Vec<&str> = filter(&all, "lo").iter().map(|e| e.name.as_str()).collect();
+        let names: Vec<&str> = filter(&all, "log").iter().map(|e| e.name.as_str()).collect();
         assert_eq!(&names[..2], &["login", "logout"]);
+        let lo: Vec<&str> = filter(&all, "lo").iter().map(|e| e.name.as_str()).collect();
+        assert!(lo.iter().take(3).all(|n| n.starts_with("lo")), "{lo:?}");
         assert!(filter(&all, "").len() == all.len());
     }
 
@@ -216,15 +223,15 @@ mod tests {
     fn custom_commands_and_skills_join_the_popup_without_shadowing_builtins() {
         let all = entries(
             &[
-                ("review".into(), "<ref>".into(), "review a change".into()),
+                ("deploy".into(), "<env>".into(), "deploy a build".into()),
                 ("help".into(), String::new(), String::new()),
             ],
-            &[("pdf".into(), "fill PDFs".into()), ("review".into(), "x".into())],
+            &[("pdf".into(), "fill PDFs".into()), ("deploy".into(), "x".into())],
         );
         assert_eq!(all.iter().filter(|e| e.name == "help").count(), 1);
-        let review = all.iter().find(|e| e.name == "review").unwrap();
-        assert_eq!(review.origin, Origin::Custom);
-        assert_eq!((review.usage.as_str(), review.description.as_str()), ("<ref>", "review a change"));
+        let deploy = all.iter().find(|e| e.name == "deploy").unwrap();
+        assert_eq!(deploy.origin, Origin::Custom);
+        assert_eq!((deploy.usage.as_str(), deploy.description.as_str()), ("<env>", "deploy a build"));
         assert_eq!(
             all.iter().find(|e| e.name == "pdf").unwrap().origin,
             Origin::Skill

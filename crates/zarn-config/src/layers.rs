@@ -4,25 +4,49 @@ use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Scope {
+    Local,
     Project,
     User,
 }
 
+pub const LOCAL_FILE: &str = "config.local.toml";
+
 impl Scope {
+    pub const ALL: [Scope; 3] = [Scope::Local, Scope::Project, Scope::User];
+
     pub fn label(&self) -> &'static str {
         match self {
+            Scope::Local => "local",
             Scope::Project => "project",
             Scope::User => "user",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Scope> {
+        match text.trim() {
+            "local" | "me" | "just for me" => Some(Scope::Local),
+            "project" => Some(Scope::Project),
+            "user" | "" => Some(Scope::User),
+            _ => None,
         }
     }
 }
 
 #[derive(Clone, Debug)]
 pub struct Layers {
+    pub local_path: PathBuf,
     pub project_path: PathBuf,
     pub user_path: Option<PathBuf>,
+    pub local: Config,
     pub project: Config,
     pub user: Config,
+}
+
+pub fn local_beside(project_path: &Path) -> PathBuf {
+    project_path
+        .parent()
+        .map(|d| d.join(LOCAL_FILE))
+        .unwrap_or_else(|| PathBuf::from(LOCAL_FILE))
 }
 
 fn read_layer(path: &Path) -> Result<Config> {
@@ -39,14 +63,18 @@ impl Layers {
     }
 
     pub fn load_from(project_path: PathBuf, user_path: Option<PathBuf>) -> Result<Self> {
+        let local_path = local_beside(&project_path);
+        let local = read_layer(&local_path)?;
         let project = read_layer(&project_path)?;
         let user = match &user_path {
             Some(path) => read_layer(path)?,
             None => Config::default(),
         };
         let layers = Layers {
+            local_path,
             project_path,
             user_path,
+            local,
             project,
             user,
         };
@@ -55,7 +83,8 @@ impl Layers {
     }
 
     pub fn merged(&self) -> Config {
-        let mut merged = self.project.clone();
+        let mut merged = self.local.clone();
+        merged.merge(self.project.clone());
         merged.merge(self.user.clone());
         crate::plugins::contribute(&mut merged);
         merged
@@ -63,6 +92,7 @@ impl Layers {
 
     pub fn layer(&self, scope: Scope) -> &Config {
         match scope {
+            Scope::Local => &self.local,
             Scope::Project => &self.project,
             Scope::User => &self.user,
         }
@@ -70,6 +100,7 @@ impl Layers {
 
     pub fn layer_mut(&mut self, scope: Scope) -> &mut Config {
         match scope {
+            Scope::Local => &mut self.local,
             Scope::Project => &mut self.project,
             Scope::User => &mut self.user,
         }
@@ -77,6 +108,7 @@ impl Layers {
 
     pub fn path(&self, scope: Scope) -> Option<&Path> {
         match scope {
+            Scope::Local => Some(&self.local_path),
             Scope::Project => Some(&self.project_path),
             Scope::User => self.user_path.as_deref(),
         }
@@ -104,33 +136,40 @@ impl Layers {
         Ok(path.to_path_buf())
     }
 
-    fn pick(&self, in_project: bool) -> Scope {
-        if in_project { Scope::Project } else { Scope::User }
+    pub fn find(&self, has: impl Fn(&Config) -> bool) -> Scope {
+        if has(&self.local) {
+            Scope::Local
+        } else if has(&self.project) {
+            Scope::Project
+        } else {
+            Scope::User
+        }
     }
 
     pub fn provider_scope(&self, name: &str) -> Scope {
-        self.pick(self.project.providers.contains_key(name))
+        self.find(|c| c.providers.contains_key(name))
     }
 
     pub fn profile_scope(&self, name: &str) -> Scope {
-        self.pick(self.project.profiles.contains_key(name))
+        self.find(|c| c.profiles.contains_key(name))
     }
 
     pub fn permission_scope(&self, tool: &str) -> Scope {
-        self.pick(self.project.permissions.contains_key(tool))
+        self.find(|c| c.permissions.contains_key(tool))
     }
 
     pub fn skill_scope(&self, name: &str) -> Scope {
-        self.pick(self.project.skills.contains_key(name))
+        self.find(|c| c.skills.contains_key(name))
     }
 
     pub fn mcp_scope(&self, name: &str) -> Scope {
-        self.pick(self.project.mcp.contains_key(name))
+        self.find(|c| c.mcp.contains_key(name))
     }
 
     pub fn general_scope(&self, field: GeneralField) -> Scope {
-        let g = &self.project.general;
-        self.pick(match field {
+        self.find(|c| {
+            let g = &c.general;
+            match field {
             GeneralField::DefaultProfile => g.default_profile.is_some(),
             GeneralField::Accent => g.accent.is_some(),
             GeneralField::Banner => g.banner.is_some(),
@@ -145,20 +184,20 @@ impl Layers {
             GeneralField::Notifications => g.notifications.is_some(),
             GeneralField::StatusLine => g.status_line.is_some(),
             GeneralField::Mouse => g.mouse.is_some(),
+            }
         })
     }
 
     pub fn limits_scope(&self, day: bool) -> Scope {
-        let l = &self.project.limits;
-        self.pick(if day { l.day_usd.is_some() } else { l.session_usd.is_some() })
+        self.find(|c| if day { c.limits.day_usd.is_some() } else { c.limits.session_usd.is_some() })
     }
 
     pub fn routing_scope(&self) -> Scope {
-        self.pick(self.project.routing.enabled.is_some())
+        self.find(|c| c.routing.enabled.is_some())
     }
 
     pub fn role_scope(&self, role: &str) -> Scope {
-        self.pick(self.project.routing.roles.contains_key(role))
+        self.find(|c| c.routing.roles.contains_key(role))
     }
 }
 
@@ -242,5 +281,25 @@ mod tests {
         );
         l.user.providers.clear();
         assert!(l.save(Scope::User).is_err());
+    }
+
+    #[test]
+    fn the_local_layer_sits_above_project_and_takes_its_own_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(LOCAL_FILE), "[general]\naccent = \"red\"\n").unwrap();
+        let mut l = layers(dir.path(), "[general]\naccent = \"cyan\"\nbanner = false\n", "");
+        assert_eq!(l.local_path, dir.path().join(LOCAL_FILE));
+        let merged = l.merged();
+        assert_eq!(merged.general.accent.as_deref(), Some("red"));
+        assert_eq!(merged.general.banner, Some(false));
+        assert_eq!(l.general_scope(GeneralField::Accent), Scope::Local);
+        assert_eq!(l.general_scope(GeneralField::Banner), Scope::Project);
+        l.layer_mut(Scope::Local).general.vim = Some(true);
+        l.save(Scope::Local).unwrap();
+        let local = std::fs::read_to_string(dir.path().join(LOCAL_FILE)).unwrap();
+        assert!(local.contains("vim = true"));
+        assert!(!std::fs::read_to_string(dir.path().join("project.toml")).unwrap().contains("vim"));
+        assert_eq!(Scope::parse("just for me"), Some(Scope::Local));
+        assert_eq!(Scope::parse("nowhere"), None);
     }
 }

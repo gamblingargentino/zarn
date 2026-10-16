@@ -188,7 +188,7 @@ pub fn remove_provider(layers: &mut Layers, store: &KeyStore, name: &str) -> Res
     if !layers.merged().providers.contains_key(name) {
         bail!("no provider named '{name}'");
     }
-    for scope in [Scope::Project, Scope::User] {
+    for scope in Scope::ALL {
         let layer = layers.layer_mut(scope);
         layer.providers.remove(name);
         for profile in layer.profiles.values_mut() {
@@ -198,7 +198,7 @@ pub fn remove_provider(layers: &mut Layers, store: &KeyStore, name: &str) -> Res
             .profiles
             .retain(|_, p| p.provider.is_some() || p.model.is_some() || p.fallback.is_some());
     }
-    for scope in [Scope::Project, Scope::User] {
+    for scope in Scope::ALL {
         if layers.path(scope).is_some_and(|p| p.exists()) {
             layers.save(scope)?;
         }
@@ -472,7 +472,7 @@ pub fn add_permission_rule(
 
 pub fn remove_permission_rule(layers: &mut Layers, policy: Policy, rule: &str) -> Result<()> {
     let mut found = false;
-    for scope in [Scope::Project, Scope::User] {
+    for scope in Scope::ALL {
         let rules = &mut layers.layer_mut(scope).permissions.rules;
         let list = match policy {
             Policy::Allow => &mut rules.allow,
@@ -493,8 +493,7 @@ pub fn remove_permission_rule(layers: &mut Layers, policy: Policy, rule: &str) -
 }
 
 pub fn rule_scope(layers: &Layers, rule: &str) -> Scope {
-    let has = |c: &Config| c.permissions.rules.list().iter().any(|(_, r)| r == rule);
-    if has(&layers.project) { Scope::Project } else { Scope::User }
+    layers.find(|c| c.permissions.rules.list().iter().any(|(_, r)| r == rule))
 }
 
 pub fn set_permission(layers: &mut Layers, tool: &str, policy: Policy) -> Result<Scope> {
@@ -584,7 +583,7 @@ pub fn set_role(
 
 pub fn clear_role(layers: &mut Layers, role: &str) -> Result<()> {
     let mut found = false;
-    for scope in [Scope::Project, Scope::User] {
+    for scope in Scope::ALL {
         if layers.layer_mut(scope).routing.roles.remove(role).is_some() {
             found = true;
             layers.save(scope)?;
@@ -643,7 +642,7 @@ pub fn mcp_add(
 
 pub fn mcp_remove(layers: &mut Layers, name: &str) -> Result<()> {
     let mut found = false;
-    for scope in [Scope::Project, Scope::User] {
+    for scope in Scope::ALL {
         if layers.layer_mut(scope).mcp.remove(name).is_some() {
             found = true;
             layers.save(scope)?;

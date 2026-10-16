@@ -87,6 +87,8 @@ pub struct Options {
     pub resume: Option<PathBuf>,
     pub store: Option<Arc<KeyStore>>,
     pub mode: Option<String>,
+    pub fork: bool,
+    pub add_dirs: Vec<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -139,6 +141,9 @@ enum UiEvent {
     Task(zarn_core::subagent::TaskUpdate),
     Expanded { result: Result<String, String>, model: Option<String> },
     McpChanged(String),
+    CommitDraft(Result<String, String>),
+    Committed(Result<String, String>),
+    PrDraft(Result<(String, String), String>),
     McpLoggedIn { name: String, result: Result<(), String> },
     McpRefreshed { name: String, result: Result<usize, String> },
     McpPrompt(Result<String, String>),
@@ -178,6 +183,15 @@ pub async fn run(options: Options) -> Result<()> {
     );
     ratatui::restore();
     outcome
+}
+
+type GitContext = (Arc<dyn zarn_core::provider::Provider>, String, Arc<dyn zarn_core::agent::ToolGate>);
+
+struct LoopJob {
+    id: usize,
+    every: std::time::Duration,
+    prompt: String,
+    next: std::time::Instant,
 }
 
 pub struct Controller {
@@ -232,6 +246,8 @@ pub struct Controller {
     background: Arc<zarn_core::subagent::Background>,
     waiting: std::collections::VecDeque<PermissionRequest>,
     turn_model: Option<String>,
+    loops: Vec<LoopJob>,
+    loop_count: usize,
     memory: Arc<context::NestedMemory>,
     mouse: bool,
     mouse_on: bool,
@@ -325,6 +341,8 @@ impl Controller {
             background: zarn_core::subagent::Background::new(),
             waiting: std::collections::VecDeque::new(),
             turn_model: None,
+            loops: Vec::new(),
+            loop_count: 0,
             memory: context::NestedMemory::new(&cwd_for_memory),
             mouse: false,
             mouse_on: false,
@@ -645,6 +663,7 @@ impl Controller {
         for err in cfg.apply_permissions(&self.gate, &self.cwd) {
             self.app.notice(format!("permission rule ignored: {err}"));
         }
+        self.gate.set_boundary(Some(self.options.add_dirs.clone()));
         self.sync_mcp(&cfg);
         self.refresh_entries(&cfg);
 
@@ -955,6 +974,7 @@ impl Controller {
         let mut ui_rx = self.ui_rx.take().expect("receiver");
         let mut keys = EventStream::new();
         let mut frames = tokio::time::interval(FRAME_INTERVAL);
+        let mut loop_tick = tokio::time::interval(std::time::Duration::from_secs(1));
 
         loop {
             if self.mouse != self.mouse_on {
@@ -968,6 +988,7 @@ impl Controller {
             terminal.draw(|frame| render::draw(frame, &self.app))?;
 
             tokio::select! {
+                _ = loop_tick.tick(), if !self.loops.is_empty() => self.fire_loops(),
                 _ = frames.tick(), if self.app.streaming || self.panel_loading() => {
                     self.app.advance_frame();
                     if let Mode::Panel(panel) = &mut self.app.mode {
@@ -1106,6 +1127,9 @@ impl Controller {
     }
 
     pub async fn pump(&mut self, wait: std::time::Duration) -> bool {
+        if !self.loops.is_empty() {
+            self.fire_loops();
+        }
         let Some(mut ui_rx) = self.ui_rx.take() else {
             return false;
         };
@@ -1253,6 +1277,7 @@ impl Controller {
             Action::SendQueued => self.send_next(),
             Action::CycleMode => self.cycle_mode(),
             Action::Confirmed(ConfirmFor::Bypass) => self.set_mode("bypass", true),
+            Action::Confirmed(ConfirmFor::Commit(message)) => self.commit(message),
             Action::Confirmed(ConfirmFor::Rewind(turn)) => self.rewind(turn),
             Action::Confirmed(ConfirmFor::Prompted(provider)) => {
                 let result = match self.layers() {
@@ -1410,6 +1435,199 @@ impl Controller {
             return;
         }
         self.app.notice(format!("no clipboard is available here; the last reply is:\n{reply}"));
+    }
+
+    fn git_context(&mut self, what: &str) -> Option<GitContext> {
+        if self.app.streaming {
+            self.app.notice(format!("wait for the current turn to finish before /{what}"));
+            return None;
+        }
+        let Some(rt) = &self.runtime else {
+            self.app.notice(format!("/{what} needs a provider; run /login or /config"));
+            return None;
+        };
+        Some((rt.provider.clone(), rt.model.clone(), self.hooked_gate()))
+    }
+
+    fn start_commit(&mut self) {
+        let Some((provider, model, gate)) = self.git_context("commit") else { return };
+        let trailer = self.cfg().git.commit_trailer.clone();
+        let ctx = self.ctx.clone();
+        let tx = self.ui_tx.clone();
+        self.app.streaming = true;
+        self.app.notice("drafting a commit message from the staged diff…");
+        tokio::spawn(async move {
+            let result = async {
+                let diff = run_git(&ctx, gate.as_ref(), "git diff --cached").await?;
+                if diff.trim().is_empty() || diff.trim() == "command succeeded with no output" {
+                    return Err("nothing is staged; stage changes with git add first".to_string());
+                }
+                let raw = zarn_config::git::draft(provider.as_ref(), &model, zarn_config::git::COMMIT, &diff).await?;
+                Ok(zarn_config::git::clean_message(&raw, trailer.as_deref()))
+            }
+            .await;
+            let _ = tx.send(UiEvent::CommitDraft(result)).await;
+        });
+    }
+
+    fn commit(&mut self, message: String) {
+        let gate = self.hooked_gate();
+        let cwd = self.cwd.clone();
+        let tx = self.ui_tx.clone();
+        let file = paths::data_dir().join(format!("commit-message-{}.txt", std::process::id()));
+        let command = format!("git commit -F {}", file.display());
+        if let Ok(rule) = zarn_tools::permissions::parse_rule(&format!("bash({command})")) {
+            self.gate.set_turn_rules(vec![rule]);
+        }
+        self.app.streaming = true;
+        tokio::spawn(async move {
+            let result = async {
+                if let Some(parent) = file.parent() {
+                    std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+                }
+                std::fs::write(&file, format!("{message}\n")).map_err(|e| e.to_string())?;
+                let args = serde_json::json!({ "command": command });
+                if let zarn_core::agent::GateDecision::Deny(reason) = gate.check("bash", zarn_core::tools::Risk::Execute, &args).await {
+                    return Err(reason);
+                }
+                let output = tokio::process::Command::new("git")
+                    .arg("commit")
+                    .arg("-F")
+                    .arg(&file)
+                    .current_dir(&cwd)
+                    .output()
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let text = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+                if output.status.success() { Ok(text) } else { Err(text) }
+            }
+            .await;
+            let _ = std::fs::remove_file(&file);
+            let _ = tx.send(UiEvent::Committed(result.map_err(|e| zarn_config::auth::redact(&e)))).await;
+        });
+    }
+
+    fn start_pr(&mut self) {
+        let Some((provider, model, gate)) = self.git_context("pr") else { return };
+        let ctx = self.ctx.clone();
+        let cwd = self.cwd.clone();
+        let tx = self.ui_tx.clone();
+        self.app.streaming = true;
+        self.app.notice("drafting a pull request from this branch…");
+        tokio::spawn(async move {
+            let result = async {
+                let mut base = "master".to_string();
+                for candidate in ["origin/HEAD", "main"] {
+                    if run_git(&ctx, gate.as_ref(), &format!("git log -1 --format=%H {candidate}")).await.is_ok() {
+                        base = candidate.to_string();
+                        break;
+                    }
+                }
+                let log = run_git(&ctx, gate.as_ref(), &format!("git log --oneline {base}..HEAD")).await?;
+                let diff = run_git(&ctx, gate.as_ref(), &format!("git diff {base}...HEAD")).await?;
+                let empty = |t: &str| t.trim().is_empty() || t.trim() == "command succeeded with no output";
+                if empty(&log) && empty(&diff) {
+                    return Err(format!("this branch has no changes against {base}"));
+                }
+                let material = format!("Commits:\n{log}\n\nDiff against {base}:\n{diff}");
+                let raw = zarn_config::git::draft(provider.as_ref(), &model, zarn_config::git::PR, &material).await?;
+                let (title, body) = zarn_config::git::split_pr(&raw);
+                let file = cwd.join(".zarn").join("pr.md");
+                if let Some(parent) = file.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                let _ = std::fs::write(&file, format!("# {title}\n\n{body}\n"));
+                Ok((title, body))
+            }
+            .await;
+            let _ = tx.send(UiEvent::PrDraft(result)).await;
+        });
+    }
+
+    fn loop_command(&mut self, line: &str) {
+        let rest = line.trim_start().trim_start_matches('/').trim_start_matches("loop").trim();
+        let (head, tail) = rest.split_once(char::is_whitespace).map(|(a, b)| (a, b.trim())).unwrap_or((rest, ""));
+        match head {
+            "" | "list" => {
+                if self.loops.is_empty() {
+                    self.app.notice("no loops; /loop <interval> <prompt>, for example /loop 10m check the CI status");
+                    return;
+                }
+                let lines: Vec<String> = self
+                    .loops
+                    .iter()
+                    .map(|l| format!("  {}  every {}  {}", l.id, zarn_config::schedule::label(l.every), l.prompt))
+                    .collect();
+                self.app.notice(format!("loops in this session\n{}\n/loop stop <id|all> ends them", lines.join("\n")));
+            }
+            "stop" => {
+                let before = self.loops.len();
+                if tail == "all" || tail.is_empty() {
+                    self.loops.clear();
+                } else {
+                    self.loops.retain(|l| l.id.to_string() != tail);
+                }
+                self.app.notice(format!("stopped {} loop{}", before - self.loops.len(), if before - self.loops.len() == 1 { "" } else { "s" }));
+            }
+            interval => {
+                let every = match zarn_config::schedule::parse_interval(interval) {
+                    Ok(every) => every,
+                    Err(err) => return self.app.notice(format!("{err:#}")),
+                };
+                if tail.is_empty() {
+                    self.app.notice("usage: /loop <interval> <prompt>");
+                    return;
+                }
+                self.loop_count += 1;
+                let id = self.loop_count;
+                self.loops.push(LoopJob {
+                    id,
+                    every,
+                    prompt: tail.to_string(),
+                    next: std::time::Instant::now(),
+                });
+                self.app.notice(format!(
+                    "loop {id}: \"{tail}\" every {}, starting now; it stops when you quit or run /loop stop {id}",
+                    zarn_config::schedule::label(every)
+                ));
+                self.fire_loops();
+            }
+        }
+    }
+
+    fn fire_loops(&mut self) {
+        if self.app.streaming || !self.app.queue.is_empty() || self.app.pending.is_some() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let Some(job) = self.loops.iter_mut().find(|l| l.next <= now) else { return };
+        job.next = now + job.every;
+        let prompt = job.prompt.clone();
+        self.submit(prompt);
+    }
+
+    fn fork(&mut self) {
+        if self.messages.len() <= 1 {
+            self.app.notice("nothing to fork yet");
+            return;
+        }
+        if self.app.streaming {
+            self.app.notice("wait for the current turn to finish before forking");
+            return;
+        }
+        self.persist();
+        let original = self.session.as_ref().map(|s| s.meta().id.clone());
+        self.session = None;
+        self.persisted = 1;
+        if let Some(title) = self.title.clone() {
+            self.title = Some(format!("fork of {title}"));
+        }
+        self.persist();
+        let fresh = self.session.as_ref().map(|s| s.meta().id.clone()).unwrap_or_default();
+        self.app.notice(match original {
+            Some(original) => format!("forked into {fresh}; {original} is unchanged"),
+            None => format!("forked into {fresh}"),
+        });
     }
 
     fn rename(&mut self, title: &str) {
@@ -2204,6 +2422,35 @@ impl Controller {
                 }
                 Err(err) => self.app.notice(format!("login to {name} failed: {err}")),
             },
+            UiEvent::CommitDraft(result) => {
+                self.app.streaming = false;
+                match result {
+                    Ok(message) => {
+                        self.app.overlay = Some(Overlay::Confirm(
+                            format!("Commit the staged changes with this message?\n\n{message}\n\n[y] commit   [n] cancel"),
+                            ConfirmFor::Commit(message),
+                        ));
+                    }
+                    Err(err) => self.app.notice(format!("/commit: {err}")),
+                }
+            }
+            UiEvent::Committed(result) => {
+                self.app.streaming = false;
+                self.gate.clear_turn_rules();
+                match result {
+                    Ok(output) => self.app.notice(format!("committed\n{}", output.trim())),
+                    Err(err) => self.app.notice(format!("commit failed: {err}")),
+                }
+            }
+            UiEvent::PrDraft(result) => {
+                self.app.streaming = false;
+                match result {
+                    Ok((title, body)) => self.app.notice(format!(
+                        "pull request draft (nothing was sent anywhere; also saved to .zarn/pr.md)\n\nTitle: {title}\n\n{body}"
+                    )),
+                    Err(err) => self.app.notice(format!("/pr: {err}")),
+                }
+            }
             UiEvent::McpChanged(name) => {
                 if let Some(server) = self.mcp.get(&name).and_then(|s| s.server.clone()) {
                     let tx = self.ui_tx.clone();
@@ -2327,6 +2574,9 @@ impl Controller {
             return;
         };
         let start = self.persisted.clamp(1, self.messages.len());
+        if start >= self.messages.len() {
+            return;
+        }
         if let Err(err) = guard::append_redacted(session, &self.messages[start..]) {
             self.app.notice(format!("session write failed: {err:#}"));
             return;
@@ -2353,6 +2603,16 @@ impl Controller {
                 self.messages = vec![Message::System(self.system.clone())];
                 self.messages.extend(loaded);
                 self.app.blocks = flatten_messages(&self.messages);
+                if self.options.fork {
+                    self.session = None;
+                    self.persisted = 1;
+                    self.app.notice(format!(
+                        "forked {} ({} messages); your next message starts a new session and the original is unchanged",
+                        meta.id,
+                        self.messages.len() - 1
+                    ));
+                    return;
+                }
                 match Session::open(path) {
                     Ok(opened) => self.session = Some(opened),
                     Err(err) => self.app.notice(format!("cannot append to that session: {err:#}")),
@@ -2597,8 +2857,10 @@ impl Controller {
 
     fn provider_picker(&self, title: &str, with_kinds: bool, only_with_keys: bool) -> Picker {
         let layers = self.layers.clone().unwrap_or_else(|| Layers {
+            local_path: paths::local_config(),
             project_path: paths::project_config(),
             user_path: paths::user_config(),
+            local: Config::default(),
             project: Config::default(),
             user: Config::default(),
         });
@@ -2818,6 +3080,14 @@ impl Controller {
                 });
             }
             "export" => self.export(first),
+            "loop" => self.loop_command(line),
+            "review" => {
+                let focus = line.trim_start().trim_start_matches('/').trim_start_matches("review").trim();
+                self.submit(zarn_config::git::review_prompt(focus));
+            }
+            "commit" => self.start_commit(),
+            "pr" => self.start_pr(),
+            "fork" => self.fork(),
             "tasks" => match (first, line.split_whitespace().nth(2)) {
                 (Some("cancel"), Some(id)) => match self.background.cancel(id) {
                     Ok(text) => self.app.notice(text),
@@ -3289,6 +3559,18 @@ async fn compare_one(
             meta: "timed out".into(),
             failed: true,
         },
+    }
+}
+
+async fn run_git(ctx: &Ctx, gate: &dyn zarn_core::agent::ToolGate, command: &str) -> Result<String, String> {
+    let args = serde_json::json!({ "command": command });
+    if let zarn_core::agent::GateDecision::Deny(reason) = gate.check("bash", zarn_core::tools::Risk::Execute, &args).await {
+        return Err(format!("{command} was not run: {reason}"));
+    }
+    match zarn_core::tools::Tool::run(&zarn_tools::bash::Bash::new(), args, ctx).await {
+        Ok(out) if !out.is_error => Ok(out.content),
+        Ok(out) => Err(out.content),
+        Err(err) => Err(format!("{err:#}")),
     }
 }
 

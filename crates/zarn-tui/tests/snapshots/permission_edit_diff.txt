@@ -11,7 +11,7 @@ edit lib.rs (+3 -1)
   10   fn step_8() {}
   11   fn step_9() {}
   [y] once   [a] allow edit(lib.rs) for this session
-  [p] save that rule to the project   [u] save it to the user config   [e] expand   [n] no
+  save the rule: [p] project   [l] just for me   [u] user   [e] expand   [n] no
 
 
 default mode  ·  m  ·  0 in / 0 out  ·  no rate configured

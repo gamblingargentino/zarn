@@ -273,6 +273,7 @@ pub struct Permissions {
     rules: RwLock<Vec<(Policy, Rule)>>,
     session_rules: Mutex<Vec<Rule>>,
     turn_rules: Mutex<Vec<Rule>>,
+    boundary: RwLock<Option<Vec<PathBuf>>>,
     cwd: RwLock<PathBuf>,
     safe: RwLock<Option<Vec<String>>>,
     configured: RwLock<HashMap<String, Policy>>,
@@ -293,6 +294,7 @@ impl Permissions {
             rules: RwLock::new(Vec::new()),
             session_rules: Mutex::new(Vec::new()),
             turn_rules: Mutex::new(Vec::new()),
+            boundary: RwLock::new(None),
             cwd: RwLock::new(PathBuf::from(".")),
             safe: RwLock::new(Some(crate::safe_shell::defaults())),
             configured: RwLock::new(HashMap::new()),
@@ -392,6 +394,44 @@ impl Permissions {
         })
     }
 
+    pub fn set_boundary(&self, extra: Option<Vec<PathBuf>>) {
+        let cwd = self.cwd();
+        let roots = extra.map(|dirs| {
+            let mut roots = vec![cwd.clone()];
+            for dir in dirs {
+                let full = if dir.is_absolute() { dir } else { cwd.join(dir) };
+                if let Ok(real) = full.canonicalize() {
+                    roots.push(real);
+                }
+                roots.push(full);
+            }
+            if let Ok(real) = cwd.canonicalize() {
+                roots.push(real);
+            }
+            roots
+        });
+        if let Ok(mut current) = self.boundary.write() {
+            *current = roots;
+        }
+    }
+
+    pub fn boundary(&self) -> Option<Vec<PathBuf>> {
+        self.boundary.read().ok().and_then(|b| b.clone())
+    }
+
+    fn outside(&self, name: &str, args: &Value) -> Option<String> {
+        if !FILE_TOOLS.contains(&name) && name != "glob" && name != "grep" {
+            return None;
+        }
+        let roots = self.boundary()?;
+        let path = arg_path(args)?;
+        let cwd = self.cwd();
+        let absolute = if Path::new(path).is_absolute() { PathBuf::from(path) } else { cwd.join(path) };
+        let text = absolute.to_string_lossy().to_string();
+        let inside = roots.iter().any(|root| relative(&text, root).is_some());
+        (!inside).then(|| path.to_string())
+    }
+
     pub fn set_turn_rules(&self, rules: Vec<Rule>) {
         if let Ok(mut current) = self.turn_rules.lock() {
             *current = rules;
@@ -448,6 +488,11 @@ impl Permissions {
         let overlay = self.overlay();
         if overlay.policies.get(name) == Some(&Policy::Deny) {
             return (Policy::Deny, format!("{} mode", overlay.name));
+        }
+        if !overlay.allow_all
+            && let Some(path) = self.outside(name, args)
+        {
+            return (Policy::Ask, format!("{path} is outside the working directory; allow it with --add-dir"));
         }
         if let Some(rule) = self.rule_hit(Policy::Ask, name, args)
             && !overlay.allow_all
@@ -557,6 +602,9 @@ impl ToolGate for Permissions {
                         self.allow_for_session(name);
                     }
                     GateDecision::Allow
+                }
+                Answer::No if why.contains("outside the working directory") => {
+                    GateDecision::Deny(format!("{name} was refused: {why}"))
                 }
                 Answer::No => GateDecision::Deny(format!("user denied {name}")),
             },

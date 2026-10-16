@@ -3,6 +3,7 @@ pub mod auth;
 pub mod catalog;
 pub mod context;
 pub mod doctor;
+pub mod git;
 pub mod guard;
 pub mod health;
 pub mod hooks;
@@ -16,6 +17,7 @@ pub mod pricing;
 pub mod quota;
 pub mod refs;
 pub mod runtime;
+pub mod schedule;
 pub mod spend;
 pub mod titles;
 
@@ -285,6 +287,20 @@ pub struct Config {
     pub hooks: hooks::Hooks,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub websearch: Option<WebSearchConfig>,
+    #[serde(default, skip_serializing_if = "GitConfig::is_empty")]
+    pub git: GitConfig,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commit_trailer: Option<String>,
+}
+
+impl GitConfig {
+    pub fn is_empty(&self) -> bool {
+        self.commit_trailer.is_none()
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -359,6 +375,9 @@ impl Config {
         if self.websearch.is_none() {
             self.websearch = other.websearch;
         }
+        if self.git.commit_trailer.is_none() {
+            self.git.commit_trailer = other.git.commit_trailer;
+        }
     }
 
     pub fn home_path() -> Option<PathBuf> {
@@ -366,7 +385,7 @@ impl Config {
     }
 
     pub fn sources() -> Vec<PathBuf> {
-        let mut paths = vec![PathBuf::from(LOCAL_PATH)];
+        let mut paths = vec![layers::local_beside(std::path::Path::new(LOCAL_PATH)), PathBuf::from(LOCAL_PATH)];
         if let Some(home) = Self::home_path() {
             paths.push(home);
         }

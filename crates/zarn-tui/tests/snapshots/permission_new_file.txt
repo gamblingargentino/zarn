@@ -3,7 +3,7 @@ write new file notes/todo.md (+3 -0)
   2 +
   3 + - ship it
   [y] once   [a] allow write(notes/todo.md) for this session
-  [p] save that rule to the project   [u] save it to the user config   [e] expand   [n] no
+  save the rule: [p] project   [l] just for me   [u] user   [e] expand   [n] no
 
 
 default mode  ·  m  ·  0 in / 0 out  ·  no rate configured
