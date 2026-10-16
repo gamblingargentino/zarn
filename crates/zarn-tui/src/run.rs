@@ -655,7 +655,7 @@ impl Controller {
         }
         self.notifier.enabled = cfg.general.notifications();
         self.mouse = cfg.general.mouse();
-        self.app.status.cwd = crate::status_line::short_path(&self.cwd, std::env::var_os("HOME").map(PathBuf::from).as_deref());
+        self.app.status.cwd = crate::status_line::short_path(&self.cwd, std::env::home_dir().as_deref());
         self.app.status.branch = crate::status_line::branch(&self.cwd);
         if let Ok(mut hooks) = self.hooks.write() {
             *hooks = cfg.hooks.clone();
@@ -738,6 +738,15 @@ impl Controller {
         };
         match runtime::assemble(&cfg, plan, &self.cwd, self.ctx.clone(), tools, assembly) {
             Ok(rt) => {
+                if self.app.streaming
+                    && let Some(old) = &self.runtime
+                    && (old.plan.provider_name != rt.plan.provider_name || old.model != rt.model)
+                {
+                    self.app.notice(format!(
+                        "the current turn finishes on {} ({}); the next turn uses {} ({})",
+                        old.plan.provider_name, old.model, rt.plan.provider_name, rt.model
+                    ));
+                }
                 for warning in &rt.warnings {
                     if self.warned.insert(warning.clone()) {
                         self.app.notice(warning.clone());
@@ -852,11 +861,13 @@ impl Controller {
         let tx = self.ui_tx.clone();
         let store = self.store.clone();
         tokio::spawn(async move {
-            let authed = zarn_config::mcp_auth::with_auth(&store, &name, &config).await;
-            let result = match tokio::time::timeout(MCP_START_TIMEOUT, McpServer::start(&name, &authed)).await {
-                Err(_) => Err("did not start within 30 seconds".to_string()),
-                Ok(Err(err)) => Err(zarn_config::auth::redact(&format!("{err:#}"))),
-                Ok(Ok(server)) => Ok(Box::new(server)),
+            let result = match zarn_config::mcp_auth::prepare(&store, &name, &config).await {
+                Err(err) => Err(err),
+                Ok(authed) => match tokio::time::timeout(MCP_START_TIMEOUT, McpServer::start(&name, &authed)).await {
+                    Err(_) => Err("did not start within 30 seconds".to_string()),
+                    Ok(Err(err)) => Err(zarn_config::auth::redact(&format!("{err:#}"))),
+                    Ok(Ok(server)) => Ok(Box::new(server)),
+                },
             };
             let _ = tx.send(UiEvent::Mcp { name, config, result }).await;
         });

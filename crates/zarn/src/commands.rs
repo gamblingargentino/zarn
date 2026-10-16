@@ -334,11 +334,15 @@ pub async fn mcp_list(offline: bool) -> Result<()> {
         let status = if offline {
             String::new()
         } else {
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(20),
-                zarn_tools::mcp::McpServer::start(name, server),
-            )
-            .await
+            let store = KeyStore::shared();
+            let prepared = zarn_config::mcp_auth::prepare(&store, name, server).await;
+            let started = match prepared {
+                Ok(ready) => tokio::time::timeout(std::time::Duration::from_secs(20), zarn_tools::mcp::McpServer::start(name, &ready))
+                    .await
+                    .map(|r| r.map_err(|e| anyhow::anyhow!("{e:#}"))),
+                Err(err) => Ok(Err(anyhow::anyhow!(err))),
+            };
+            match started
             {
                 Err(_) => "did not start in time".to_string(),
                 Ok(Err(err)) => format!("failed: {}", zarn_config::auth::redact(&format!("{err:#}"))),
@@ -373,6 +377,7 @@ pub async fn doctor(offline: bool) -> Result<()> {
     let store = KeyStore::shared();
     let mut checks = doctor::run(&store, paths::project_config(), paths::user_config(), !offline).await;
     checks.extend(zarn_tui::terminal::checks(None));
+    checks.extend(zarn_tui::keymap::checks());
     let mouse = layers().map(|l| l.merged().general.mouse()).unwrap_or(false);
     checks.push(zarn_tui::terminal::mouse_check(mouse));
     println!("{}", doctor::render(&checks));

@@ -732,3 +732,33 @@ fn show(panel: Panel, width: u16, height: u16) -> (Panel, Vec<String>) {
     let Mode::Panel(panel) = app.mode else { unreachable!() };
     (*panel, shown)
 }
+
+#[test]
+fn the_mcp_form_takes_references_and_refuses_literal_secrets() {
+    let fx = Fixture::new(TWO_PROVIDERS);
+    let mut panel = fx.panel().open_at(Tab::Mcp);
+    let at = panel.rows().iter().position(|r| r.kind == zarn_tui::settings::RowKind::AddMcp).unwrap();
+    for _ in 0..at {
+        panel_key(&mut panel, KeyCode::Down);
+    }
+    let fill = |panel: &mut Panel, env: &str| {
+        panel_key(panel, KeyCode::Enter);
+        panel.paste("gh");
+        panel_key(panel, KeyCode::Down);
+        panel.paste("gh-mcp --stdio");
+        panel_key(panel, KeyCode::Down);
+        panel.paste(env);
+        panel.on_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::CONTROL))
+    };
+    let literal = format!("GITHUB_TOKEN=sk-{}", "z8".repeat(14));
+    assert_eq!(fill(&mut panel, &literal), None);
+    let (text, failed) = panel.message.clone().unwrap();
+    assert!(failed && text.contains("looks like a openai secret"), "{text}");
+    assert!(!fx.user_config().contains("sk-"));
+
+    panel.editor = None;
+    assert_eq!(fill(&mut panel, "GITHUB_TOKEN=key:gh-token, LOG=debug"), Some(Effect::RestartMcp("gh".into())));
+    let saved = fx.user_config();
+    assert!(saved.contains("GITHUB_TOKEN = \"key:gh-token\""), "{saved}");
+    assert!(saved.contains("LOG = \"debug\""));
+}

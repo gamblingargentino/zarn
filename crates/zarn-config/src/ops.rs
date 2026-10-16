@@ -632,11 +632,19 @@ pub fn mcp_add(
         bail!("an MCP server needs a command or a url");
     }
     let scope = scope.unwrap_or_else(|| layers.mcp_scope(name));
-    layers
-        .layer_mut(scope)
-        .mcp
-        .insert(name.to_string(), server);
-    layers.save(scope)?;
+    let previous = layers.layer_mut(scope).mcp.insert(name.to_string(), server);
+    if let Err(err) = layers.save(scope) {
+        let layer = &mut layers.layer_mut(scope).mcp;
+        match previous {
+            Some(old) => {
+                layer.insert(name.to_string(), old);
+            }
+            None => {
+                layer.remove(name);
+            }
+        }
+        return Err(err);
+    }
     Ok(scope)
 }
 

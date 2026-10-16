@@ -18,6 +18,7 @@ pub mod quota;
 pub mod refs;
 pub mod runtime;
 pub mod schedule;
+pub mod secrets;
 pub mod spend;
 pub mod titles;
 
@@ -418,6 +419,23 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<()> {
+        for (name, server) in &self.mcp {
+            for (place, values) in [("env", &server.env), ("headers", &server.headers)] {
+                for (field, value) in values {
+                    if secrets::is_reference(value) {
+                        continue;
+                    }
+                    let found = value.split_whitespace().find_map(secrets::matches).or_else(|| secrets::matches(value));
+                    if let Some(kind) = found {
+                        bail!(
+                            "MCP server '{name}' {place}.{field} holds what looks like a {kind} secret. Secrets never belong in a config file: store it with `zarn login {name}-{}` and write key:{name}-{} instead, or put it in an environment variable and write env:VARIABLE.",
+                            field.to_lowercase(),
+                            field.to_lowercase()
+                        );
+                    }
+                }
+            }
+        }
         for (name, spec) in &self.providers {
             if spec.api_key.is_some() {
                 bail!(
@@ -441,7 +459,7 @@ impl Config {
                 && !self.providers.contains_key(provider)
             {
                 bail!(
-                    "routing role '{role}' names provider '{provider}', which is not configured"
+                    "routing role '{role}' names provider '{provider}', which is not configured; run zarn providers add {provider} or change the role under /config → Models"
                 );
             }
         }
@@ -462,7 +480,7 @@ impl Config {
             if let Some(provider) = &profile.provider
                 && !self.providers.contains_key(provider)
             {
-                bail!("profile '{name}' names provider '{provider}', which is not configured");
+                bail!("profile '{name}' names provider '{provider}', which is not configured; run zarn providers add {provider} or edit [profiles.{name}]");
             }
             for fallback in profile.fallback.iter().flatten() {
                 if !self.providers.contains_key(fallback) {

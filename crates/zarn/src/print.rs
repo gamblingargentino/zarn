@@ -111,7 +111,12 @@ pub async fn run(args: &Args, prompt: String) -> Result<()> {
     let ctx = Arc::new(Ctx::new(&cwd));
     let mut authed = std::collections::BTreeMap::new();
     for (name, config) in &mcp {
-        authed.insert(name.clone(), zarn_config::mcp_auth::with_auth(&store, name, config).await);
+        match zarn_config::mcp_auth::prepare(&store, name, config).await {
+            Ok(ready) => {
+                authed.insert(name.clone(), ready);
+            }
+            Err(err) => eprintln!("mcp {name} skipped: {err}"),
+        }
     }
     let mcp_tools = zarn_tools::mcp::connect_all(&authed).await;
     let notify: runtime::Notify = Arc::new(|text: String| eprintln!("{}", redact(&text)));

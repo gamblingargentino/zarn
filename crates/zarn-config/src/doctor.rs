@@ -176,7 +176,14 @@ pub async fn run(store: &KeyStore, project: PathBuf, user: Option<PathBuf>, prob
             checks.push(Check::new(area, Status::Ok, "configured"));
             continue;
         }
-        let started = tokio::time::timeout(MCP_TIMEOUT, McpServer::start(name, server)).await;
+        let ready = match crate::mcp_auth::prepare(store, name, server).await {
+            Ok(ready) => ready,
+            Err(err) => {
+                checks.push(Check::new(area, Status::Fail, format!("{err}; fix the reference in [mcp.{name}] or run zarn login")));
+                continue;
+            }
+        };
+        let started = tokio::time::timeout(MCP_TIMEOUT, McpServer::start(name, &ready)).await;
         checks.push(match started {
             Err(_) => Check::new(area, Status::Fail, "did not start in time"),
             Ok(Err(err)) => Check::new(area, Status::Fail, format!("{err:#}")),
@@ -213,8 +220,135 @@ pub async fn run(store: &KeyStore, project: PathBuf, user: Option<PathBuf>, prob
 
     checks.push(sandbox_check(&cfg));
     checks.push(hooks_check(&cfg));
+    checks.push(modes_check(&cfg, &crate::modes::load()));
+    checks.push(routing_check(&cfg, store));
+    checks.push(discovery_check(&crate::quota::cache_dir()));
+    checks.push(plugins_check(&crate::plugins::installed()));
+    checks.push(spend_check(&cfg, store));
+    if let Some(search) = &cfg.websearch {
+        checks.push(match search.backend(store) {
+            Ok(_) => Check::new("websearch", Status::Ok, "backend configured"),
+            Err(err) => Check::new("websearch", Status::Fail, format!("{err}; fix [websearch] in config.toml")),
+        });
+    }
 
     checks
+}
+
+pub fn modes_check(cfg: &Config, loaded: &crate::modes::Loaded) -> Check {
+    let active = cfg.general.mode();
+    if loaded.find(&active).is_none() {
+        return Check::new(
+            "modes",
+            Status::Fail,
+            format!("general.mode is '{active}', which is not a mode; run /mode or zarn modes list and pick one of {}", loaded.names().join(", ")),
+        );
+    }
+    if let Some(warning) = loaded.warnings.first() {
+        return Check::new(
+            "modes",
+            Status::Warn,
+            format!("{warning}; fix or delete that file (zarn modes list shows where each mode comes from)"),
+        );
+    }
+    Check::new("modes", Status::Ok, format!("{} modes, active {active}", loaded.modes.len()))
+}
+
+pub fn routing_check(cfg: &Config, store: &KeyStore) -> Check {
+    if !cfg.routing.enabled.unwrap_or(false) || cfg.routing.roles.is_empty() {
+        return Check::new("routing", Status::Ok, "off; every role uses the main model");
+    }
+    for (role, spec) in &cfg.routing.roles {
+        if !crate::ROLES.contains(&role.as_str()) {
+            return Check::new(
+                "routing",
+                Status::Fail,
+                format!("[routing.roles.{role}] is not a role; use one of {} (edit it under /config → Models)", crate::ROLES.join(", ")),
+            );
+        }
+        if let Some(provider) = &spec.provider {
+            let Some(provider_spec) = cfg.providers.get(provider) else {
+                return Check::new(
+                    "routing",
+                    Status::Fail,
+                    format!("role {role} names provider {provider}, which is not configured; run zarn providers add or change it under /config → Models"),
+                );
+            };
+            if catalog::needs_key(provider_spec)
+                && store.has_with(provider, provider_spec.api_key_env.as_deref(), provider_spec.api_key_helper.as_deref()).is_none()
+            {
+                return Check::new(
+                    "routing",
+                    Status::Fail,
+                    format!("role {role} uses {provider}, which has no key; run zarn login {provider}"),
+                );
+            }
+        }
+    }
+    Check::new("routing", Status::Ok, format!("{} roles routed", cfg.routing.roles.len()))
+}
+
+pub fn discovery_check(dir: &Path) -> Check {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Check::new("discovery cache", Status::Ok, "empty; zarn models fills it");
+    };
+    let mut good = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|x| x != "json") {
+            continue;
+        }
+        let ok = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<crate::quota::Report>(&t).ok())
+            .is_some();
+        if !ok {
+            return Check::new(
+                "discovery cache",
+                Status::Warn,
+                format!("{} is unreadable; run zarn models --refresh to rebuild it", path.display()),
+            );
+        }
+        good += 1;
+    }
+    Check::new("discovery cache", Status::Ok, format!("{good} providers cached; zarn models --refresh updates them"))
+}
+
+pub fn plugins_check(plugins: &[crate::plugins::Plugin]) -> Check {
+    if plugins.is_empty() {
+        return Check::new("plugins", Status::Ok, "none installed");
+    }
+    let waiting: Vec<&str> = plugins.iter().filter(|p| p.needs_approval()).map(|p| p.name()).collect();
+    if let Some(first) = waiting.first() {
+        return Check::new(
+            "plugins",
+            Status::Warn,
+            format!(
+                "{} installed; hooks and MCP servers of {} are off until approved: zarn plugin approve {first}",
+                plugins.len(),
+                waiting.join(", ")
+            ),
+        );
+    }
+    Check::new("plugins", Status::Ok, format!("{} installed, code approved where any", plugins.len()))
+}
+
+pub fn spend_check(cfg: &Config, store: &KeyStore) -> Check {
+    if cfg.limits.is_empty() {
+        return Check::new("spend caps", Status::Ok, "none set; /limits or zarn limits sets them");
+    }
+    let profile = runtime::active_profile(cfg, None);
+    let model = runtime::plan(cfg, store, &profile, None).map(|p| p.model).unwrap_or_default();
+    let priced = crate::pricing::table(cfg).lookup(&model).is_some();
+    match crate::spend::unenforceable(&cfg.limits, &model, priced) {
+        Some(note) => Check::new("spend caps", Status::Warn, format!("{note} (zarn limits shows the caps)")),
+        None => {
+            let session = cfg.limits.session_usd.map(|v| format!("${v:.2} a session")).unwrap_or_default();
+            let day = cfg.limits.day_usd.map(|v| format!("${v:.2} a day")).unwrap_or_default();
+            let caps: Vec<String> = [session, day].into_iter().filter(|c| !c.is_empty()).collect();
+            Check::new("spend caps", Status::Ok, format!("{} for {model}", caps.join(" and ")))
+        }
+    }
 }
 
 pub fn on_path(program: &str) -> bool {

@@ -361,6 +361,26 @@ pub struct Panel {
     mode_dirs: (Option<PathBuf>, PathBuf),
 }
 
+const PAIRS_HINT: &str = "NAME=value, comma separated; secrets as NAME=env:VARIABLE or NAME=key:entry";
+
+pub fn pairs(text: &str) -> Result<BTreeMap<String, String>, String> {
+    let mut out = BTreeMap::new();
+    for part in text.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let Some((name, value)) = part.split_once('=') else {
+            return Err(format!("'{part}' needs the form NAME=value"));
+        };
+        if name.trim().is_empty() {
+            return Err(format!("'{part}' has no name"));
+        }
+        out.insert(name.trim().to_string(), value.trim().to_string());
+    }
+    Ok(out)
+}
+
+fn join_pairs(map: &BTreeMap<String, String>) -> String {
+    map.iter().map(|(k, v)| format!("{k}={v}")).collect::<Vec<_>>().join(", ")
+}
+
 fn policy_label(policy: Policy) -> &'static str {
     match policy {
         Policy::Allow => "allow",
@@ -1233,6 +1253,8 @@ impl Panel {
                             FormField::new("name", ""),
                             FormField::new("command or url", "")
                                 .hint("e.g. npx -y @modelcontextprotocol/server-filesystem . or https://host/mcp"),
+                            FormField::new("env", "").hint(PAIRS_HINT),
+                            FormField::new("headers", "").hint(PAIRS_HINT),
                             FormField::new("scope", "user").hint("user, project or local (just for me, not committed)"),
                         ],
                     ),
@@ -1251,10 +1273,16 @@ impl Panel {
                     (None, Some(url)) => url.clone(),
                     _ => String::new(),
                 };
+                let env = join_pairs(&server.env);
+                let headers = join_pairs(&server.headers);
                 self.editor = Some(Editor::Form(
                     Form::new(
                         format!("Edit MCP server {name}"),
-                        vec![FormField::new("command or url", line)],
+                        vec![
+                            FormField::new("command or url", line),
+                            FormField::new("env", env).hint(PAIRS_HINT),
+                            FormField::new("headers", headers).hint(PAIRS_HINT),
+                        ],
                     ),
                     FormFor::EditMcp(name),
                 ));
@@ -1798,10 +1826,23 @@ impl Panel {
                     },
                 };
                 let words = split_words(&form.value("command or url"));
-                let server = match ops::parse_server(&words) {
+                let mut server = match ops::parse_server(&words) {
                     Ok(server) => server,
                     Err(err) => return retry(self, form, purpose, format!("{err:#}")),
                 };
+                match (pairs(&form.value("env")), pairs(&form.value("headers"))) {
+                    (Ok(env), Ok(headers)) => {
+                        server.env = env;
+                        server.headers = headers;
+                    }
+                    (Err(err), _) | (_, Err(err)) => return retry(self, form, purpose, err),
+                }
+                if let FormFor::EditMcp(old) = &purpose
+                    && let Some(previous) = self.layers.merged().mcp.get(old)
+                {
+                    server.client_id = previous.client_id.clone();
+                    server.scope = previous.scope.clone();
+                }
                 match ops::mcp_add(&mut self.layers, &name, server, scope) {
                     Ok(_) => {
                         self.say(format!("MCP server {name} saved; starting it"));

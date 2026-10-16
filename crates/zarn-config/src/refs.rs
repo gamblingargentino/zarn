@@ -2,18 +2,24 @@ use crate::auth::KeyStore;
 
 pub fn looks_like_secret(value: &str) -> bool {
     let v = value.trim();
-    if v.starts_with("env:") || v.starts_with("key:") {
+    if crate::secrets::is_reference(v) {
         return false;
     }
-    let shaped = ["sk-", "sk_", "gsk_", "AIza", "ghp_", "gho_", "github_pat_", "xox", "glpat-", "Bearer ", "bearer "]
-        .iter()
-        .any(|p| v.starts_with(p) && v.len() >= 20);
-    let opaque = v.len() >= 32
-        && !v.contains(' ')
-        && !v.contains('/')
-        && v.chars().any(|c| c.is_ascii_digit())
-        && v.chars().any(|c| c.is_ascii_alphabetic());
-    shaped || opaque
+    crate::secrets::matches(v).is_some() || v.split_whitespace().any(|w| crate::secrets::matches(w).is_some())
+}
+
+pub fn resolve_inline(store: &KeyStore, value: &str) -> Result<String, String> {
+    if crate::secrets::is_reference(value) {
+        return resolve(store, value.trim());
+    }
+    if !value.split_whitespace().any(crate::secrets::is_reference) {
+        return Ok(value.to_string());
+    }
+    let parts: Result<Vec<String>, String> = value
+        .split(' ')
+        .map(|word| if crate::secrets::is_reference(word) { resolve(store, word) } else { Ok(word.to_string()) })
+        .collect();
+    parts.map(|p| p.join(" "))
 }
 
 pub fn resolve(store: &KeyStore, value: &str) -> Result<String, String> {
@@ -53,8 +59,9 @@ mod tests {
         assert_eq!(resolve(&store, "env:ZARN_REFS_TEST_VAR").unwrap(), "test-key-not-real-env-0002");
         assert!(resolve(&store, "env:ZARN_REFS_UNSET_VAR").unwrap_err().contains("not set"));
         assert!(resolve(&store, "key:missing").unwrap_err().contains("zarn login missing"));
-        assert!(resolve(&store, "sk-test-key-not-real-abcdefghijkl").unwrap_err().contains("literal secret"));
-        assert!(resolve(&store, "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6e7f8").is_err());
+        assert!(resolve(&store, &format!("sk-{}", "q7".repeat(12))).unwrap_err().contains("literal secret"));
+        assert_eq!(resolve_inline(&store, "Bearer key:search").unwrap(), "Bearer test-key-not-real-refs-0001");
+        assert_eq!(resolve_inline(&store, "plain value").unwrap(), "plain value");
         assert_eq!(resolve(&store, "application/json").unwrap(), "application/json");
         assert_eq!(resolve(&store, "--verbose").unwrap(), "--verbose");
     }

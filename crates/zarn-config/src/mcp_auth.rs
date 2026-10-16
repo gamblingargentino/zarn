@@ -51,6 +51,21 @@ pub async fn bearer(store: &KeyStore, server: &str) -> Option<String> {
     }
 }
 
+pub fn resolve_refs(store: &KeyStore, config: &ServerConfig) -> Result<ServerConfig, String> {
+    let mut config = config.clone();
+    for (place, values) in [("env", &mut config.env), ("headers", &mut config.headers)] {
+        for (field, value) in values.iter_mut() {
+            *value = crate::refs::resolve_inline(store, value).map_err(|e| format!("{place}.{field}: {e}"))?;
+        }
+    }
+    Ok(config)
+}
+
+pub async fn prepare(store: &KeyStore, server: &str, config: &ServerConfig) -> Result<ServerConfig, String> {
+    let resolved = resolve_refs(store, config)?;
+    Ok(with_auth(store, server, &resolved).await)
+}
+
 pub async fn with_auth(store: &KeyStore, server: &str, config: &ServerConfig) -> ServerConfig {
     let mut config = config.clone();
     if config.url.is_some()
