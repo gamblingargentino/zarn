@@ -8,16 +8,24 @@ pub mod read;
 pub mod search;
 pub mod write;
 
-use zarn_core::tools::ToolRegistry;
+use zarn_core::tools::{Tool, ToolRegistry};
+
+pub fn builtin_list() -> Vec<Box<dyn Tool>> {
+    vec![
+        Box::new(bash::Bash::new()),
+        Box::new(edit::Edit::new()),
+        Box::new(read::Read::new()),
+        Box::new(search::Glob::new()),
+        Box::new(search::Grep::new()),
+        Box::new(write::Write::new()),
+    ]
+}
 
 pub fn builtins() -> ToolRegistry {
     let mut registry = ToolRegistry::new();
-    registry.register(Box::new(bash::Bash::new()));
-    registry.register(Box::new(edit::Edit::new()));
-    registry.register(Box::new(read::Read::new()));
-    registry.register(Box::new(search::Glob::new()));
-    registry.register(Box::new(search::Grep::new()));
-    registry.register(Box::new(write::Write::new()));
+    for tool in builtin_list() {
+        registry.register(tool);
+    }
     registry
 }
 

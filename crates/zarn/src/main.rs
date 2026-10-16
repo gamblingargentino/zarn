@@ -12,7 +12,6 @@ use zarn_core::provider::Event;
 use zarn_core::session;
 use zarn_core::tools::Ctx;
 use zarn_core::types::Message;
-use zarn_providers::{build_chain, ProviderSpec};
 use zarn_tools::permissions::Permissions;
 use cli::{Args, Command, ConfigAction, RunMode};
 
@@ -23,7 +22,7 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_env("ZARN_LOG")
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
-        .with_writer(std::io::stderr)
+        .with_writer(|| zarn_config::guard::RedactingWriter::new(std::io::stderr()))
         .init();
 
     let args = Args::parse();
@@ -210,47 +209,34 @@ async fn cmd_providers() -> Result<()> {
 }
 
 async fn run_agent(args: &Args) -> Result<()> {
-    let mut cfg = Config::load().unwrap_or_default();
+    let mut cfg = Config::load()?;
     let mcp = std::mem::take(&mut cfg.mcp);
+    let store = zarn_config::auth::KeyStore::shared();
 
     let profile_name = args.profile
         .clone()
         .or_else(|| std::env::var("ZARN_PROFILE").ok())
         .unwrap_or_else(|| "default".to_string());
 
-    let profile = cfg.profiles.entry(profile_name.clone())
-        .or_default();
-
-    let provider_name = profile.provider.as_deref()
-        .unwrap_or("openai");
-
-    let mut specs = vec![];
-    if let Some(fallback) = &profile.fallback {
-        for name in fallback {
-            if let Some(spec) = cfg.providers.remove(name) {
-                specs.push(spec);
-            }
-        }
+    if !cfg.profiles.contains_key(&profile_name) {
+        bail!("no provider is configured for profile '{profile_name}'. Run `zarn` for guided setup, or `zarn providers add`.");
     }
-    if let Some(spec) = cfg.providers.remove(provider_name) {
-        specs.insert(0, spec);
-    } else {
-        specs.insert(0, ProviderSpec {
-            kind: provider_name.to_string(),
-            ..ProviderSpec::default()
-        });
+    let specs = cfg.chain_for(store, &profile_name)?;
+    if let Some(notice) = store.fallback_notice() {
+        eprintln!("{notice}");
     }
-
-    let provider = build_chain(&specs)?;
+    let provider = zarn_config::guard::guarded_chain(&specs)?;
     let model = args.model
         .clone()
-        .or_else(|| profile.model.clone())
+        .or_else(|| cfg.profiles[&profile_name].model.clone())
         .or_else(|| std::env::var("ZARN_MODEL").ok())
-        .unwrap_or_else(|| "gpt-4o-mini".to_string());
+        .context("no model is set for this profile; pass --model or run `zarn` to pick one")?;
 
-    let mut registry = zarn_tools::builtins();
-    for tool in zarn_tools::mcp::connect_all(&mcp).await {
-        registry.register(tool);
+    let mut tools: Vec<Box<dyn zarn_core::tools::Tool>> = Vec::new();
+    tools.extend(zarn_tools::mcp::connect_all(&mcp).await);
+    let mut registry = zarn_config::guard::guard_registry(tools);
+    for tool in zarn_tools::builtin_list() {
+        registry.register(zarn_config::guard::redacting(tool));
     }
     let tools = Arc::new(registry);
     let ctx = Arc::new(Ctx::new(std::env::current_dir()?));

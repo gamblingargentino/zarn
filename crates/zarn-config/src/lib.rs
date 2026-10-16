@@ -1,4 +1,9 @@
+pub mod auth;
+pub mod guard;
+pub mod paths;
+
 use anyhow::{Context, Result, bail};
+use auth::{KeySource, KeyStore};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -81,7 +86,7 @@ impl Config {
     }
 
     pub fn home_path() -> Option<PathBuf> {
-        dirs::home_dir().map(|h| h.join(".config/zarn/config.toml"))
+        paths::user_config()
     }
 
     pub fn sources() -> Vec<PathBuf> {
@@ -119,7 +124,7 @@ impl Config {
         for (name, spec) in &self.providers {
             if spec.api_key.is_some() {
                 bail!(
-                    "provider '{name}' sets api_key inline. Secrets never belong in a config file: delete that line and set api_key_env = \"SOME_ENV_VAR\" instead, naming the variable that holds the key."
+                    "provider '{name}' sets api_key inline. Secrets never belong in a config file: delete that line and run `zarn login {name}` to keep the key in the OS credential store, or set api_key_env = \"SOME_ENV_VAR\" naming the variable that holds it."
                 );
             }
         }
@@ -140,22 +145,12 @@ impl Config {
         Ok(())
     }
 
-    pub fn resolve_key(&self, name: &str) -> Result<Option<String>> {
-        let Some(spec) = self.providers.get(name) else {
-            return Ok(None);
-        };
-        let Some(var) = &spec.api_key_env else {
-            return Ok(None);
-        };
-        match std::env::var(var) {
-            Ok(key) => Ok(Some(key)),
-            Err(_) => bail!(
-                "provider '{name}' reads its key from {var}, but that environment variable is not set"
-            ),
-        }
+    pub fn resolve_key(&self, store: &KeyStore, name: &str) -> Option<(String, KeySource)> {
+        let spec = self.providers.get(name)?;
+        store.resolve(name, spec.api_key_env.as_deref())
     }
 
-    pub fn chain_for(&self, profile: &str) -> Result<Vec<ProviderSpec>> {
+    pub fn chain_for(&self, store: &KeyStore, profile: &str) -> Result<Vec<ProviderSpec>> {
         let Some(spec) = self.profiles.get(profile) else {
             bail!("no profile named '{profile}'");
         };
@@ -177,7 +172,7 @@ impl Config {
                     .get(name)
                     .cloned()
                     .with_context(|| format!("provider '{name}' is not configured"))?;
-                resolved.api_key = self.resolve_key(name)?;
+                resolved.api_key = self.resolve_key(store, name).map(|(key, _)| key);
                 Ok(resolved)
             })
             .collect()
@@ -188,25 +183,7 @@ impl Config {
     }
 }
 
-const STARTER: &str = r#"[providers.openai]
-kind = "openai"
-base_url = "https://api.openai.com/v1"
-api_key_env = "OPENAI_API_KEY"
-
-[providers.anthropic]
-kind = "anthropic"
-api_key_env = "ANTHROPIC_API_KEY"
-
-[providers.local]
-kind = "ollama"
-base_url = "http://localhost:11434"
-
-[profiles.default]
-provider = "anthropic"
-model = "claude-sonnet-5"
-fallback = ["openai"]
-
-[permissions]
+const STARTER: &str = r#"[permissions]
 read = "allow"
 glob = "allow"
 grep = "allow"
@@ -244,7 +221,7 @@ mod tests {
         let path = write(
             &dir,
             "config.toml",
-            "[providers.openai]\nkind = \"openai\"\napi_key = \"sk-secret\"\n",
+            "[providers.openai]\nkind = \"openai\"\napi_key = \"test-key-not-real\"\n",
         );
         let err = Config::load_from(&[path]).unwrap_err().to_string();
         assert!(err.contains("api_key_env"));
@@ -258,7 +235,7 @@ mod tests {
         let path = write(
             &dir,
             "config.toml",
-            "[providers.openai]\nkind = \"openai\"\napi_key = \"sk-secret\"\napi_key_env = \"OPENAI_API_KEY\"\n",
+            "[providers.openai]\nkind = \"openai\"\napi_key = \"test-key-not-real\"\napi_key_env = \"OPENAI_API_KEY\"\n",
         );
         assert!(Config::load_from(&[path]).is_err());
         std::fs::remove_dir_all(dir).ok();
@@ -314,21 +291,6 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_env_var_is_reported_by_name() {
-        let mut config = Config::default();
-        config.providers.insert(
-            "openai".into(),
-            ProviderSpec {
-                kind: "openai".into(),
-                api_key_env: Some("ZARN_TEST_DEFINITELY_UNSET".into()),
-                ..ProviderSpec::default()
-            },
-        );
-        let err = config.resolve_key("openai").unwrap_err().to_string();
-        assert!(err.contains("ZARN_TEST_DEFINITELY_UNSET"));
-    }
-
-    #[test]
     fn a_chain_is_the_provider_then_its_fallbacks_in_order() {
         let dir = temp("chain");
         let path = write(
@@ -337,7 +299,8 @@ mod tests {
             "[providers.a]\nkind = \"openai\"\n\n[providers.b]\nkind = \"anthropic\"\n\n[profiles.default]\nprovider = \"a\"\nfallback = [\"b\"]\n",
         );
         let config = Config::load_from(&[path]).unwrap();
-        let chain = config.chain_for("default").unwrap();
+        let store = KeyStore::new(std::sync::Arc::new(auth::MemoryBackend::new()), dir.join("auth.json"));
+        let chain = config.chain_for(&store, "default").unwrap();
 
         assert_eq!(chain.len(), 2);
         assert_eq!(chain[0].kind, "openai");
@@ -346,10 +309,10 @@ mod tests {
     }
 
     #[test]
-    fn the_starter_config_is_valid_and_names_no_inline_keys() {
+    fn the_starter_config_is_valid_and_ships_no_provider() {
         let parsed: Config = toml::from_str(Config::starter()).unwrap();
         assert!(parsed.validate().is_ok());
-        assert!(parsed.providers.values().all(|p| p.api_key.is_none()));
+        assert!(parsed.providers.is_empty());
     }
 
     #[test]
