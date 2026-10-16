@@ -14,6 +14,30 @@ use zarn_tools::exit_plan::PlanVerdict;
 use zarn_tools::permissions::Answer;
 
 pub const COLLAPSED_LINES: usize = 3;
+pub const PASTE_LINES: usize = 20;
+pub const PASTE_CHARS: usize = 2_000;
+pub const IMAGE_MARK: &str = "[[zarn-image:";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Vim {
+    pub normal: bool,
+    pub pending_d: bool,
+}
+
+pub const VIM_HELP: &str = "vim input (General → vim input): esc normal mode · i insert · a append · o open line below · h j k l move · w b word · 0 $ line start and end · x delete char · dd delete line · enter sends";
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Search {
+    pub query: String,
+    pub typing: bool,
+    pub hit: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Paste {
+    pub token: String,
+    pub text: String,
+}
 
 #[derive(Debug)]
 pub struct PermissionRequest {
@@ -127,6 +151,8 @@ pub enum ChatPick {
     Mode,
     Profile,
     Rewind,
+    Memory(String),
+    History,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -169,6 +195,9 @@ pub enum Action {
     Confirmed(ConfirmFor),
     Plan(PlanVerdict),
     SaveRule(String, zarn_config::layers::Scope),
+    Shell(String),
+    Remember(String),
+    Editor,
 }
 
 #[derive(Clone, Debug)]
@@ -211,6 +240,15 @@ pub struct App {
     pub queue_paused: bool,
     pub plan_review: Option<PlanReview>,
     pub pending_expanded: bool,
+    pub files: Vec<String>,
+    pub keymap: crate::keymap::Keymap,
+    pub transcript: bool,
+    pub vim: Option<Vim>,
+    pub transcript_scroll: u16,
+    pub search: Option<Search>,
+    pub pastes: Vec<Paste>,
+    pub paste_count: usize,
+    pub queue_display: Vec<String>,
     ctrl_c_armed: bool,
     esc_armed: bool,
 }
@@ -227,10 +265,91 @@ impl App {
         }
     }
 
+    pub fn mention(&self) -> Option<(usize, String)> {
+        if self.input.starts_with('/') {
+            return None;
+        }
+        crate::mentions::token_at(&self.input, self.cursor)
+    }
+
+    pub fn mention_entries(&self) -> Vec<Entry> {
+        let Some((_, query)) = self.mention() else {
+            return Vec::new();
+        };
+        crate::mentions::filter(&self.files, &query, 50)
+            .into_iter()
+            .map(|path| Entry {
+                name: path.clone(),
+                usage: String::new(),
+                description: String::new(),
+                origin: popup::Origin::Builtin,
+            })
+            .collect()
+    }
+
     pub fn popup_matches(&self) -> Vec<&Entry> {
         match popup::query(&self.input) {
             Some(q) => popup::filter(&self.entries, q),
             None => Vec::new(),
+        }
+    }
+
+    pub fn mention_visible(&self) -> bool {
+        matches!(self.mode, Mode::Chat)
+            && self.overlay.is_none()
+            && self.pending.is_none()
+            && self.plan_review.is_none()
+            && !self.popup_hidden
+            && !self.mention_entries().is_empty()
+    }
+
+    fn complete_mention(&mut self, path: &str) {
+        let Some((start, _)) = self.mention() else {
+            return;
+        };
+        let chars: Vec<char> = self.input.chars().collect();
+        let before: String = chars[..start].iter().collect();
+        let after: String = chars[self.cursor.min(chars.len())..].iter().collect();
+        self.input = format!("{before}@{path} {}", after.trim_start());
+        self.cursor = before.chars().count() + path.chars().count() + 2;
+        self.popup_hidden = true;
+    }
+
+    fn on_mention_key(&mut self, key: KeyEvent) -> Option<Option<Action>> {
+        if !self.mention_visible() {
+            return None;
+        }
+        let shown = self.mention_entries();
+        let chosen = shown
+            .get(self.popup_selected.min(shown.len().saturating_sub(1)))
+            .map(|e| e.name.clone());
+        match key.code {
+            KeyCode::Up => {
+                self.popup_selected = self.popup_selected.saturating_sub(1);
+                Some(None)
+            }
+            KeyCode::Down => {
+                self.popup_selected = (self.popup_selected + 1).min(shown.len().saturating_sub(1));
+                Some(None)
+            }
+            KeyCode::Esc => {
+                self.popup_hidden = true;
+                Some(None)
+            }
+            KeyCode::Enter
+                if self.mention().is_some_and(|(_, q)| Some(&q) == chosen.as_ref()) =>
+            {
+                None
+            }
+            KeyCode::Tab | KeyCode::Enter
+                if !key.modifiers.intersects(KeyModifiers::SHIFT | KeyModifiers::ALT) =>
+            {
+                if let Some(path) = chosen {
+                    self.complete_mention(&path);
+                }
+                Some(None)
+            }
+            _ => None,
         }
     }
 
@@ -264,13 +383,83 @@ impl App {
             Some(Overlay::Secret { input, .. }) => input.paste(text),
             Some(Overlay::Pick(picker, _)) => picker.filter.paste(text),
             Some(Overlay::Confirm(..)) => {}
-            None if self.pending.is_none() => {
-                for c in text.chars().filter(|c| *c != '\r') {
-                    self.insert(c);
-                }
-            }
+            None if self.pending.is_none() => self.paste_into_input(text),
             None => {}
         }
+    }
+
+    fn insert_str(&mut self, text: &str) {
+        for c in text.chars() {
+            self.insert(c);
+        }
+    }
+
+    fn paste_into_input(&mut self, text: &str) {
+        let text = text.replace('\r', "");
+        let candidate = text.trim().trim_matches(['"', '\'']);
+        if !candidate.contains('\n')
+            && crate::mentions::image_mime(candidate).is_some()
+            && std::path::Path::new(candidate).is_file()
+        {
+            let full = std::path::Path::new(candidate)
+                .canonicalize()
+                .unwrap_or_else(|_| std::path::PathBuf::from(candidate));
+            self.paste_count += 1;
+            let name = full
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            let token = format!("[Image #{} {name}]", self.paste_count);
+            self.pastes.push(Paste {
+                token: token.clone(),
+                text: format!("{IMAGE_MARK}{}]]", full.display()),
+            });
+            self.insert_str(&token);
+            return;
+        }
+        let lines = text.lines().count();
+        if lines > PASTE_LINES || text.chars().count() > PASTE_CHARS {
+            self.paste_count += 1;
+            let token = format!("[Pasted text #{} +{lines} lines]", self.paste_count);
+            self.pastes.push(Paste {
+                token: token.clone(),
+                text,
+            });
+            self.insert_str(&token);
+            return;
+        }
+        self.insert_str(&text);
+    }
+
+    pub fn expand_pastes(&mut self, text: &str) -> String {
+        let mut out = text.to_string();
+        for paste in std::mem::take(&mut self.pastes) {
+            if let Some(at) = out.find(&paste.token) {
+                out.replace_range(at..at + paste.token.len(), &paste.text);
+            }
+        }
+        out
+    }
+
+    fn delete_token_before_cursor(&mut self) -> bool {
+        let before: String = self.input.chars().take(self.cursor).collect();
+        let Some(index) = self.pastes.iter().position(|p| before.ends_with(&p.token)) else {
+            return false;
+        };
+        let token = self.pastes.remove(index).token;
+        let count = token.chars().count();
+        let start = self.byte_at(self.cursor - count);
+        let end = self.byte_at(self.cursor);
+        self.input.replace_range(start..end, "");
+        self.cursor -= count;
+        self.input_changed();
+        true
+    }
+
+    pub fn enqueue(&mut self, display: String, expanded: String) {
+        self.queue.push(expanded);
+        self.queue_display.push(display.clone());
+        self.blocks.push(Block::Queued(display));
     }
 
     fn on_overlay_key(&mut self, overlay: Overlay, key: KeyEvent) -> Option<Action> {
@@ -368,13 +557,21 @@ impl App {
             self.blocks.push(Block::User(text.clone()));
             return Some(Action::Command(text));
         }
+        if let Some(command) = text.strip_prefix('!').map(str::trim).filter(|c| !c.is_empty()) {
+            self.blocks.push(Block::User(text.clone()));
+            return Some(Action::Shell(command.to_string()));
+        }
+        if let Some(note) = text.strip_prefix('#').map(str::trim).filter(|n| !n.is_empty()) {
+            self.blocks.push(Block::User(text.clone()));
+            return Some(Action::Remember(note.to_string()));
+        }
+        let expanded = self.expand_pastes(&text);
         if self.streaming || self.queue_paused {
-            self.queue.push(text.clone());
-            self.blocks.push(Block::Queued(text));
+            self.enqueue(text, expanded);
             return None;
         }
-        self.blocks.push(Block::User(text.clone()));
-        Some(Action::Submit(text))
+        self.blocks.push(Block::User(text));
+        Some(Action::Submit(expanded))
     }
 
     pub fn next_queued(&mut self) -> Option<String> {
@@ -382,14 +579,19 @@ impl App {
             return None;
         }
         let text = self.queue.remove(0);
+        let display = if self.queue_display.is_empty() {
+            text.clone()
+        } else {
+            self.queue_display.remove(0)
+        };
         if let Some(at) = self
             .blocks
             .iter()
-            .position(|b| matches!(b, Block::Queued(t) if *t == text))
+            .position(|b| matches!(b, Block::Queued(t) if *t == display))
         {
             self.blocks.remove(at);
         }
-        self.blocks.push(Block::User(text.clone()));
+        self.blocks.push(Block::User(display));
         Some(text)
     }
 
@@ -407,6 +609,7 @@ impl App {
     pub fn clear_queue(&mut self) {
         let dropped = self.queue.len();
         self.queue.clear();
+        self.queue_display.clear();
         self.queue_paused = false;
         self.blocks.retain(|b| !matches!(b, Block::Queued(_)));
         self.notice(format!(
@@ -536,15 +739,35 @@ impl App {
             return action;
         }
 
+        if let Some(action) = self.on_mention_key(key) {
+            return action;
+        }
+
+        if let Some(action) = self.on_vim_key(key) {
+            return action;
+        }
+
+        if let Some(action) = self.keymap.action(&key) {
+            use crate::keymap::KeyAction;
+            match action {
+                KeyAction::ExpandOutput => self.expand_last_output(),
+                KeyAction::HistorySearch => return Some(Action::Command("/history".into())),
+                KeyAction::CycleMode => return Some(Action::CycleMode),
+                KeyAction::ProfilePicker => return Some(Action::Command("/profile".into())),
+                KeyAction::ExternalEditor => return Some(Action::Editor),
+                KeyAction::Transcript => self.toggle_transcript(),
+                KeyAction::SearchScrollback => self.start_search(),
+                KeyAction::ScrollUp => self.scroll_up = self.scroll_up.saturating_add(10),
+                KeyAction::ScrollDown => self.scroll_up = self.scroll_up.saturating_sub(10),
+                KeyAction::HistoryPrev => self.recall(-1),
+                KeyAction::HistoryNext => self.recall(1),
+                KeyAction::Newline => self.insert('\n'),
+                KeyAction::ExpandThinking => {}
+            }
+            return None;
+        }
+
         match (key.code, key.modifiers) {
-            (KeyCode::BackTab, _) => return Some(Action::CycleMode),
-            (KeyCode::Char('p'), m) if m.contains(KeyModifiers::CONTROL) => {
-                return Some(Action::Command("/profile".into()));
-            }
-            (KeyCode::Tab, m) if m.contains(KeyModifiers::SHIFT) => return Some(Action::CycleMode),
-            (KeyCode::Char('r'), m) if m.contains(KeyModifiers::CONTROL) => {
-                self.expand_last_output()
-            }
             (KeyCode::Esc, _) => {
                 if self.streaming {
                     return Some(Action::Cancel);
@@ -561,11 +784,6 @@ impl App {
                     self.esc_armed = true;
                 }
             }
-            (KeyCode::Enter, m)
-                if m.contains(KeyModifiers::SHIFT) || m.contains(KeyModifiers::ALT) =>
-            {
-                self.insert('\n')
-            }
             (KeyCode::Enter, _) => {
                 let text = self.input.trim().to_string();
                 if !text.is_empty() {
@@ -577,7 +795,7 @@ impl App {
                 }
             }
             (KeyCode::Backspace, _) => {
-                if self.cursor > 0 {
+                if self.cursor > 0 && !self.delete_token_before_cursor() {
                     let at = self.byte_at(self.cursor - 1);
                     self.input.remove(at);
                     self.cursor -= 1;
@@ -595,15 +813,152 @@ impl App {
             (KeyCode::Right, _) => self.cursor = (self.cursor + 1).min(self.len()),
             (KeyCode::Home, _) => self.cursor = 0,
             (KeyCode::End, _) => self.cursor = self.len(),
-            (KeyCode::PageUp, _) => self.scroll_up = self.scroll_up.saturating_add(10),
-            (KeyCode::PageDown, _) => self.scroll_up = self.scroll_up.saturating_sub(10),
-            (KeyCode::Up, _) => self.recall(-1),
-            (KeyCode::Down, _) => self.recall(1),
-            (KeyCode::Char(c), _) => self.insert(c),
+            (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) => self.insert(c),
             _ => {}
         }
 
         None
+    }
+
+    fn line_bounds(&self) -> (usize, usize) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let cursor = self.cursor.min(chars.len());
+        let start = chars[..cursor].iter().rposition(|c| *c == '\n').map(|i| i + 1).unwrap_or(0);
+        let end = chars[cursor..]
+            .iter()
+            .position(|c| *c == '\n')
+            .map(|i| cursor + i)
+            .unwrap_or(chars.len());
+        (start, end)
+    }
+
+    fn vim_vertical(&mut self, down: bool) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let (start, end) = self.line_bounds();
+        let column = self.cursor - start;
+        if down {
+            if end >= chars.len() {
+                return self.recall(1);
+            }
+            let next_start = end + 1;
+            let next_end = chars[next_start..]
+                .iter()
+                .position(|c| *c == '\n')
+                .map(|i| next_start + i)
+                .unwrap_or(chars.len());
+            self.cursor = (next_start + column).min(next_end);
+        } else {
+            if start == 0 {
+                return self.recall(-1);
+            }
+            let prev_end = start - 1;
+            let prev_start = chars[..prev_end].iter().rposition(|c| *c == '\n').map(|i| i + 1).unwrap_or(0);
+            self.cursor = (prev_start + column).min(prev_end);
+        }
+    }
+
+    fn vim_word(&mut self, forward: bool) {
+        let chars: Vec<char> = self.input.chars().collect();
+        let mut i = self.cursor.min(chars.len());
+        if forward {
+            while i < chars.len() && !chars[i].is_whitespace() {
+                i += 1;
+            }
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+        } else {
+            while i > 0 && chars[i - 1].is_whitespace() {
+                i -= 1;
+            }
+            while i > 0 && !chars[i - 1].is_whitespace() {
+                i -= 1;
+            }
+        }
+        self.cursor = i;
+    }
+
+    fn on_vim_key(&mut self, key: KeyEvent) -> Option<Option<Action>> {
+        let mut vim = self.vim?;
+        if key.modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) {
+            return None;
+        }
+        if !vim.normal {
+            if key.code == KeyCode::Esc && !self.streaming && self.queue.is_empty() {
+                vim.normal = true;
+                self.cursor = self.cursor.saturating_sub(1).max(self.line_bounds().0);
+                self.vim = Some(vim);
+                return Some(None);
+            }
+            return None;
+        }
+        let pending = std::mem::take(&mut vim.pending_d);
+        let len = self.len();
+        match key.code {
+            KeyCode::Char('h') | KeyCode::Left => self.cursor = self.cursor.saturating_sub(1).max(self.line_bounds().0),
+            KeyCode::Char('l') | KeyCode::Right => {
+                let (_, end) = self.line_bounds();
+                self.cursor = (self.cursor + 1).min(end.saturating_sub(1).max(self.line_bounds().0));
+            }
+            KeyCode::Char('j') | KeyCode::Down => self.vim_vertical(true),
+            KeyCode::Char('k') | KeyCode::Up => self.vim_vertical(false),
+            KeyCode::Char('w') => self.vim_word(true),
+            KeyCode::Char('b') => self.vim_word(false),
+            KeyCode::Char('0') | KeyCode::Home => self.cursor = self.line_bounds().0,
+            KeyCode::Char('$') | KeyCode::End => self.cursor = self.line_bounds().1.saturating_sub(1).max(self.line_bounds().0),
+            KeyCode::Char('x') | KeyCode::Delete => {
+                if self.cursor < len && self.input.chars().nth(self.cursor) != Some('\n') {
+                    let at = self.byte_at(self.cursor);
+                    self.input.remove(at);
+                    self.input_changed();
+                }
+            }
+            KeyCode::Char('d') if pending => {
+                let (start, end) = self.line_bounds();
+                let chars: Vec<char> = self.input.chars().collect();
+                let (from, to) = if end < chars.len() {
+                    (start, end + 1)
+                } else if start > 0 {
+                    (start - 1, end)
+                } else {
+                    (start, end)
+                };
+                self.input = chars[..from].iter().chain(chars[to..].iter()).collect();
+                self.cursor = from.min(self.len());
+                self.input_changed();
+            }
+            KeyCode::Char('d') => vim.pending_d = true,
+            KeyCode::Char('i') => vim.normal = false,
+            KeyCode::Char('a') => {
+                vim.normal = false;
+                self.cursor = (self.cursor + 1).min(self.line_bounds().1);
+            }
+            KeyCode::Char('o') => {
+                vim.normal = false;
+                self.cursor = self.line_bounds().1;
+                self.insert('\n');
+            }
+            KeyCode::Enter => {
+                self.vim = Some(Vim { normal: false, pending_d: false });
+                let text = self.input.trim().to_string();
+                return Some(if text.is_empty() { None } else { self.submit_line(text) });
+            }
+            KeyCode::Esc => {
+                self.vim = Some(vim);
+                return None;
+            }
+            _ => {}
+        }
+        self.vim = Some(vim);
+        Some(None)
+    }
+
+    pub fn toggle_transcript(&mut self) {
+        self.transcript = !self.transcript;
+    }
+
+    pub fn start_search(&mut self) {
+        self.search = Some(crate::state::Search::default());
     }
 
     fn on_plan_key(&mut self, key: KeyEvent) -> Option<Action> {
@@ -830,6 +1185,167 @@ mod tests {
         app.on_key(key(KeyCode::Char('x')));
         app.on_key(key(KeyCode::Backspace));
         assert_eq!(app.on_key(key(KeyCode::Esc)), None);
+    }
+
+    #[test]
+    fn typing_at_lists_files_and_tab_inserts_the_chosen_path() {
+        let mut app = App::new("m");
+        app.files = vec!["src/main.rs".into(), "src/mentions.rs".into(), "README.md".into()];
+        for c in "look at @ment".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        assert!(app.mention_visible());
+        assert_eq!(app.mention_entries()[0].name, "src/mentions.rs");
+        assert_eq!(app.on_key(key(KeyCode::Tab)), None);
+        assert_eq!(app.input, "look at @src/mentions.rs ");
+        assert!(!app.mention_visible());
+        for c in "please".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(
+            app.on_key(key(KeyCode::Enter)),
+            Some(Action::Submit("look at @src/mentions.rs please".into()))
+        );
+    }
+
+    #[test]
+    fn a_large_paste_is_collapsed_into_a_token_and_expanded_when_sent() {
+        let mut app = App::new("m");
+        let big: String = (1..=30).map(|i| format!("line {i}\n")).collect();
+        app.paste("before ");
+        app.paste(&big);
+        assert_eq!(app.input, "before [Pasted text #1 +30 lines]");
+        app.paste(" after");
+        let sent = app.on_key(key(KeyCode::Enter));
+        let Some(Action::Submit(text)) = sent else { panic!("{sent:?}") };
+        assert!(text.starts_with("before line 1\n"));
+        assert!(text.ends_with("line 30\n after"));
+        assert!(matches!(app.blocks.last(), Some(Block::User(t)) if t == "before [Pasted text #1 +30 lines] after"));
+    }
+
+    #[test]
+    fn a_long_single_line_paste_also_collapses_and_small_ones_do_not() {
+        let mut app = App::new("m");
+        app.paste(&"x".repeat(2_500));
+        assert_eq!(app.input, "[Pasted text #1 +1 lines]");
+        let mut small = App::new("m");
+        small.paste("short text");
+        assert_eq!(small.input, "short text");
+    }
+
+    #[test]
+    fn backspace_on_a_token_removes_the_whole_paste() {
+        let mut app = App::new("m");
+        app.paste("a ");
+        app.paste(&"y\n".repeat(25));
+        app.on_key(key(KeyCode::Backspace));
+        assert_eq!(app.input, "a ");
+        assert!(app.pastes.is_empty());
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Some(Action::Submit("a b".into())));
+    }
+
+    #[test]
+    fn a_queued_paste_shows_collapsed_and_sends_expanded() {
+        let mut app = App::new("m");
+        app.streaming = true;
+        app.paste(&"z\n".repeat(21));
+        app.on_key(key(KeyCode::Enter));
+        assert!(matches!(app.blocks.last(), Some(Block::Queued(t)) if t == "[Pasted text #1 +21 lines]"));
+        app.streaming = false;
+        assert_eq!(app.next_queued().unwrap(), "z\n".repeat(21));
+        assert!(matches!(app.blocks.last(), Some(Block::User(t)) if t == "[Pasted text #1 +21 lines]"));
+    }
+
+    #[test]
+    fn pasting_an_image_path_attaches_it_as_a_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("shot.png");
+        std::fs::write(&image, [137u8, 80, 78, 71]).unwrap();
+        let mut app = App::new("m");
+        app.paste(&format!("'{}'", image.display()));
+        assert_eq!(app.input, "[Image #1 shot.png]");
+        let Some(Action::Submit(text)) = app.on_key(key(KeyCode::Enter)) else { panic!() };
+        assert!(text.starts_with(IMAGE_MARK));
+        assert!(text.contains("shot.png]]"));
+    }
+
+    #[test]
+    fn bang_and_hash_lines_become_shell_and_memory_actions() {
+        let mut app = App::new("m");
+        app.set_input("!git status");
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Some(Action::Shell("git status".into())));
+        app.set_input("# always run cargo fmt");
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Some(Action::Remember("always run cargo fmt".into())));
+        app.set_input("#");
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Some(Action::Submit("#".into())));
+    }
+
+    #[test]
+    fn enter_sends_when_the_mention_is_already_complete() {
+        let mut app = App::new("m");
+        app.files = vec!["shot.png".into()];
+        app.set_input("see @shot.png");
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Some(Action::Submit("see @shot.png".into())));
+    }
+
+    #[test]
+    fn rebound_keys_follow_the_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keys.toml");
+        std::fs::write(&path, "expand_output = \"ctrl+e\"\nhistory_search = \"ctrl+y\"\n").unwrap();
+        let mut app = App::new("m");
+        app.keymap = crate::keymap::Keymap::load_from(&path);
+        assert_eq!(app.on_key(ctrl('y')), Some(Action::Command("/history".into())));
+        assert_eq!(app.on_key(ctrl('f')), None);
+        assert_eq!(app.on_key(ctrl('g')), Some(Action::Editor));
+    }
+
+    #[test]
+    fn vim_mode_supports_the_basic_motions_and_edits() {
+        let mut app = App::new("m");
+        app.vim = Some(Vim::default());
+        for c in "one two three".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.vim.unwrap().normal);
+        for c in ['0', 'w', 'x'] {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        assert_eq!(app.input, "one wo three");
+        app.on_key(key(KeyCode::Char('$')));
+        app.on_key(key(KeyCode::Char('a')));
+        app.on_key(key(KeyCode::Char('!')));
+        assert_eq!(app.input, "one wo three!");
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('o')));
+        for c in "second".chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Esc));
+        assert_eq!(app.input, "one wo three!\nsecond");
+        app.on_key(key(KeyCode::Char('k')));
+        app.on_key(key(KeyCode::Char('d')));
+        app.on_key(key(KeyCode::Char('d')));
+        assert_eq!(app.input, "second");
+        app.on_key(key(KeyCode::Char('0')));
+        app.on_key(key(KeyCode::Char('l')));
+        app.on_key(key(KeyCode::Char('h')));
+        app.on_key(key(KeyCode::Char('i')));
+        app.on_key(key(KeyCode::Char('>')));
+        assert_eq!(app.input, ">second");
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('b')));
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Some(Action::Submit(">second".into())));
+    }
+
+    #[test]
+    fn without_vim_mode_letters_are_just_typed() {
+        let mut app = App::new("m");
+        app.on_key(key(KeyCode::Esc));
+        app.on_key(key(KeyCode::Char('x')));
+        assert_eq!(app.input, "x");
     }
 
     #[test]

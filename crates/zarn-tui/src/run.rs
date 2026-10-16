@@ -130,6 +130,11 @@ enum UiEvent {
         blocked: Option<String>,
     },
     HookFailed(String),
+    Shell {
+        id: String,
+        command: String,
+        output: zarn_core::tools::ToolOutput,
+    },
     Window { model: String, window: u32 },
 }
 
@@ -148,7 +153,10 @@ pub async fn run(options: Options) -> Result<()> {
     );
 
     let outcome = match Controller::new(options) {
-        Ok(controller) => controller.event_loop(&mut terminal).await,
+        Ok(mut controller) => {
+            controller.interactive = true;
+            controller.event_loop(&mut terminal).await
+        }
         Err(err) => Err(err),
     };
 
@@ -202,6 +210,11 @@ pub struct Controller {
     hooks: Arc<std::sync::RwLock<zarn_config::hooks::Hooks>>,
     checkpoints: Arc<zarn_tools::checkpoint::Checkpoints>,
     checkpoint_notes: Arc<std::sync::Mutex<Vec<String>>>,
+    pending_context: Vec<String>,
+    last_shell: Option<(String, String)>,
+    shell_runs: usize,
+    interactive: bool,
+    editor_pending: bool,
 }
 
 fn flatten_messages(messages: &[Message]) -> Vec<Block> {
@@ -280,6 +293,11 @@ impl Controller {
                 cwd_for_checkpoints,
             )),
             checkpoint_notes: Arc::default(),
+            pending_context: Vec::new(),
+            last_shell: None,
+            shell_runs: 0,
+            interactive: false,
+            editor_pending: false,
         };
 
         if let Some(path) = controller.options.resume.clone() {
@@ -551,6 +569,13 @@ impl Controller {
             }
         }
         let cfg = self.cfg();
+        self.app.keymap = crate::keymap::Keymap::load();
+        match (cfg.general.vim(), self.app.vim.is_some()) {
+            (true, false) => self.app.vim = Some(crate::state::Vim::default()),
+            (false, true) => self.app.vim = None,
+            _ => {}
+        }
+        self.app.files = crate::mentions::list_files(&self.cwd);
         self.fingerprint = context::fingerprint(&self.cwd);
         self.cost.set_table(zarn_config::pricing::table(&cfg));
         self.app.status.cost = self.cost.total().usd;
@@ -849,6 +874,20 @@ impl Controller {
                     if !self.on_terminal(event) {
                         break;
                     }
+                    if self.editor_pending {
+                        self.editor_pending = false;
+                        let _ = crossterm::terminal::disable_raw_mode();
+                        let _ = crossterm::execute!(
+                            std::io::stdout(),
+                            crossterm::terminal::LeaveAlternateScreen,
+                            crossterm::cursor::Show
+                        );
+                        self.open_editor();
+                        let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen);
+                        let _ = crossterm::terminal::enable_raw_mode();
+                        let _ = terminal.clear();
+                        keys = EventStream::new();
+                    }
                 }
                 event = ui_rx.recv() => {
                     match event {
@@ -1089,6 +1128,10 @@ impl Controller {
                 }
             }
             Action::Plan(verdict) => self.decide_plan(verdict),
+            Action::Shell(command) => self.shell(command),
+            Action::Editor if self.interactive => self.editor_pending = true,
+            Action::Editor => self.open_editor(),
+            Action::Remember(note) => self.remember(note),
             Action::SaveRule(pattern, scope) => {
                 let result = match self.layers() {
                     Some(layers) => ops::add_permission_rule(layers, scope, Policy::Allow, &pattern),
@@ -1243,8 +1286,7 @@ impl Controller {
             return self.submit(text);
         };
         if self.app.streaming {
-            self.app.queue.push(text.clone());
-            self.app.blocks.push(Block::Queued(text));
+            self.app.enqueue(text.clone(), text);
             return;
         }
         let agent = Agent::new(
@@ -1332,6 +1374,86 @@ impl Controller {
         )
     }
 
+    fn shell(&mut self, command: String) {
+        self.shell_runs += 1;
+        let id = format!("shell-{}", self.shell_runs);
+        let args = serde_json::json!({ "command": command });
+        self.app.apply(AgentEvent::ToolStarted {
+            id: id.clone(),
+            name: "bash".into(),
+            args: args.clone(),
+        });
+        let gate = self.hooked_gate();
+        let ctx = self.ctx.clone();
+        let sandbox = self.cfg().general.sandbox();
+        let tx = self.ui_tx.clone();
+        tokio::spawn(async move {
+            let output = match gate.check("bash", Risk::Execute, &args).await {
+                zarn_core::agent::GateDecision::Deny(reason) => zarn_core::tools::ToolOutput::error(reason),
+                zarn_core::agent::GateDecision::Allow => {
+                    let tool = if sandbox {
+                        zarn_tools::bash::Bash::sandboxed()
+                    } else {
+                        zarn_tools::bash::Bash::new()
+                    };
+                    let tool = guard::redacting(Box::new(tool));
+                    match tool.run(args, &ctx).await {
+                        Ok(out) => out,
+                        Err(err) => zarn_core::tools::ToolOutput::error(format!("{err:#}")),
+                    }
+                }
+            };
+            let _ = tx.send(UiEvent::Shell { id, command, output }).await;
+        });
+    }
+
+    fn open_editor(&mut self) {
+        let editor = std::env::var("VISUAL")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| std::env::var("EDITOR").ok().filter(|v| !v.trim().is_empty()));
+        match crate::editor::edit_text(&self.app.input, editor.as_deref()) {
+            Ok(text) => self.app.set_input(text),
+            Err(err) => self.app.notice(err),
+        }
+    }
+
+    fn remember(&mut self, note: String) {
+        let project = self.cwd.join(context::MEMORY_FILE);
+        let user = paths::user_dir().map(|d| d.join(context::MEMORY_FILE));
+        match user.filter(|u| u.exists() && project.exists()) {
+            Some(user) => {
+                let choices = vec![
+                    Choice::new(project.display().to_string(), "project ZARN.md").with_detail(project.display().to_string()),
+                    Choice::new(user.display().to_string(), "user ZARN.md").with_detail(user.display().to_string()),
+                ];
+                self.app.overlay = Some(Overlay::Pick(
+                    Picker::new("Add the note to which ZARN.md?", choices),
+                    ChatPick::Memory(note),
+                ));
+            }
+            None => self.append_memory(&note, &project),
+        }
+    }
+
+    fn append_memory(&mut self, note: &str, path: &Path) {
+        let project = self.cwd.join(context::MEMORY_FILE);
+        let user = paths::user_dir().map(|d| d.join(context::MEMORY_FILE));
+        if path != project && Some(path.to_path_buf()) != user {
+            self.app.notice("refusing to write a note anywhere but a ZARN.md");
+            return;
+        }
+        let mut body = std::fs::read_to_string(path).unwrap_or_default();
+        if !body.is_empty() && !body.ends_with('\n') {
+            body.push('\n');
+        }
+        body.push_str(&format!("- {}\n", note.replace('\n', " ")));
+        match path.parent().map(std::fs::create_dir_all).unwrap_or(Ok(())).and_then(|_| std::fs::write(path, body)) {
+            Ok(()) => self.app.notice(format!("noted in {}", path.display())),
+            Err(err) => self.app.notice(format!("could not write {}: {err}", path.display())),
+        }
+    }
+
     fn rewind_picker(&mut self) {
         if self.app.streaming {
             self.app.notice("wait for the turn to finish, or press esc to cancel it, before rewinding");
@@ -1417,8 +1539,7 @@ impl Controller {
 
     fn submit(&mut self, text: String) {
         if self.app.streaming {
-            self.app.queue.push(text.clone());
-            self.app.blocks.push(Block::Queued(text));
+            self.app.enqueue(text.clone(), text);
             return;
         }
         let hooks = self.hooks();
@@ -1443,6 +1564,52 @@ impl Controller {
         self.submit_checked(text);
     }
 
+    fn user_message(&mut self, text: &str, vision: bool) -> Message {
+        let mut images = Vec::new();
+        let mut rest = text.to_string();
+        while let Some(start) = rest.find(crate::state::IMAGE_MARK) {
+            let after = &rest[start + crate::state::IMAGE_MARK.len()..];
+            let Some(end) = after.find("]]") else { break };
+            images.push(std::path::PathBuf::from(&after[..end]));
+            rest.replace_range(start..start + crate::state::IMAGE_MARK.len() + end + 2, "");
+        }
+        let expanded = crate::mentions::expand(rest.trim(), &self.cwd, vision, crate::mentions::ATTACH_BYTES);
+        for note in &expanded.notes {
+            self.app.notice(note.clone());
+        }
+        let mut content = expanded.content;
+        for path in images {
+            let name = path.display().to_string();
+            if !vision {
+                self.app.notice(format!(
+                    "{name} is an image, but this model does not accept images; it was not attached"
+                ));
+                continue;
+            }
+            let Some(mime) = crate::mentions::image_mime(&name) else { continue };
+            match std::fs::metadata(&path) {
+                Ok(meta) if meta.len() > crate::mentions::IMAGE_BYTES => {
+                    self.app.notice(format!("{name} is over 5 MB; it was not attached"));
+                }
+                Ok(_) => match std::fs::read(&path) {
+                    Ok(data) => content.push(zarn_core::types::Content::Image {
+                        mime: mime.to_string(),
+                        data,
+                    }),
+                    Err(err) => self.app.notice(format!("{name} could not be read: {err}")),
+                },
+                Err(err) => self.app.notice(format!("{name} could not be read: {err}")),
+            }
+        }
+        if !self.pending_context.is_empty()
+            && let Some(zarn_core::types::Content::Text(first)) = content.first_mut()
+        {
+            let context = std::mem::take(&mut self.pending_context).join("\n\n");
+            *first = format!("{context}\n\n{first}");
+        }
+        Message::User(content)
+    }
+
     fn submit_checked(&mut self, text: String) {
         if !self.check_caps(true) {
             return;
@@ -1459,7 +1626,9 @@ impl Controller {
             self.app.notice(format!("cannot send: {why}"));
             return;
         };
-        self.messages.push(Message::user(text));
+        let vision = agent.provider().caps().vision;
+        let message = self.user_message(&text, vision);
+        self.messages.push(message);
         self.cancel = CancellationToken::new();
         self.app.streaming = true;
         spawn_turn(agent, self.messages.clone(), self.ui_tx.clone(), self.cancel.clone());
@@ -1625,6 +1794,15 @@ impl Controller {
             UiEvent::Title(Err(err)) => tracing::debug!(error = %err, "no session title"),
             UiEvent::Compared(sides) => self.app.blocks.push(Block::Compare(sides)),
             UiEvent::HookFailed(text) => self.app.notice(text),
+            UiEvent::Shell { id, command, output } => {
+                self.last_shell = Some((command, output.content.clone()));
+                self.app.apply(AgentEvent::ToolFinished {
+                    id,
+                    name: "bash".into(),
+                    output,
+                });
+                self.app.notice("not sent to the model; /attach-output adds it to your next message");
+            }
             UiEvent::Prompted { text, blocked } => {
                 self.app.streaming = false;
                 match blocked {
@@ -1832,6 +2010,8 @@ impl Controller {
             ChatPick::Logout => self.logout(&value),
             ChatPick::Profile => self.use_profile(&value),
             ChatPick::Rewind => self.confirm_rewind(&value),
+            ChatPick::Memory(note) => self.append_memory(&note, Path::new(&value)),
+            ChatPick::History => self.app.set_input(value),
             ChatPick::Mode if value == "bypass" => self.ask_bypass(),
             ChatPick::Mode => self.set_mode(&value, true),
         }
@@ -2008,7 +2188,11 @@ impl Controller {
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
-                self.app.notice(text);
+                let keys = self.app.keymap.help();
+                self.app.notice(format!(
+                    "{text}\n\nkeys (rebind in ~/.config/zarn/keybindings.toml):\n{keys}\n\n{}\n\n!command runs a shell command without the model · #note adds a line to ZARN.md · @path attaches a file",
+                    crate::state::VIM_HELP
+                ));
             }
             "clear" => {
                 self.messages.truncate(1);
@@ -2027,6 +2211,31 @@ impl Controller {
                 self.start_compaction(false);
             }
             "rewind" => self.rewind_picker(),
+            "history" => {
+                let mut seen = std::collections::BTreeSet::new();
+                let choices: Vec<Choice> = self
+                    .app
+                    .history
+                    .iter()
+                    .rev()
+                    .filter(|h| seen.insert((*h).clone()))
+                    .map(|h| Choice::new(h.clone(), h.replace('\n', " ")))
+                    .collect();
+                if choices.is_empty() {
+                    self.app.notice("no earlier inputs yet");
+                } else {
+                    let picker = Picker::new("Search earlier inputs (type to filter)", choices);
+                    self.app.overlay = Some(Overlay::Pick(picker, ChatPick::History));
+                }
+            }
+            "attach-output" => match self.last_shell.take() {
+                Some((command, output)) => {
+                    self.pending_context
+                        .push(format!("Output of `{command}`, run by the user:\n{output}"));
+                    self.app.notice(format!("the output of `{command}` will go with your next message"));
+                }
+                None => self.app.notice("no ! command output to attach; run one with !command"),
+            },
             "profile" => match first {
                 Some(name) => self.use_profile(name),
                 None => self.profile_picker(),
@@ -2286,6 +2495,7 @@ impl Controller {
                 let store = self.store.clone();
                 let tx = self.ui_tx.clone();
                 let mut checks = terminal::checks(Some(self.keyboard));
+                checks.extend(crate::keymap::checks());
                 tokio::spawn(async move {
                     let mut all = doctor::run(&store, paths::project_config(), paths::user_config(), true).await;
                     all.append(&mut checks);

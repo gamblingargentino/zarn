@@ -6,9 +6,9 @@
 │  cost display          on                                                                        │
 │  auto-compact          on  compact when the context is 80% full                                  │
 │  read-only commands    on  ls, git status and the like run without asking                        │
+│  vim input             off  normal and insert modes in the input; /help lists the keys           │
 │  bash sandbox          off  scrubbed environment only; not OS isolation, see /doctor             │
 │  session spend cap     off                                                                       │
-│  daily spend cap       off                                                                       │
 │                                                                                                  │
 │↑↓ move · ←→ tab · enter change · esc close                                                       │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

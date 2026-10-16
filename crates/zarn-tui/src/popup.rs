@@ -25,6 +25,7 @@ pub const BUILTINS: &[(&str, &str, &str)] = &[
     ("help", "", "list the commands"),
     ("clear", "", "drop the conversation and start over"),
     ("compact", "", "summarize the conversation to free context"),
+    ("attach-output", "", "add the last !command output to your next message"),
     ("rewind", "", "undo the file changes and messages of recent turns (esc esc)"),
     ("cost", "", "show token usage and cost for this session"),
     ("context", "", "show what fills the context window"),
@@ -137,6 +138,17 @@ pub fn split(line: &str) -> Option<(String, String)> {
 }
 
 pub fn draw(frame: &mut Frame, area: Rect, shown: &[&Entry], selected: usize, accent: Color) {
+    draw_with(frame, area, shown, selected, accent, '/');
+}
+
+pub fn draw_with(
+    frame: &mut Frame,
+    area: Rect,
+    shown: &[&Entry],
+    selected: usize,
+    accent: Color,
+    prefix: char,
+) {
     if shown.is_empty() || area.height < 3 {
         return;
     }
@@ -146,7 +158,7 @@ pub fn draw(frame: &mut Frame, area: Rect, shown: &[&Entry], selected: usize, ac
     let rect = Rect {
         x: area.x,
         y: area.y + area.height - height,
-        width: area.width.min(72),
+        width: area.width.min(if prefix == '/' { 72 } else { 90 }),
         height,
     };
     let name_width = shown.iter().map(|e| e.name.len()).max().unwrap_or(0) + 1;
@@ -165,7 +177,7 @@ pub fn draw(frame: &mut Frame, area: Rect, shown: &[&Entry], selected: usize, ac
             };
             Line::from(vec![
                 Span::styled(marker, Style::default().fg(accent)),
-                Span::styled(format!("/{:<name_width$}", entry.name), name_style),
+                Span::styled(format!("{prefix}{:<name_width$}", entry.name), name_style),
                 Span::styled(entry.description.clone(), Style::default().fg(Color::DarkGray)),
             ])
         })

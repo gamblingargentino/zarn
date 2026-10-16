@@ -152,6 +152,7 @@ pub enum RowKind {
     DayCap,
     ReadOnly,
     Sandbox,
+    Vim,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -760,6 +761,8 @@ impl Panel {
                     RowKind::ReadOnly,
                 )
                 .note("ls, git status and the like run without asking"),
+                Row::new("vim input", on_off(cfg.general.vim()), RowKind::Vim)
+                    .note("normal and insert modes in the input; /help lists the keys"),
                 Row::new("bash sandbox", on_off(cfg.general.sandbox()), RowKind::Sandbox)
                     .note("scrubbed environment only; not OS isolation, see /doctor"),
                 Row::new(
@@ -1313,6 +1316,11 @@ impl Panel {
                     g.auto_allow_read_only = Some(value)
                 });
                 self.saved(format!("read-only commands without asking: {}", on_off(value)), result)
+            }
+            RowKind::Vim => {
+                let value = !cfg.general.vim();
+                let result = ops::set_general(&mut self.layers, GeneralField::Vim, |g| g.vim = Some(value));
+                self.saved(format!("vim input {}", on_off(value)), result)
             }
             RowKind::Sandbox => {
                 let value = !cfg.general.sandbox();

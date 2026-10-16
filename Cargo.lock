@@ -4520,6 +4520,7 @@ dependencies = [
  "async-trait",
  "crossterm",
  "futures",
+ "ignore",
  "ratatui",
  "serde_json",
  "syntect",

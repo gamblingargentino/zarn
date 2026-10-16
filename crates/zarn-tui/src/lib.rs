@@ -1,5 +1,8 @@
 pub mod brand;
+pub mod editor;
+pub mod keymap;
 pub mod markdown;
+pub mod mentions;
 pub mod onboarding;
 pub mod popup;
 pub mod prompt;

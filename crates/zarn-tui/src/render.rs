@@ -34,6 +34,11 @@ pub fn draw(frame: &mut Frame, app: &App) {
         let shown = app.popup_matches();
         let selected = app.popup_selected.min(shown.len().saturating_sub(1));
         popup::draw(frame, areas[0], &shown, selected, app.theme.accent);
+    } else if app.mention_visible() {
+        let entries = app.mention_entries();
+        let shown: Vec<&popup::Entry> = entries.iter().collect();
+        let selected = app.popup_selected.min(shown.len().saturating_sub(1));
+        popup::draw_with(frame, areas[0], &shown, selected, app.theme.accent, '@');
     }
 
     match &app.overlay {
@@ -362,7 +367,11 @@ fn permission_lines(request: &crate::state::PermissionRequest, expanded: bool) -
 
 fn status(frame: &mut Frame, app: &App, area: Rect) {
     let mode = if app.status.mode.is_empty() { "default" } else { app.status.mode.as_str() };
-    let mut parts = vec![
+    let mut parts = Vec::new();
+    if let Some(vim) = app.vim {
+        parts.push(if vim.normal { "NORMAL".to_string() } else { "INSERT".to_string() });
+    }
+    parts.extend([
         format!("{mode} mode"),
         app.status.model.clone(),
         format!(
@@ -370,7 +379,7 @@ fn status(frame: &mut Frame, app: &App, area: Rect) {
             compact(app.status.input_tokens),
             compact(app.status.output_tokens)
         ),
-    ];
+    ]);
     if app.status.cached_tokens > 0 {
         parts.push(format!("{} cached", compact(app.status.cached_tokens)));
     }

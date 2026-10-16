@@ -139,6 +139,7 @@ impl Layers {
             GeneralField::Mode => g.mode.is_some(),
             GeneralField::ReadOnly => g.auto_allow_read_only.is_some(),
             GeneralField::Sandbox => g.sandbox.is_some(),
+            GeneralField::Vim => g.vim.is_some(),
         })
     }
 
@@ -167,6 +168,7 @@ pub enum GeneralField {
     Mode,
     ReadOnly,
     Sandbox,
+    Vim,
 }
 
 #[cfg(test)]

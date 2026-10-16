@@ -62,6 +62,8 @@ pub struct General {
     pub auto_allow_read_only: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sandbox: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vim: Option<bool>,
 }
 
 impl General {
@@ -77,6 +79,11 @@ impl General {
         self.read_only_commands = self.read_only_commands.take().or(other.read_only_commands);
         self.auto_allow_read_only = self.auto_allow_read_only.or(other.auto_allow_read_only);
         self.sandbox = self.sandbox.or(other.sandbox);
+        self.vim = self.vim.or(other.vim);
+    }
+
+    pub fn vim(&self) -> bool {
+        self.vim.unwrap_or(false)
     }
 
     pub fn sandbox(&self) -> bool {
