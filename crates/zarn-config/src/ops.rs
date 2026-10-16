@@ -644,10 +644,15 @@ pub fn switch_provider(layers: &mut Layers, provider: &str) -> Result<String> {
     let profile = cfg.default_profile();
     let current = cfg.profiles.get(&profile).and_then(|p| p.provider.clone());
     set_profile_provider(layers, &profile, provider)?;
-    if current.as_deref() != Some(provider)
-        && let Some(model) = model_for(&cfg, provider)
-    {
-        set_profile_model(layers, &profile, &model)?;
+    if current.as_deref() != Some(provider) {
+        let model = model_for(&cfg, provider).or_else(|| {
+            let spec = cfg.providers.get(provider)?;
+            pick_model(spec, &crate::quota::cached_models(&crate::quota::cache_dir(), provider))
+        });
+        match model {
+            Some(model) => set_profile_model(layers, &profile, &model)?,
+            None => save_profile(layers, &profile, |p| p.model = None)?,
+        }
     }
     Ok(profile)
 }

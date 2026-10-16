@@ -298,6 +298,7 @@ fn wire_events(frame: Wire, tracker: &mut Tracker, stop: &mut Option<StopReason>
 }
 
 fn http_error(status: reqwest::StatusCode, body: String) -> ProviderError {
+    let body = format!("{} (HTTP {})", crate::error_message(&body), status.as_u16());
     match status.as_u16() {
         401 | 403 => ProviderError::Auth(body),
         429 => ProviderError::RateLimit(body),

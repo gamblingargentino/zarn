@@ -319,9 +319,13 @@ impl Picker {
                 }
                 None => Pick::Pending,
             },
-            KeyCode::Tab if self.allow_custom && !self.filter.value.trim().is_empty() => {
-                Pick::Custom(self.filter.value.trim().to_string())
-            }
+            KeyCode::Tab => match self.current() {
+                Some(choice) => Pick::Chosen(choice.value.clone()),
+                None if self.allow_custom && !self.filter.value.trim().is_empty() => {
+                    Pick::Custom(self.filter.value.trim().to_string())
+                }
+                None => Pick::Pending,
+            },
             _ => {
                 if self.filter.on_key(key) == Edit::Changed {
                     self.selected = 0;

@@ -534,7 +534,10 @@ fn card_lines_full(card: &ToolCard, full: bool) -> Vec<Line<'static>> {
             lines.push(Line::from(vec![
                 Span::styled("│ ", edge),
                 Span::styled(
-                    format!("… {} more lines (ctrl+r)", all.len() - shown),
+                    match all.len() - shown {
+                        1 => "… 1 more line (ctrl+r)".to_string(),
+                        n => format!("… {n} more lines (ctrl+r)"),
+                    },
                     Style::default().fg(theme::dim()),
                 ),
             ]));

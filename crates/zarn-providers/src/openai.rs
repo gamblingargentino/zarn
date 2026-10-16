@@ -271,6 +271,7 @@ fn chunk_events(
 }
 
 fn http_error(status: reqwest::StatusCode, body: String) -> ProviderError {
+    let body = format!("{} (HTTP {})", crate::error_message(&body), status.as_u16());
     match status.as_u16() {
         401 | 403 => ProviderError::Auth(body),
         429 => ProviderError::RateLimit(body),
@@ -283,20 +284,34 @@ fn http_error(status: reqwest::StatusCode, body: String) -> ProviderError {
 #[async_trait]
 impl Provider for OpenAiCompatProvider {
     async fn stream(&self, req: Request) -> Result<BoxStream<'static, Event>, ProviderError> {
-        let response = self
-            .client
-            .post(self.endpoint())
-            .bearer_auth(&self.api_key)
-            .json(&encode_body(&req))
-            .send()
-            .await
-            .map_err(|e| ProviderError::Network(e.to_string()))?;
-
-        let status = response.status();
-        if !status.is_success() {
-            let body = response.text().await.unwrap_or_default();
-            return Err(http_error(status, body));
-        }
+        let mut body = encode_body(&req);
+        let mut retried = false;
+        let response = loop {
+            let response = self
+                .client
+                .post(self.endpoint())
+                .bearer_auth(&self.api_key)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|e| ProviderError::Network(e.to_string()))?;
+            let status = response.status();
+            if status.is_success() {
+                break response;
+            }
+            let text = response.text().await.unwrap_or_default();
+            if status.as_u16() == 402
+                && !retried
+                && let Some(limit) = crate::affordable_tokens(&crate::error_message(&text))
+                && limit >= 64
+                && limit < req.max_tokens
+            {
+                retried = true;
+                body["max_tokens"] = json!(limit);
+                continue;
+            }
+            return Err(http_error(status, text));
+        };
 
         let (tx, rx) = mpsc::channel(64);
         tokio::spawn(async move {

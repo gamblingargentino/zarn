@@ -280,18 +280,12 @@ pub async fn limits(name: &str, spec: &ProviderSpec, model: &str) -> Result<Limi
     let client = client()?;
     let base = base_url(spec);
     let request = match kind(spec) {
-        "ollama" => return Ok(Limits::NotExposed),
+        "ollama" | "google" => return Ok(Limits::NotExposed),
         "anthropic" => client.post(format!("{base}/messages")).json(&json!({
             "model": model,
             "max_tokens": 1,
             "messages": [{ "role": "user", "content": "hi" }]
         })),
-        "google" => client
-            .post(format!("{base}/models/{model}:generateContent"))
-            .json(&json!({
-                "contents": [{ "role": "user", "parts": [{ "text": "hi" }] }],
-                "generationConfig": { "maxOutputTokens": 1 }
-            })),
         _ => client.post(format!("{base}/chat/completions")).json(&json!({
             "model": model,
             "max_tokens": 1,

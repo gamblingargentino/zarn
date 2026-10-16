@@ -153,3 +153,52 @@ async fn popups_pickers_and_settings_take_clicks() {
         _ => panic!("the panel closed"),
     }
 }
+
+#[tokio::test]
+async fn switching_provider_picks_one_of_its_models_and_model_names_are_checked() {
+    let mock = echo_server("ok").await;
+    let other = echo_server("from other").await;
+    wiremock::Mock::given(wiremock::matchers::method("GET"))
+        .and(wiremock::matchers::path("/models"))
+        .respond_with(wiremock::ResponseTemplate::new(200).set_body_string(
+            "{\"data\":[{\"id\":\"text-embedding-3\"},{\"id\":\"vendor/model-a\"},{\"id\":\"vendor/model-b\"}]}",
+        ))
+        .mount(&other)
+        .await;
+    let env = Env::new(&format!(
+        "{}\n[providers.other]\nkind = \"openai-compat\"\nbase_url = \"{}\"\n",
+        provider_config(&mock.uri(), ""),
+        other.uri()
+    ))
+    .await;
+    let mut c = env.controller();
+    c.type_line("/provider switch other");
+    wait_for(&mut c, Duration::from_secs(10), |c| notices(c).iter().any(|n| n.contains("models found"))).await;
+    assert!(
+        notices(&c).iter().any(|n| n.contains("other: 3 models found · using vendor/model-a")),
+        "{:?}",
+        notices(&c)
+    );
+    wait_for(&mut c, Duration::from_secs(2), |c| c.app().status.model == "vendor/model-a").await;
+    assert_eq!(c.app().status.model, "vendor/model-a", "the model of the old provider is not carried over");
+
+    c.type_line("/model aion");
+    assert!(notices(&c).last().unwrap().contains("'aion' is not one of the 3 models other lists"), "{:?}", notices(&c));
+    assert_eq!(c.app().status.model, "vendor/model-a");
+    c.app_mut().set_input("/model vendor");
+    c.key(code(KeyCode::Esc));
+    c.key(code(KeyCode::Enter));
+    assert!(notices(&c).last().unwrap().contains("matches 2 models"), "{:?}", notices(&c));
+    c.type_line("/model model-b");
+    assert_eq!(c.app().status.model, "vendor/model-b");
+
+    c.type_line("/model");
+    assert!(matches!(c.app().overlay, Some(Overlay::Pick(..))));
+    for ch in "model-a".chars() {
+        c.key(code(KeyCode::Char(ch)));
+    }
+    c.key(code(KeyCode::Tab));
+    assert_eq!(c.app().status.model, "vendor/model-a", "tab takes the highlighted model, not the typed text");
+    turn(&mut c, "hi").await;
+    assert_eq!(assistant(&c).last().map(String::as_str), Some("from other"));
+}

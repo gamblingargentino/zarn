@@ -2977,7 +2977,74 @@ impl Controller {
         }
     }
 
+    fn load_models_for(&mut self, provider: &str) {
+        let Some(layers) = self.layers.clone() else {
+            return;
+        };
+        let spec = match ops::spec_with_key(&layers.merged(), &self.store, provider) {
+            Ok(spec) => spec,
+            Err(err) => {
+                self.app.notice(format!("{err:#}"));
+                return;
+            }
+        };
+        let provider = provider.to_string();
+        let tx = self.ui_tx.clone();
+        tokio::spawn(async move {
+            let mut layers = layers;
+            let cache = zarn_config::quota::cache_dir();
+            let result = match ops::check_key(&provider, &spec, None).await {
+                Ok(models) => match ops::adopt_models(&mut layers, &cache, &provider, &spec, &models) {
+                    Ok(Some(model)) => Ok(format!("{provider}: {} models found · using {model} · /model to pick another", models.len())),
+                    Ok(None) => Ok(format!("{provider}: {} models found · /model to pick one", models.len())),
+                    Err(err) => Err(format!("{err:#}")),
+                },
+                Err(err) => Err(format!("{provider}: could not load its models: {err} · set one with /model <name>")),
+            };
+            let _ = tx.send(UiEvent::LoginDone(result)).await;
+        });
+    }
+
+    fn known_model(&self, model: &str) -> Result<String, String> {
+        let cfg = self.cfg();
+        let provider = cfg
+            .profiles
+            .get(&self.profile())
+            .and_then(|p| p.provider.clone())
+            .unwrap_or_default();
+        let listed: Vec<String> = zarn_config::quota::cached_models(&zarn_config::quota::cache_dir(), &provider)
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        if listed.is_empty() || listed.iter().any(|m| m == model) {
+            return Ok(model.to_string());
+        }
+        let needle = model.to_lowercase();
+        let close: Vec<&String> = listed.iter().filter(|m| m.to_lowercase().contains(&needle)).collect();
+        match close.as_slice() {
+            [only] => Ok((*only).clone()),
+            [] => Err(format!(
+                "'{model}' is not one of the {} models {provider} lists; /model shows them, /models refresh updates the list",
+                listed.len()
+            )),
+            many => Err(format!(
+                "'{model}' matches {} models {provider} lists: {}{}; pick one with /model",
+                many.len(),
+                many.iter().take(6).map(|m| m.as_str()).collect::<Vec<_>>().join(", "),
+                if many.len() > 6 { ", …" } else { "" }
+            )),
+        }
+    }
+
     fn set_model(&mut self, model: &str) {
+        let model = match self.known_model(model.trim()) {
+            Ok(model) => model,
+            Err(err) => {
+                self.app.notice(err);
+                return;
+            }
+        };
+        let model = model.as_str();
         let profile = self.profile();
         let result = match self.layers() {
             Some(layers) => ops::set_profile_model(layers, &profile, model),
@@ -3039,15 +3106,14 @@ impl Controller {
             Ok(profile) => {
                 self.options.model = None;
                 self.rebuild();
-                let model = self
-                    .cfg()
-                    .profiles
-                    .get(&profile)
-                    .and_then(|p| p.model.clone())
-                    .unwrap_or_else(|| "none".into());
-                self.app.notice(format!(
-                    "profile {profile} now uses {provider} with model {model}"
-                ));
+                let model = self.cfg().profiles.get(&profile).and_then(|p| p.model.clone());
+                match model {
+                    Some(model) => self.app.notice(format!("profile {profile} now uses {provider} with model {model}")),
+                    None => {
+                        self.app.notice(format!("profile {profile} now uses {provider}; loading its models to pick one…"));
+                        self.load_models_for(provider);
+                    }
+                }
             }
             Err(err) => self.app.notice(format!("{err:#}")),
         }

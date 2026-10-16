@@ -92,7 +92,7 @@ pub const KINDS: &[Kind] = &[
         needs_key: true,
         env_hint: Some("GEMINI_API_KEY"),
         models: &["gemini-2.5-pro", "gemini-2.5-flash"],
-        key_prefixes: &["AIza"],
+        key_prefixes: &["AIza", "AQ."],
         key_page: Some("https://aistudio.google.com/apikey"),
     },
     hosted("openrouter", "OpenRouter (hundreds of models, one key)", "https://openrouter.ai/api/v1", "OPENROUTER_API_KEY", &["sk-or-"], "https://openrouter.ai/keys", &[]),
@@ -308,6 +308,7 @@ mod tests {
         assert_eq!(one("sk-proj-test-key-not-real"), "openai");
         assert_eq!(one("gsk_test-key-not-real"), "groq");
         assert_eq!(one("AIza-test-key-not-real"), "google");
+        assert_eq!(one("AQ.test-key-not-real"), "google");
         assert_eq!(one("xai-test-key-not-real"), "xai");
         assert_eq!(one("pplx-test-key-not-real"), "perplexity");
         assert_eq!(one("nvapi-test-key-not-real"), "nvidia");

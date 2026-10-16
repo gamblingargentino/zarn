@@ -284,8 +284,9 @@ impl SystemParts {
 
 pub fn system_parts_in(cwd: &Path, user_dir: Option<&Path>, skills: &[Skill], budget: u32) -> SystemParts {
     let base = format!(
-        "You are zarn, a coding agent working in {}. Use the tools to read, search, edit and run code. Be concise.",
-        cwd.display()
+        "You are zarn, a coding agent working in {0}. Use the tools to read, search, edit and run code. Be concise.\n\n{1} Relative paths in tool calls resolve against {0}; MCP servers may use their own root, so give them absolute paths.",
+        cwd.display(),
+        zarn_tools::bash::environment_note()
     );
     let memory = memory_section(&memory_files(cwd, user_dir), budget);
     let memory = if memory.is_empty() {

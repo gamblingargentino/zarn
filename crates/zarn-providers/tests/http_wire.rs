@@ -12,6 +12,57 @@ fn test_request() -> Request {
 mod openai {
     use super::*;
 
+    const OUT_OF_CREDIT: &str = r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 4096 tokens, but can only afford 4000. To increase, visit https://openrouter.ai/settings/credits and upgrade to a paid account","code":402,"metadata":{"raw":"[{\"code\":402},{\"code\":402},{\"code\":402}]"}},"user_id":"user_x"}"#;
+
+    #[tokio::test]
+    async fn a_credit_limit_on_max_tokens_is_retried_once_with_what_the_account_affords() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(|req: &wiremock::Request| {
+                serde_json::from_slice::<serde_json::Value>(&req.body).is_ok_and(|b| b["max_tokens"] == 4096)
+            })
+            .respond_with(ResponseTemplate::new(402).set_body_string(OUT_OF_CREDIT))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(|req: &wiremock::Request| {
+                serde_json::from_slice::<serde_json::Value>(&req.body).is_ok_and(|b| b["max_tokens"] == 4000)
+            })
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+                    .insert_header("content-type", "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = OpenAiCompatProvider::new(server.uri(), "test-key-not-real");
+        let mut request = test_request();
+        request.max_tokens = 4096;
+        let mut stream = provider.stream(request).await.unwrap();
+        assert_eq!(stream.next().await.unwrap(), Event::TextDelta("hi".into()));
+    }
+
+    #[tokio::test]
+    async fn an_error_shows_the_provider_message_not_the_raw_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(402).set_body_string(OUT_OF_CREDIT.replace("4096", "50").replace("4000", "10")))
+            .mount(&server)
+            .await;
+        let provider = OpenAiCompatProvider::new(server.uri(), "test-key-not-real");
+        let mut request = test_request();
+        request.max_tokens = 50;
+        let err = match provider.stream(request).await {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(err.contains("This request requires more credits"), "{err}");
+        assert!(err.contains("(HTTP 402)"), "{err}");
+        assert!(!err.contains("metadata") && !err.contains("user_id"), "{err}");
+    }
+
     #[tokio::test]
     async fn posts_to_chat_completions_with_bearer_auth() {
         let server = MockServer::start().await;

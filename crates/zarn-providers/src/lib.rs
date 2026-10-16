@@ -26,6 +26,38 @@ use std::sync::Arc;
 use zarn_core::prompted::PromptedProvider;
 use zarn_core::provider::{Caps, Provider, ProviderError, ToolSupport};
 
+pub fn error_message(body: &str) -> String {
+    let trimmed = body.trim();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        let value = match &value {
+            serde_json::Value::Array(items) => items.first().cloned().unwrap_or(serde_json::Value::Null),
+            other => other.clone(),
+        };
+        let found = ["/error/message", "/message", "/detail", "/error/detail", "/error_message"]
+            .iter()
+            .find_map(|path| value.pointer(path).and_then(|v| v.as_str()))
+            .or_else(|| value.get("error").and_then(|v| v.as_str()));
+        if let Some(message) = found {
+            return message.trim().to_string();
+        }
+    }
+    let mut short: String = trimmed.chars().take(300).collect();
+    if trimmed.chars().count() > 300 {
+        short.push('…');
+    }
+    short
+}
+
+pub fn affordable_tokens(message: &str) -> Option<u32> {
+    let at = message.find("can only afford")? + "can only afford".len();
+    let digits: String = message[at..]
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ProviderSpec {
     pub kind: String,
