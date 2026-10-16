@@ -71,8 +71,17 @@ pub struct ToolCard {
     pub expanded: bool,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompareSide {
+    pub label: String,
+    pub text: String,
+    pub meta: String,
+    pub failed: bool,
+}
+
 #[derive(Debug)]
 pub enum Block {
+    Compare(Vec<CompareSide>),
     User(String),
     Assistant(String),
     Tool(ToolCard),
@@ -100,11 +109,13 @@ pub enum ChatPick {
     Login,
     Logout,
     Mode,
+    Profile,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfirmFor {
     Bypass,
+    Prompted(String),
 }
 
 #[derive(Debug)]
@@ -501,6 +512,9 @@ impl App {
 
         match (key.code, key.modifiers) {
             (KeyCode::BackTab, _) => return Some(Action::CycleMode),
+            (KeyCode::Char('p'), m) if m.contains(KeyModifiers::CONTROL) => {
+                return Some(Action::Command("/profile".into()));
+            }
             (KeyCode::Tab, m) if m.contains(KeyModifiers::SHIFT) => return Some(Action::CycleMode),
             (KeyCode::Char('r'), m) if m.contains(KeyModifiers::CONTROL) => {
                 self.expand_last_output()
@@ -735,6 +749,12 @@ mod tests {
         app.streaming = true;
         assert_eq!(typed(&mut app, "/cost"), Some(Action::Command("/cost".into())));
         assert!(app.queue.is_empty());
+    }
+
+    #[test]
+    fn ctrl_p_opens_the_profile_picker() {
+        let mut app = App::new("m");
+        assert_eq!(app.on_key(ctrl('p')), Some(Action::Command("/profile".into())));
     }
 
     #[test]

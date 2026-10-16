@@ -2,7 +2,7 @@ use crate::brand;
 use crate::onboarding::{self, Onboarding};
 use crate::popup;
 use crate::render;
-use crate::settings::{self, Panel, PanelData, RowKind, SkillRow, Tab, TestState};
+use crate::settings::{self, Panel, PanelData, QuotaState, RowKind, SkillRow, Tab, TestState};
 use crate::state::{Action, App, Block, ChatPick, ConfirmFor, Mode, Overlay, PermissionRequest, PlanReview};
 use crate::terminal;
 use crate::widgets::{Choice, MaskedInput, Picker};
@@ -115,7 +115,7 @@ enum UiEvent {
     OnboardTest(Result<String, String>),
     Models {
         target: ModelTarget,
-        models: Vec<String>,
+        models: Vec<(String, Option<u32>)>,
     },
     Mcp {
         name: String,
@@ -125,6 +125,12 @@ enum UiEvent {
     Doctor(String),
     Notice(String),
     Title(Result<String, String>),
+    Quota {
+        reports: Vec<zarn_config::quota::Report>,
+        chat: bool,
+    },
+    Compared(Vec<crate::state::CompareSide>),
+    Window { model: String, window: u32 },
 }
 
 struct McpState {
@@ -186,6 +192,13 @@ pub struct Controller {
     warned: std::collections::BTreeSet<String>,
     titled: bool,
     title: Option<String>,
+    ledger: zarn_config::spend::Ledger,
+    day_base: f64,
+    session_base: f64,
+    cap_notes: std::collections::BTreeSet<String>,
+    cap_stopped: bool,
+    parse_failures: u32,
+    window: Option<(String, u32)>,
 }
 
 fn flatten_messages(messages: &[Message]) -> Vec<Block> {
@@ -246,6 +259,13 @@ impl Controller {
             warned: Default::default(),
             titled: false,
             title: None,
+            ledger: zarn_config::spend::Ledger::system(),
+            day_base: 0.0,
+            session_base: 0.0,
+            cap_notes: Default::default(),
+            cap_stopped: false,
+            parse_failures: 0,
+            window: None,
         };
 
         if let Some(path) = controller.options.resume.clone() {
@@ -342,6 +362,146 @@ impl Controller {
         }
         self.rebuild();
         self.app.notice(format!("{name} mode: {}", file.def.description));
+    }
+
+    fn use_profile(&mut self, name: &str) {
+        if !self.cfg().profiles.contains_key(name) {
+            self.app.notice(format!("no profile named {name}"));
+            return;
+        }
+        self.options.profile = Some(name.to_string());
+        self.options.model = None;
+        self.rebuild();
+        self.app.notice(format!(
+            "using profile {name} for this session; /config sets the default profile"
+        ));
+    }
+
+    fn profile_picker(&mut self) {
+        let cfg = self.cfg();
+        let current = self.profile();
+        let choices: Vec<Choice> = cfg
+            .profiles
+            .iter()
+            .map(|(name, p)| {
+                Choice::new(name.clone(), name.clone()).with_detail(format!(
+                    "{} · {}",
+                    p.provider.as_deref().unwrap_or("no provider"),
+                    p.model.as_deref().unwrap_or("no model")
+                ))
+            })
+            .collect();
+        if choices.is_empty() {
+            self.app.notice("no profiles yet; /config → Models adds one");
+            return;
+        }
+        let picker = Picker::new("Profile for this session", choices).select_value(&current);
+        self.app.overlay = Some(Overlay::Pick(picker, ChatPick::Profile));
+    }
+
+    fn compare(&mut self, words: &[String]) {
+        let (Some(a), Some(b)) = (words.first(), words.get(1)) else {
+            self.app.notice("usage: /compare <provider-a> <provider-b> <prompt>");
+            return;
+        };
+        let prompt = words[2..].join(" ");
+        if prompt.trim().is_empty() {
+            self.app.notice("usage: /compare <provider-a> <provider-b> <prompt>");
+            return;
+        }
+        let Some(rt) = self.runtime.as_ref() else {
+            self.app.notice("cannot compare: no provider is ready");
+            return;
+        };
+        let cfg = self.cfg();
+        let mut jobs = Vec::new();
+        for name in [a, b] {
+            let label = name.clone();
+            let model = ops::model_for(&cfg, name).unwrap_or_default();
+            let provider = if cfg.providers.contains_key(name) {
+                rt.router.providers.chain(std::slice::from_ref(name))
+            } else {
+                Err(format!("no provider named {name}"))
+            };
+            jobs.push((label, model, provider));
+        }
+        self.app.notice(format!("comparing {a} and {b}…"));
+        let tx = self.ui_tx.clone();
+        tokio::spawn(async move {
+            let runs = jobs.into_iter().map(|(label, model, provider)| {
+                let prompt = prompt.clone();
+                async move { compare_one(label, model, provider, prompt).await }
+            });
+            let sides = futures::future::join_all(runs).await;
+            let _ = tx.send(UiEvent::Compared(sides)).await;
+        });
+    }
+
+    fn note_tool_call(&mut self, args: &Value) {
+        if args.is_object() {
+            self.parse_failures = 0;
+            return;
+        }
+        self.parse_failures += 1;
+        if self.parse_failures < 3 || self.app.overlay.is_some() {
+            return;
+        }
+        let Some(rt) = self.runtime.as_ref() else {
+            return;
+        };
+        let name = rt.plan.provider_name.clone();
+        let native = self
+            .cfg()
+            .providers
+            .get(&name)
+            .is_some_and(|spec| {
+                let default = if spec.kind == "ollama" { "prompted" } else { "native" };
+                spec.tools.as_deref().unwrap_or(default) == "native"
+            });
+        if !native {
+            return;
+        }
+        self.app.overlay = Some(Overlay::Confirm(
+            format!(
+                "{name}'s tool calls failed to parse 3 times in a row. Switch it to prompted tool calls (tools = \"prompted\")? Local models often handle that better."
+            ),
+            ConfirmFor::Prompted(name),
+        ));
+    }
+
+    fn probe_window(&mut self) {
+        let Some(rt) = self.runtime.as_ref() else {
+            return;
+        };
+        let Some(spec) = rt.plan.specs.first().cloned() else {
+            return;
+        };
+        if spec.kind != "ollama" || spec.context_window.is_some() {
+            self.window = None;
+            return;
+        }
+        let model = rt.model.clone();
+        if self.window.as_ref().is_some_and(|(m, _)| *m == model) {
+            return;
+        }
+        let base = zarn_providers::discovery::base_url(&spec);
+        let tx = self.ui_tx.clone();
+        tokio::spawn(async move {
+            let probe = zarn_providers::OllamaProvider::new(base);
+            if let Ok(Ok(Some(window))) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), probe.context_window(&model)).await
+            {
+                let _ = tx.send(UiEvent::Window { model, window }).await;
+            }
+        });
+    }
+
+    fn context_window(&self) -> Option<u32> {
+        let rt = self.runtime.as_ref()?;
+        match &self.window {
+            Some((model, window)) if *model == rt.model => Some(*window),
+            _ => Some(rt.provider.caps().context_window),
+        }
     }
 
     fn cycle_mode(&mut self) {
@@ -461,6 +621,7 @@ impl Controller {
                 self.app.not_ready = None;
                 self.runtime = Some(rt);
                 self.app.status.cost = self.cost.total().usd;
+                self.probe_window();
                 self.update_meter();
             }
             Err(err) => {
@@ -590,11 +751,39 @@ impl Controller {
                 tools.push((name.clone(), Policy::Ask));
             }
         }
+        let dir = zarn_config::quota::cache_dir();
+        let quota = zarn_config::quota::eligible(&cfg, &self.store)
+            .into_iter()
+            .map(|(name, _)| {
+                let state = match zarn_config::quota::load_cached(&dir, &name) {
+                    Some(report) => QuotaState::Loaded(Box::new(report)),
+                    None => QuotaState::Loading,
+                };
+                (name, state)
+            })
+            .collect();
         PanelData {
             skills,
             mcp_status: self.mcp_statuses(),
             tools,
+            quota,
+            tick: 0,
         }
+    }
+
+    fn fetch_quota(&self, only: Option<String>, refresh: bool, chat: bool) {
+        let cfg = self.cfg();
+        let store = self.store.clone();
+        let tx = self.ui_tx.clone();
+        tokio::spawn(async move {
+            let dir = zarn_config::quota::cache_dir();
+            let reports = zarn_config::quota::reports(&cfg, &store, only.as_deref(), refresh, &dir).await;
+            let _ = tx.send(UiEvent::Quota { reports, chat }).await;
+        });
+    }
+
+    fn panel_loading(&self) -> bool {
+        matches!(&self.app.mode, Mode::Panel(panel) if panel.loading_quota())
     }
 
     fn open_panel(&mut self, tab: Tab) -> Option<&mut Panel> {
@@ -603,6 +792,15 @@ impl Controller {
         let layers = self.layers()?.clone();
         self.app.overlay = None;
         let mode = self.mode.clone();
+        let missing: Vec<String> = data
+            .quota
+            .iter()
+            .filter(|(_, q)| **q == QuotaState::Loading)
+            .map(|(n, _)| n.clone())
+            .collect();
+        for name in missing {
+            self.fetch_quota(Some(name), false, false);
+        }
         self.app.mode = Mode::Panel(Box::new(
             Panel::new(layers, store, data).open_at(tab).with_active_mode(mode),
         ));
@@ -621,7 +819,12 @@ impl Controller {
             terminal.draw(|frame| render::draw(frame, &self.app))?;
 
             tokio::select! {
-                _ = frames.tick(), if self.app.streaming => self.app.advance_frame(),
+                _ = frames.tick(), if self.app.streaming || self.panel_loading() => {
+                    self.app.advance_frame();
+                    if let Mode::Panel(panel) = &mut self.app.mode {
+                        panel.data.tick = panel.data.tick.wrapping_add(1);
+                    }
+                }
                 event = keys.next() => {
                     let Some(Ok(event)) = event else { continue };
                     if !self.on_terminal(event) {
@@ -762,6 +965,25 @@ impl Controller {
             Action::SendQueued => self.send_next(),
             Action::CycleMode => self.cycle_mode(),
             Action::Confirmed(ConfirmFor::Bypass) => self.set_mode("bypass", true),
+            Action::Confirmed(ConfirmFor::Prompted(provider)) => {
+                let result = match self.layers() {
+                    Some(layers) => ops::update_provider(layers, &provider, |spec| {
+                        spec.tools = Some("prompted".into())
+                    }),
+                    None => return true,
+                };
+                match result {
+                    Ok(scope) => {
+                        self.parse_failures = 0;
+                        self.rebuild();
+                        self.app.notice(format!(
+                            "{provider} now uses prompted tool calls (tools = \"prompted\" in the {} config)",
+                            scope.label()
+                        ));
+                    }
+                    Err(err) => self.app.notice(format!("{err:#}")),
+                }
+            }
             Action::Plan(verdict) => self.decide_plan(verdict),
             Action::Login(provider, secret) => {
                 let store = self.store.clone();
@@ -825,7 +1047,7 @@ impl Controller {
             return;
         };
         let provider = agent.provider();
-        let window = provider.caps().context_window;
+        let window = self.context_window().unwrap_or_else(|| provider.caps().context_window);
         let used = provider.count_tokens(&self.messages).unwrap_or(0);
         self.app.status.context = Some((used, window));
     }
@@ -884,8 +1106,13 @@ impl Controller {
         let Some(agent) = &self.agent else {
             return false;
         };
+        let window = self
+            .context_window()
+            .unwrap_or_else(|| agent.provider().caps().context_window);
+        let used = agent.provider().count_tokens(&self.messages).unwrap_or(0);
+        let ratio = if window == 0 { 0.0 } else { used as f32 / window as f32 };
         self.cfg().general.auto_compact()
-            && compact::should_compact(agent.provider().as_ref(), &self.messages)
+            && ratio >= compact::TRIGGER
             && compact::split_point(&self.messages, compact::KEEP_TURNS).is_some()
     }
 
@@ -919,12 +1146,72 @@ impl Controller {
         spawn_turn(Arc::new(agent), self.messages.clone(), self.ui_tx.clone(), self.cancel.clone());
     }
 
+    fn spend(&self) -> (f64, f64) {
+        let session = self.cost.total().usd.unwrap_or(0.0);
+        (session, self.day_base + (session - self.session_base))
+    }
+
+    fn note_once(&mut self, key: String, text: String) {
+        if self.cap_notes.insert(key) {
+            self.app.notice(text);
+        }
+    }
+
+    fn check_caps(&mut self, starting: bool) -> bool {
+        let limits = self.cfg().limits;
+        if limits.is_empty() {
+            return true;
+        }
+        if starting {
+            self.day_base = self.ledger.today();
+            self.session_base = self.cost.total().usd.unwrap_or(0.0);
+        }
+        if let Some(text) =
+            zarn_config::spend::unenforceable(&limits, self.cost.model(), self.cost.rates().is_some())
+        {
+            self.note_once(format!("unpriced:{}", self.cost.model()), text);
+            return true;
+        }
+        let (session, day) = self.spend();
+        match zarn_config::spend::check(&limits, session, day) {
+            zarn_config::spend::Check::Ok => true,
+            zarn_config::spend::Check::Warn(warnings) => {
+                for warning in warnings {
+                    let key = warning.split(" spend cap").next().unwrap_or("").to_string();
+                    let cap = key.rsplit(' ').next().unwrap_or("").to_string();
+                    self.note_once(format!("warn:{cap}"), warning);
+                }
+                true
+            }
+            zarn_config::spend::Check::Stop(text) => {
+                self.app.notice(format!("stopped: {text}"));
+                false
+            }
+        }
+    }
+
+    fn record_spend(&mut self) {
+        let (session, _) = self.spend();
+        let delta = session - self.session_base;
+        if delta > 0.0 {
+            if let Err(err) = self.ledger.add(delta) {
+                self.app.notice(format!("daily spend not recorded: {err}"));
+            }
+            self.day_base = self.ledger.today();
+            self.session_base = session;
+        }
+    }
+
     fn submit(&mut self, text: String) {
         if self.app.streaming {
             self.app.queue.push(text.clone());
             self.app.blocks.push(Block::Queued(text));
             return;
         }
+        if !self.check_caps(true) {
+            return;
+        }
+        self.cap_stopped = false;
         self.reload_if_changed();
         let Some(agent) = self.agent.clone() else {
             let why = self
@@ -944,11 +1231,19 @@ impl Controller {
     fn on_ui(&mut self, event: UiEvent) {
         match event {
             UiEvent::Agent(event) => {
+                let usage = matches!(&event, AgentEvent::Provider(zarn_core::provider::Event::Usage { .. }));
+                if let AgentEvent::ToolStarted { args, .. } = &event {
+                    self.note_tool_call(args);
+                }
                 if let AgentEvent::Provider(provider_event) = &event {
                     self.cost.observe(provider_event);
                 }
                 self.app.apply(event);
                 self.app.status.cost = self.cost.total().usd;
+                if usage && self.app.streaming && !self.cap_stopped && !self.check_caps(false) {
+                    self.cap_stopped = true;
+                    self.cancel.cancel();
+                }
             }
             UiEvent::TurnDone { messages, result } => {
                 self.app.streaming = false;
@@ -956,6 +1251,7 @@ impl Controller {
                 self.set_system();
                 self.cost.end_turn();
                 self.app.status.cost = self.cost.total().usd;
+                self.record_spend();
                 self.persist();
                 self.update_meter();
                 match result {
@@ -1016,16 +1312,12 @@ impl Controller {
             }
             UiEvent::Models { target, models } => match (&mut self.app.mode, target) {
                 (Mode::Panel(panel), ModelTarget::Panel(profile)) => panel.set_models(&profile, models),
-                (Mode::Onboarding(flow), ModelTarget::Onboarding) => flow.set_models(models),
+                (Mode::Onboarding(flow), ModelTarget::Onboarding) => {
+                    flow.set_models(models.into_iter().map(|(m, _)| m).collect())
+                }
                 (Mode::Chat, ModelTarget::Chat) => {
                     if let Some(Overlay::Pick(picker, ChatPick::Model)) = &mut self.app.overlay {
-                        let mut choices = picker.choices.clone();
-                        for model in models {
-                            if !choices.iter().any(|c| c.value == model) {
-                                choices.push(Choice::plain(model));
-                            }
-                        }
-                        picker.set_choices(choices);
+                        picker.set_choices(settings::merge_models(picker.choices.clone(), models));
                     }
                 }
                 _ => {}
@@ -1063,6 +1355,21 @@ impl Controller {
                 }
             }
             UiEvent::Title(Err(err)) => tracing::debug!(error = %err, "no session title"),
+            UiEvent::Compared(sides) => self.app.blocks.push(Block::Compare(sides)),
+            UiEvent::Window { model, window } => {
+                self.window = Some((model, window));
+                self.update_meter();
+            }
+            UiEvent::Quota { reports, chat } => {
+                if let Mode::Panel(panel) = &mut self.app.mode {
+                    for report in &reports {
+                        panel.set_quota(&report.provider, QuotaState::Loaded(Box::new(report.clone())));
+                    }
+                }
+                if chat {
+                    self.app.notice(zarn_config::quota::render(&reports));
+                }
+            }
         }
     }
 
@@ -1139,6 +1446,7 @@ impl Controller {
                 self.ask_bypass();
             }
             settings::Effect::SetMode(name) => self.set_mode(&name, false),
+            settings::Effect::RefreshQuota(only) => self.fetch_quota(only, true, false),
             settings::Effect::Close => {
                 self.app.mode = Mode::Chat;
                 self.rebuild();
@@ -1172,12 +1480,12 @@ impl Controller {
                 }
             }
             settings::Effect::ListModels { provider, profile } => {
-                let Some(spec) = self.cfg().providers.get(&provider).cloned() else {
+                let Ok(spec) = ops::spec_with_key(&self.cfg(), &self.store, &provider) else {
                     return;
                 };
                 let tx = self.ui_tx.clone();
                 tokio::spawn(async move {
-                    let models = ops::list_models(&spec).await;
+                    let models = ops::model_choices(&provider, &spec).await;
                     let _ = tx
                         .send(UiEvent::Models {
                             target: ModelTarget::Panel(profile),
@@ -1211,7 +1519,7 @@ impl Controller {
                 let spec = flow.spec();
                 let tx = self.ui_tx.clone();
                 tokio::spawn(async move {
-                    let models = ops::list_models(&spec).await;
+                    let models = ops::list_models(&spec).await.into_iter().map(|m| (m, None)).collect();
                     let _ = tx
                         .send(UiEvent::Models {
                             target: ModelTarget::Onboarding,
@@ -1243,6 +1551,7 @@ impl Controller {
             ChatPick::Resume => self.resume(Path::new(&value)),
             ChatPick::Login => self.ask_login(&value),
             ChatPick::Logout => self.logout(&value),
+            ChatPick::Profile => self.use_profile(&value),
             ChatPick::Mode if value == "bypass" => self.ask_bypass(),
             ChatPick::Mode => self.set_mode(&value, true),
         }
@@ -1369,11 +1678,8 @@ impl Controller {
         let cfg = self.cfg();
         let profile = self.profile();
         let current = cfg.profiles.get(&profile).cloned().unwrap_or_default();
-        let spec = current
-            .provider
-            .as_ref()
-            .and_then(|p| cfg.providers.get(p))
-            .cloned();
+        let provider = current.provider.clone().unwrap_or_default();
+        let spec = ops::spec_with_key(&cfg, &self.store, &provider).ok();
         let kind = spec.as_ref().map(|s| s.kind.clone()).unwrap_or_default();
         let mut choices: Vec<Choice> = catalog::suggested_models(&kind)
             .iter()
@@ -1384,16 +1690,19 @@ impl Controller {
         {
             choices.insert(0, Choice::plain(model.clone()));
         }
+        let cached = zarn_config::quota::cached_models(&zarn_config::quota::cache_dir(), &provider)
+            .into_iter()
+            .map(|m| (m.id, m.context_window))
+            .collect();
+        let choices = settings::merge_models(choices, cached);
         let picker = Picker::new(format!("Model for profile {profile}"), choices)
             .custom("type any model name, then enter")
             .select_value(current.model.as_deref().unwrap_or_default());
         self.app.overlay = Some(Overlay::Pick(picker, ChatPick::Model));
-        if let Some(spec) = spec
-            && spec.kind == "ollama"
-        {
+        if let Some(spec) = spec {
             let tx = self.ui_tx.clone();
             tokio::spawn(async move {
-                let models = ops::list_models(&spec).await;
+                let models = ops::model_choices(&provider, &spec).await;
                 let _ = tx.send(UiEvent::Models { target: ModelTarget::Chat, models }).await;
             });
         }
@@ -1436,6 +1745,63 @@ impl Controller {
                     return true;
                 }
                 self.start_compaction(false);
+            }
+            "profile" => match first {
+                Some(name) => self.use_profile(name),
+                None => self.profile_picker(),
+            },
+            "compare" => self.compare(&words),
+            "limits" => {
+                let target = match first {
+                    Some("session") => Some(false),
+                    Some("day") | Some("daily") => Some(true),
+                    Some(other) => {
+                        self.app.notice(format!("unknown: /limits {other}; use /limits session <usd|off> or /limits day <usd|off>"));
+                        return true;
+                    }
+                    None => None,
+                };
+                match target {
+                    None => {
+                        let limits = self.cfg().limits;
+                        let (session, _) = self.spend();
+                        let day = self.ledger.today();
+                        let show = |v: Option<f64>| v.map(|v| format!("${v:.2}")).unwrap_or_else(|| "off".into());
+                        self.app.notice(format!(
+                            "session cap {} · spent ${session:.4}\ndaily cap   {} · spent today ${day:.4}\nchange with /limits session <usd|off> or /limits day <usd|off>",
+                            show(limits.session_usd),
+                            show(limits.day_usd)
+                        ));
+                    }
+                    Some(day) => {
+                        let value = words.get(1).cloned().unwrap_or_default();
+                        let result = ops::parse_cap(&value).and_then(|usd| match self.layers() {
+                            Some(layers) => ops::set_spend_cap(layers, day, usd).map(|s| (usd, s)),
+                            None => Err(anyhow::anyhow!("config could not be loaded")),
+                        });
+                        match result {
+                            Ok((usd, scope)) => {
+                                self.rebuild();
+                                self.cap_notes.clear();
+                                let label = if day { "daily" } else { "session" };
+                                self.app.notice(match usd {
+                                    Some(v) => format!("{label} spend cap set to ${v:.2} in the {} config", scope.label()),
+                                    None => format!("{label} spend cap removed"),
+                                });
+                            }
+                            Err(err) => self.app.notice(format!("{err:#}")),
+                        }
+                    }
+                }
+            }
+            "models" => {
+                let refresh = first == Some("refresh");
+                self.app.notice(if refresh {
+                    "fetching models and quotas from every provider with a key…"
+                } else {
+                    "models and quotas (cached for a few minutes; /models refresh to fetch again)…"
+                });
+                self.fetch_quota(None, refresh, true);
             }
             "context" => {
                 let Some(agent) = self.agent.clone() else {
@@ -1796,6 +2162,70 @@ impl Controller {
             }
             Some(other) => self.app.notice(format!("unknown: /mcp {other}; use list, add, remove or restart")),
         }
+    }
+}
+
+async fn compare_one(
+    label: String,
+    model: String,
+    provider: Result<Arc<dyn zarn_core::provider::Provider>, String>,
+    prompt: String,
+) -> crate::state::CompareSide {
+    use crate::state::CompareSide;
+    use zarn_core::provider::Event;
+    let title = format!("{label} · {model}");
+    let provider = match provider {
+        Ok(p) => p,
+        Err(err) => {
+            return CompareSide {
+                label: title,
+                text: err,
+                meta: "not run".into(),
+                failed: true,
+            };
+        }
+    };
+    let started = std::time::Instant::now();
+    let request = zarn_core::types::Request::new(model.clone(), vec![Message::user(prompt)]);
+    let run = async {
+        let mut stream = provider.stream(request).await.map_err(|e| e.to_string())?;
+        let mut text = String::new();
+        let (mut input, mut output) = (0u32, 0u32);
+        while let Some(event) = stream.next().await {
+            match event {
+                Event::TextDelta(delta) => text.push_str(&delta),
+                Event::Usage { input: i, output: o, .. } => {
+                    input += i;
+                    output += o;
+                }
+                Event::Error(err) => return Err(err.to_string()),
+                Event::Done(_) => break,
+                _ => {}
+            }
+        }
+        Ok((text, input, output))
+    };
+    let result = tokio::time::timeout(std::time::Duration::from_secs(120), run).await;
+    let elapsed = started.elapsed().as_secs_f32();
+    match result {
+        Ok(Ok((text, input, output))) => CompareSide {
+            label: title,
+            text: zarn_config::auth::redact(&text),
+            meta: format!("{elapsed:.1} s · {input} in / {output} out"),
+            failed: false,
+        },
+        Ok(Err(err)) => CompareSide {
+            label: title,
+            text: zarn_config::auth::redact(&err),
+            meta: format!("failed after {elapsed:.1} s"),
+            failed: true,
+        },
+        Err(_) => CompareSide {
+            label: title,
+            text: "no answer within 120 seconds".into(),
+            meta: "timed out".into(),
+            failed: true,
+        },
     }
 }
 

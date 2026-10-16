@@ -27,3 +27,12 @@ pub fn project_dir() -> PathBuf {
 pub fn project_config() -> PathBuf {
     project_dir().join("config.toml")
 }
+
+pub fn data_dir() -> PathBuf {
+    let sessions = zarn_core::session::data_root();
+    sessions
+        .parent()
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or(sessions)
+}

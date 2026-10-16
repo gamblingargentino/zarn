@@ -92,6 +92,7 @@ impl Fixture {
                 ("read".into(), Policy::Allow),
                 ("skill".into(), Policy::Allow),
             ],
+            ..PanelData::default()
         };
         Panel::with_agent_dirs(
             self.layers(),
@@ -153,7 +154,7 @@ fn snapshot_the_permissions_tab() {
 fn snapshot_the_general_tab() {
     let fx = Fixture::new(TWO_PROVIDERS);
     let app = app_with_panel(fx.panel().open_at(Tab::General));
-    snapshot("panel_general", &rows(100, 12, &app));
+    snapshot("panel_general", &rows(100, 14, &app));
 }
 
 #[test]
@@ -487,4 +488,125 @@ fn the_models_tab_lists_roles_and_toggles_and_sets_routing() {
 
     assert_eq!(panel.on_key(key(KeyCode::Char('d'))), Some(Effect::Reload));
     assert!(!fx.user_config().contains("roles.compact"));
+}
+
+fn report(provider: &str) -> zarn_config::quota::Report {
+    use zarn_providers::discovery::{Credits, Limits, ModelInfo, Window};
+    zarn_config::quota::Report {
+        provider: provider.into(),
+        kind: "anthropic".into(),
+        fetched_at: zarn_config::quota::now() - 150,
+        models: Ok(vec![
+            ModelInfo {
+                id: "claude-sonnet-5-5".into(),
+                context_window: Some(1_000_000),
+                ..ModelInfo::default()
+            },
+            ModelInfo {
+                id: "claude-haiku-5-5".into(),
+                ..ModelInfo::default()
+            },
+        ]),
+        limits: Ok(Limits::Found {
+            requests: Window {
+                limit: Some("50".into()),
+                remaining: Some("49".into()),
+                reset: None,
+            },
+            tokens: Window::default(),
+        }),
+        credits: Ok(Credits::NotExposed),
+    }
+}
+
+fn quota_panel(state: zarn_tui::settings::QuotaState) -> App {
+    let fx = Fixture::new(TWO_PROVIDERS);
+    let mut panel = fx.panel().open_at(Tab::Quota);
+    panel.set_quota("claude", state);
+    app_with_panel(panel)
+}
+
+#[test]
+fn snapshot_the_quota_tab_loaded() {
+    let app = quota_panel(zarn_tui::settings::QuotaState::Loaded(Box::new(report("claude"))));
+    let out = rows(110, 12, &app);
+    snapshot("panel_quota_loaded", &out);
+    let text = out.join("\n");
+    assert!(text.contains("claude-sonnet-5-5 (1M ctx)"));
+    assert!(text.contains("requests 49/50"));
+    assert!(text.contains("tokens unknown/unknown"));
+    assert!(text.contains("not exposed by this provider"));
+}
+
+#[test]
+fn snapshot_the_quota_tab_loading() {
+    let app = quota_panel(zarn_tui::settings::QuotaState::Loading);
+    let out = rows(110, 8, &app);
+    snapshot("panel_quota_loading", &out);
+    assert!(out.join("\n").contains("loading ⠋"));
+}
+
+#[test]
+fn snapshot_the_quota_tab_failed() {
+    let app = quota_panel(zarn_tui::settings::QuotaState::Failed(
+        "claude: the key was rejected (HTTP 401)".into(),
+    ));
+    let out = rows(110, 8, &app);
+    snapshot("panel_quota_failed", &out);
+    assert!(out.join("\n").contains("FAILED: claude: the key was rejected (HTTP 401)"));
+}
+
+#[test]
+fn refreshing_a_quota_row_shows_loading_and_asks_the_loop() {
+    let fx = Fixture::new(TWO_PROVIDERS);
+    let mut panel = fx.panel().open_at(Tab::Quota);
+    panel.set_quota("claude", zarn_tui::settings::QuotaState::Loaded(Box::new(report("claude"))));
+    panel.cursor[Tab::Quota.index()] = 2;
+    assert_eq!(
+        panel.on_key(key(KeyCode::Char('r'))),
+        Some(Effect::RefreshQuota(Some("claude".into())))
+    );
+    assert!(panel.loading_quota());
+}
+
+#[test]
+fn the_providers_tab_shows_health_from_real_use() {
+    let fx = Fixture::new(
+        "[providers.healthy-one]\nkind = \"ollama\"\nbase_url = \"http://localhost:11434\"\n",
+    );
+    zarn_config::health::record_request("healthy-one", std::time::Duration::from_millis(250), true);
+    zarn_config::health::record_request("healthy-one", std::time::Duration::from_millis(250), false);
+    zarn_config::health::record_test("healthy-one", std::time::Duration::from_millis(180), true);
+    let rows = fx.panel().rows();
+    assert_eq!(
+        rows[0].note,
+        "test ok 0s ago · 180 ms · 1 failure since start"
+    );
+}
+
+#[test]
+fn model_pickers_merge_discovered_models_with_their_context_window() {
+    let fx = Fixture::new(TWO_PROVIDERS);
+    let mut panel = fx.panel().open_at(Tab::Models);
+    let row = panel.rows().iter().position(|r| r.label == "default · model").unwrap();
+    panel.cursor[Tab::Models.index()] = row;
+    panel.on_key(key(KeyCode::Enter));
+    panel.set_models(
+        "default",
+        vec![("claude-sonnet-5-5".into(), Some(1_000_000)), ("claude-next".into(), Some(200_000))],
+    );
+    match &panel.editor {
+        Some(zarn_tui::settings::Editor::Pick(picker, _)) => {
+            let sonnet = picker.choices.iter().find(|c| c.value == "claude-sonnet-5-5").unwrap();
+            assert_eq!(sonnet.detail, "1M ctx");
+            let next = picker.choices.iter().find(|c| c.value == "claude-next").unwrap();
+            assert_eq!(next.detail, "200k ctx");
+        }
+        _ => panic!("expected the model picker"),
+    }
+    for k in typed("a-model-nobody-listed") {
+        panel.on_key(k);
+    }
+    assert_eq!(panel.on_key(key(KeyCode::Enter)), Some(Effect::Reload));
+    assert!(fx.user_config().contains("model = \"a-model-nobody-listed\""));
 }

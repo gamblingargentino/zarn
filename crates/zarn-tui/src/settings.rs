@@ -21,17 +21,28 @@ pub enum Tab {
     Mcp,
     Agents,
     Modes,
+    Quota,
     Permissions,
     General,
 }
 
-pub const TABS: [Tab; 8] = [
+pub const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum QuotaState {
+    Loading,
+    Loaded(Box<zarn_config::quota::Report>),
+    Failed(String),
+}
+
+pub const TABS: [Tab; 9] = [
     Tab::Providers,
     Tab::Models,
     Tab::Skills,
     Tab::Mcp,
     Tab::Agents,
     Tab::Modes,
+    Tab::Quota,
     Tab::Permissions,
     Tab::General,
 ];
@@ -45,6 +56,7 @@ impl Tab {
             Tab::Mcp => "MCP",
             Tab::Agents => "Agents",
             Tab::Modes => "Modes",
+            Tab::Quota => "Quota",
             Tab::Permissions => "Permissions",
             Tab::General => "General",
         }
@@ -62,6 +74,7 @@ impl Tab {
             Tab::Mcp => "enter edit · a add · r restart · d delete",
             Tab::Agents => "enter edit · a create · d delete",
             Tab::Modes => "enter edit or switch · a create · d delete",
+            Tab::Quota => "r refresh this provider · R refresh all",
             Tab::Permissions => "enter cycles · a allow · s ask · d deny",
             Tab::General => "enter change",
         }
@@ -75,11 +88,13 @@ pub struct SkillRow {
     pub source: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct PanelData {
     pub skills: Vec<SkillRow>,
     pub mcp_status: BTreeMap<String, String>,
     pub tools: Vec<(String, Policy)>,
+    pub quota: BTreeMap<String, QuotaState>,
+    pub tick: usize,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -93,6 +108,7 @@ pub enum TestState {
 pub enum Effect {
     Reload,
     SetMode(String),
+    RefreshQuota(Option<String>),
     Test(String),
     RestartMcp(String),
     ListModels { provider: String, profile: String },
@@ -119,12 +135,16 @@ pub enum RowKind {
     ActiveMode,
     ModeEntry(usize),
     AddMode,
+    QuotaProvider(String),
+    Info,
     Permission(String),
     Accent,
     Banner,
     ShowCost,
     ContextBudget,
     AutoCompact,
+    SessionCap,
+    DayCap,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -176,6 +196,7 @@ pub enum FormFor {
     NewProfile,
     NewMode,
     EditMode(usize),
+    SpendCap(bool),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -453,18 +474,37 @@ impl Panel {
         self.tests.insert(provider.to_string(), state);
     }
 
-    pub fn set_models(&mut self, profile: &str, models: Vec<String>) {
-        if let Some(Editor::Pick(picker, PickFor::ProfileModel(p))) = &mut self.editor
-            && p == profile
-        {
-            let mut choices = picker.choices.clone();
-            for model in models {
-                if !choices.iter().any(|c| c.value == model) {
-                    choices.push(Choice::plain(model));
-                }
-            }
-            picker.set_choices(choices);
+    pub fn set_models(&mut self, key: &str, models: Vec<(String, Option<u32>)>) {
+        let matches = match &self.editor {
+            Some(Editor::Pick(_, PickFor::ProfileModel(p))) => p == key,
+            Some(Editor::Pick(_, PickFor::RoleModel(role, _))) => format!("role:{role}") == key,
+            _ => false,
+        };
+        if !matches {
+            return;
         }
+        if let Some(Editor::Pick(picker, _)) = &mut self.editor {
+            picker.set_choices(merge_models(picker.choices.clone(), models));
+        }
+    }
+
+    fn quota_owner(&self, index: usize) -> Option<String> {
+        self.rows()
+            .iter()
+            .take(index + 1)
+            .rev()
+            .find_map(|r| match &r.kind {
+                RowKind::QuotaProvider(name) => Some(name.clone()),
+                _ => None,
+            })
+    }
+
+    pub fn set_quota(&mut self, name: &str, state: QuotaState) {
+        self.data.quota.insert(name.to_string(), state);
+    }
+
+    pub fn loading_quota(&self) -> bool {
+        self.data.quota.values().any(|q| *q == QuotaState::Loading)
     }
 
     pub fn set_mcp_status(&mut self, name: &str, status: impl Into<String>) {
@@ -483,7 +523,7 @@ impl Panel {
                     .into_iter()
                     .map(|p| {
                         let test = match self.tests.get(&p.name) {
-                            None => String::new(),
+                            None => zarn_config::health::summary(&p.name),
                             Some(TestState::Running) => "testing…".into(),
                             Some(TestState::Ok(msg)) => msg.clone(),
                             Some(TestState::Failed(msg)) => format!("FAILED: {msg}"),
@@ -540,6 +580,47 @@ impl Panel {
                         ops::role_label(&cfg, role),
                         RowKind::Role(role.to_string()),
                     ));
+                }
+                rows
+            }
+            Tab::Quota => {
+                let mut rows = Vec::new();
+                for (name, state) in &self.data.quota {
+                    let kind = cfg.providers.get(name).map(|p| p.kind.clone()).unwrap_or_default();
+                    let header = Row::new(name.clone(), kind, RowKind::QuotaProvider(name.clone()));
+                    match state {
+                        QuotaState::Loading => rows.push(header.note(format!(
+                            "loading {}",
+                            SPINNER[self.data.tick % SPINNER.len()]
+                        ))),
+                        QuotaState::Failed(err) => rows.push(header.note(format!("FAILED: {err}"))),
+                        QuotaState::Loaded(report) => {
+                            match report.failed() {
+                                Some(err) => rows.push(header.note(format!("FAILED: {err}"))),
+                                None => {
+                                    rows.push(header.note(format!(
+                                        "fetched {}",
+                                        zarn_config::quota::age(report.fetched_at)
+                                    )));
+                                    rows.push(Row::new(
+                                        "  models",
+                                        zarn_config::quota::models_line(report, 8),
+                                        RowKind::Info,
+                                    ));
+                                    rows.push(Row::new(
+                                        "  limits",
+                                        zarn_config::quota::limits_line(&report.limits),
+                                        RowKind::Info,
+                                    ));
+                                    rows.push(Row::new(
+                                        "  credits",
+                                        zarn_config::quota::credits_line(&report.credits),
+                                        RowKind::Info,
+                                    ));
+                                }
+                            }
+                        }
+                    }
                 }
                 rows
             }
@@ -638,6 +719,16 @@ impl Panel {
                 Row::new("cost display", on_off(cfg.general.show_cost()), RowKind::ShowCost),
                 Row::new("auto-compact", on_off(cfg.general.auto_compact()), RowKind::AutoCompact)
                     .note("compact when the context is 80% full"),
+                Row::new(
+                    "session spend cap",
+                    cfg.limits.session_usd.map(|v| format!("${v:.2}")).unwrap_or_else(|| "off".into()),
+                    RowKind::SessionCap,
+                ),
+                Row::new(
+                    "daily spend cap",
+                    cfg.limits.day_usd.map(|v| format!("${v:.2}")).unwrap_or_else(|| "off".into()),
+                    RowKind::DayCap,
+                ),
                 Row::new(
                     "ZARN.md token budget",
                     cfg.general
@@ -757,6 +848,21 @@ impl Panel {
                     _ => RowKind::AddAgent,
                 };
                 self.activate_kind(add)
+            }
+            (Tab::Quota, 'R', _) => {
+                let names: Vec<String> = self.data.quota.keys().cloned().collect();
+                for name in names {
+                    self.data.quota.insert(name, QuotaState::Loading);
+                }
+                Some(Effect::RefreshQuota(None))
+            }
+            (Tab::Quota, 'r', kind) => {
+                let name = match kind {
+                    Some(RowKind::QuotaProvider(name)) => Some(name),
+                    _ => self.quota_owner(self.selected()),
+                }?;
+                self.data.quota.insert(name.clone(), QuotaState::Loading);
+                Some(Effect::RefreshQuota(Some(name)))
             }
             (Tab::Models, 'd', Some(RowKind::Role(role))) => {
                 let result = ops::clear_role(&mut self.layers, &role);
@@ -1042,6 +1148,11 @@ impl Panel {
                 ));
                 None
             }
+            RowKind::QuotaProvider(name) => {
+                self.data.quota.insert(name.clone(), QuotaState::Loading);
+                Some(Effect::RefreshQuota(Some(name)))
+            }
+            RowKind::Info => None,
             RowKind::Routing => {
                 let value = !cfg.routing.enabled();
                 let result = ops::set_routing_enabled(&mut self.layers, value).map(|_| ());
@@ -1144,6 +1255,19 @@ impl Panel {
                     g.auto_compact = Some(value)
                 });
                 self.saved(format!("auto-compact {}", on_off(value)), result)
+            }
+            RowKind::SessionCap | RowKind::DayCap => {
+                let day = kind == RowKind::DayCap;
+                let current = if day { cfg.limits.day_usd } else { cfg.limits.session_usd };
+                self.editor = Some(Editor::Form(
+                    Form::new(
+                        if day { "Daily spend cap" } else { "Session spend cap" },
+                        vec![FormField::new("usd", current.map(|v| v.to_string()).unwrap_or_default())
+                            .hint("dollars, or off; only priced models can be capped")],
+                    ),
+                    FormFor::SpendCap(day),
+                ));
+                None
             }
             RowKind::ContextBudget => {
                 let current = cfg
@@ -1334,9 +1458,12 @@ impl Panel {
                 self.editor = Some(Editor::Pick(
                     Picker::new(format!("Model for the {role} role on {value}"), choices)
                         .custom("type any model name, then enter"),
-                    PickFor::RoleModel(role, value.clone()),
+                    PickFor::RoleModel(role.clone(), value.clone()),
                 ));
-                None
+                Some(Effect::ListModels {
+                    provider: value,
+                    profile: format!("role:{role}"),
+                })
             }
             PickFor::RoleModel(role, provider) => {
                 let result = ops::set_role(&mut self.layers, &role, Some(&provider), Some(&value)).map(|_| ());
@@ -1502,6 +1629,21 @@ impl Panel {
                     Err(err) => retry(self, form, purpose, format!("{err:#}")),
                 }
             }
+            FormFor::SpendCap(day) => {
+                let result = ops::parse_cap(&form.value("usd"))
+                    .and_then(|usd| ops::set_spend_cap(&mut self.layers, day, usd).map(|_| usd));
+                match result {
+                    Ok(usd) => {
+                        let label = if day { "daily" } else { "session" };
+                        self.say(match usd {
+                            Some(v) => format!("{label} spend cap is now ${v:.2}"),
+                            None => format!("{label} spend cap removed"),
+                        });
+                        Some(Effect::Reload)
+                    }
+                    Err(err) => retry(self, form, purpose, format!("{err:#}")),
+                }
+            }
             FormFor::ContextBudget => match form.value("tokens").parse::<u32>() {
                 Ok(n) if n > 0 => {
                     let result = ops::set_general(&mut self.layers, GeneralField::ContextBudget, |g| {
@@ -1556,6 +1698,27 @@ impl Panel {
             }
         }
     }
+}
+
+pub fn merge_models(mut choices: Vec<Choice>, models: Vec<(String, Option<u32>)>) -> Vec<Choice> {
+    for (model, window) in models {
+        let detail = window.map(|w| zarn_config::quota::context_label(Some(w)));
+        match choices.iter_mut().find(|c| c.value == model) {
+            Some(existing) => {
+                if let Some(detail) = detail {
+                    existing.detail = detail;
+                }
+            }
+            None => {
+                let mut choice = Choice::plain(model);
+                if let Some(detail) = detail {
+                    choice = choice.with_detail(detail);
+                }
+                choices.push(choice);
+            }
+        }
+    }
+    choices
 }
 
 fn mode_form(title: &str, file: Option<&ModeFile>) -> Form {

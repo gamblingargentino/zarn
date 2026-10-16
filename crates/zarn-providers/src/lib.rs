@@ -1,4 +1,5 @@
 pub mod anthropic;
+pub mod discovery;
 pub mod fallback;
 pub mod google;
 pub mod openai;
@@ -35,6 +36,8 @@ pub struct ProviderSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_helper: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output: Option<u32>,
@@ -54,6 +57,7 @@ impl std::fmt::Debug for ProviderSpec {
             .field("base_url", &self.base_url)
             .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
             .field("api_key_env", &self.api_key_env)
+            .field("api_key_helper", &self.api_key_helper)
             .field("context_window", &self.context_window)
             .field("max_output", &self.max_output)
             .field("vision", &self.vision)

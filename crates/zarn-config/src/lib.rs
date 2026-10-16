@@ -4,12 +4,15 @@ pub mod catalog;
 pub mod context;
 pub mod doctor;
 pub mod guard;
+pub mod health;
 pub mod layers;
 pub mod modes;
 pub mod ops;
 pub mod paths;
 pub mod pricing;
+pub mod quota;
 pub mod runtime;
+pub mod spend;
 pub mod titles;
 
 use anyhow::{Context, Result, bail};
@@ -50,6 +53,8 @@ pub struct General {
     pub auto_compact: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub discovery_cache_minutes: Option<u32>,
 }
 
 impl General {
@@ -61,6 +66,7 @@ impl General {
         self.context_budget = self.context_budget.or(other.context_budget);
         self.auto_compact = self.auto_compact.or(other.auto_compact);
         self.mode = self.mode.take().or(other.mode);
+        self.discovery_cache_minutes = self.discovery_cache_minutes.or(other.discovery_cache_minutes);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -138,6 +144,7 @@ fn fill_provider(into: &mut ProviderSpec, from: ProviderSpec) {
     into.base_url = into.base_url.take().or(from.base_url);
     into.api_key = into.api_key.take().or(from.api_key);
     into.api_key_env = into.api_key_env.take().or(from.api_key_env);
+    into.api_key_helper = into.api_key_helper.take().or(from.api_key_helper);
     into.context_window = into.context_window.or(from.context_window);
     into.max_output = into.max_output.or(from.max_output);
     into.vision = into.vision.or(from.vision);
@@ -165,6 +172,8 @@ pub struct Config {
     pub pricing: BTreeMap<String, Rates>,
     #[serde(default, skip_serializing_if = "Routing::is_empty")]
     pub routing: Routing,
+    #[serde(default, skip_serializing_if = "spend::Limits::is_empty")]
+    pub limits: spend::Limits,
 }
 
 impl Config {
@@ -199,6 +208,7 @@ impl Config {
             self.pricing.entry(prefix).or_insert(rates);
         }
         self.routing.fill_from(other.routing);
+        self.limits.fill_from(other.limits);
     }
 
     pub fn home_path() -> Option<PathBuf> {
@@ -244,6 +254,7 @@ impl Config {
                 );
             }
         }
+        spend::validate(self)?;
         for (role, spec) in &self.routing.roles {
             if !ROLES.contains(&role.as_str()) {
                 bail!(
@@ -291,7 +302,7 @@ impl Config {
 
     pub fn resolve_key(&self, store: &KeyStore, name: &str) -> Option<(String, KeySource)> {
         let spec = self.providers.get(name)?;
-        store.resolve(name, spec.api_key_env.as_deref())
+        store.resolve_with(name, spec.api_key_env.as_deref(), spec.api_key_helper.as_deref())
     }
 
     pub fn chain_for(&self, store: &KeyStore, profile: &str) -> Result<Vec<ProviderSpec>> {

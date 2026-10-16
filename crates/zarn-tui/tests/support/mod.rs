@@ -174,3 +174,10 @@ pub async fn turn(c: &mut Controller, text: &str) {
     c.type_line(text);
     c.settle(Duration::from_secs(10)).await;
 }
+
+pub async fn wait_for(c: &mut Controller, limit: Duration, done: impl Fn(&Controller) -> bool) {
+    let deadline = tokio::time::Instant::now() + limit;
+    while !done(c) && tokio::time::Instant::now() < deadline {
+        c.pump(Duration::from_millis(50)).await;
+    }
+}

@@ -1,8 +1,8 @@
 
 
-
 ╭──────────────────────────────────────────────────────────────────────╮
 │› /model  pick a model, or set one directly                           │
+│  /models list each provider's models, rate limits and credit         │
 │  /mode   pick a mode, or switch: default, plan, accept-edits, bypass,│
 │  /logout remove a provider's API key                                 │
 │  /init   have the model inspect the repo and write ZARN.md           │

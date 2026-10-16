@@ -1,10 +1,12 @@
 ╭ zarn settings · changes save as you go ──────────────────────────────────────────────────────────╮
-│Providers │ Models │ Skills │ MCP │ Agents │ Modes │ Permissions │ General                        │
+│Providers │ Models │ Skills │ MCP │ Agents │ Modes │ Quota │ Permissions │ General                │
 │                                                                                                  │
 │› accent color          violet                                                                    │
 │  banner                on                                                                        │
 │  cost display          on                                                                        │
 │  auto-compact          on  compact when the context is 80% full                                  │
+│  session spend cap     off                                                                       │
+│  daily spend cap       off                                                                       │
 │  ZARN.md token budget  8000                                                                      │
 │                                                                                                  │
 │                                                                                                  │

@@ -333,14 +333,127 @@ fn restrict(_path: &Path) -> std::io::Result<()> {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum KeySource {
     Env(String),
+    Helper,
     Store,
     File,
+}
+
+pub const HELPER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const HELPER_TTL: std::time::Duration = std::time::Duration::from_secs(300);
+
+pub fn split_command(line: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote: Option<char> = None;
+    let mut has = false;
+    for c in line.chars() {
+        match (quote, c) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), c) => current.push(c),
+            (None, '"' | '\'') => {
+                quote = Some(c);
+                has = true;
+            }
+            (None, c) if c.is_whitespace() => {
+                if has || !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                    has = false;
+                }
+            }
+            (None, c) => current.push(c),
+        }
+    }
+    if has || !current.is_empty() {
+        words.push(current);
+    }
+    words
+}
+
+fn spawn_helper(words: &[String]) -> std::io::Result<std::process::Child> {
+    let piped = |command: &mut std::process::Command| -> std::io::Result<std::process::Child> {
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+    };
+    match piped(std::process::Command::new(&words[0]).args(&words[1..])) {
+        Err(err) if cfg!(windows) && err.kind() == std::io::ErrorKind::NotFound => {
+            piped(std::process::Command::new("cmd").arg("/c").args(words))
+        }
+        other => other,
+    }
+}
+
+pub fn run_helper(
+    provider: &str,
+    command: &str,
+    timeout: std::time::Duration,
+) -> Result<String, String> {
+    use std::io::Read;
+    let words = split_command(command);
+    if words.is_empty() {
+        return Err(format!("api_key_helper for {provider} is empty"));
+    }
+    let mut attempt = 0;
+    let mut child = loop {
+        match spawn_helper(&words) {
+            Err(err) if err.kind() == std::io::ErrorKind::ExecutableFileBusy && attempt < 10 => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            Err(err) => {
+                return Err(format!(
+                    "api_key_helper for {provider} could not start: {}",
+                    err.kind()
+                ));
+            }
+            Ok(child) => break child,
+        }
+    };
+    let mut stdout = child.stdout.take();
+    let reader = std::thread::spawn(move || {
+        let mut out = Vec::new();
+        if let Some(pipe) = stdout.as_mut() {
+            let _ = pipe.read_to_end(&mut out);
+        }
+        out
+    });
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() >= timeout => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "api_key_helper for {provider} did not finish within {} seconds",
+                    timeout.as_secs()
+                ));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(err) => {
+                return Err(format!("api_key_helper for {provider} failed: {}", err.kind()));
+            }
+        }
+    };
+    let out = reader.join().unwrap_or_default();
+    if !status.success() {
+        return Err(format!("api_key_helper for {provider} failed with {status}"));
+    }
+    let key = String::from_utf8_lossy(&out).trim().to_string();
+    if key.is_empty() {
+        return Err(format!("api_key_helper for {provider} printed nothing"));
+    }
+    register_secret(&key);
+    Ok(key)
 }
 
 impl KeySource {
     pub fn describe(&self, store: &KeyStore) -> String {
         match self {
             KeySource::Env(var) => format!("environment variable {var}"),
+            KeySource::Helper => "api_key_helper".to_string(),
             KeySource::Store => store.backend_label(),
             KeySource::File => format!("{} (fallback file)", store.file_path().display()),
         }
@@ -352,6 +465,9 @@ pub struct KeyStore {
     file: FileStore,
     fallback_used: AtomicBool,
     notice_shown: AtomicBool,
+    helper_keys: Mutex<HashMap<String, (String, String, std::time::Instant)>>,
+    helper_errors: Mutex<HashMap<String, String>>,
+    helper_timeout: std::time::Duration,
 }
 
 impl KeyStore {
@@ -361,7 +477,81 @@ impl KeyStore {
             file: FileStore::new(file),
             fallback_used: AtomicBool::new(false),
             notice_shown: AtomicBool::new(false),
+            helper_keys: Mutex::new(HashMap::new()),
+            helper_errors: Mutex::new(HashMap::new()),
+            helper_timeout: HELPER_TIMEOUT,
         }
+    }
+
+    pub fn with_helper_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.helper_timeout = timeout;
+        self
+    }
+
+    pub fn helper_error(&self, provider: &str) -> Option<String> {
+        self.helper_errors.lock().ok()?.get(provider).cloned()
+    }
+
+    fn helper_key(&self, provider: &str, command: &str) -> Option<String> {
+        if let Ok(cache) = self.helper_keys.lock()
+            && let Some((cmd, key, at)) = cache.get(provider)
+            && cmd == command
+            && at.elapsed() < HELPER_TTL
+        {
+            return Some(key.clone());
+        }
+        match run_helper(provider, command, self.helper_timeout) {
+            Ok(key) => {
+                if let Ok(mut errors) = self.helper_errors.lock() {
+                    errors.remove(provider);
+                }
+                if let Ok(mut cache) = self.helper_keys.lock() {
+                    cache.insert(
+                        provider.to_string(),
+                        (command.to_string(), key.clone(), std::time::Instant::now()),
+                    );
+                }
+                Some(key)
+            }
+            Err(err) => {
+                tracing::warn!(provider, error = %err, "api_key_helper failed");
+                if let Ok(mut errors) = self.helper_errors.lock() {
+                    errors.insert(provider.to_string(), err);
+                }
+                None
+            }
+        }
+    }
+
+    pub fn resolve_with(
+        &self,
+        provider: &str,
+        api_key_env: Option<&str>,
+        helper: Option<&str>,
+    ) -> Option<(String, KeySource)> {
+        if let Some(var) = api_key_env
+            && let Ok(value) = std::env::var(var)
+            && !value.trim().is_empty()
+        {
+            register_secret(&value);
+            return Some((value, KeySource::Env(var.to_string())));
+        }
+        if let Some(command) = helper.filter(|c| !c.trim().is_empty())
+            && let Some(key) = self.helper_key(provider, command)
+        {
+            return Some((key, KeySource::Helper));
+        }
+        self.resolve(provider, None)
+    }
+
+    pub fn has_with(
+        &self,
+        provider: &str,
+        api_key_env: Option<&str>,
+        helper: Option<&str>,
+    ) -> Option<KeySource> {
+        self.resolve_with(provider, api_key_env, helper)
+            .map(|(_, source)| source)
     }
 
     pub fn system() -> Self {

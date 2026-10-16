@@ -140,6 +140,11 @@ impl Layers {
         })
     }
 
+    pub fn limits_scope(&self, day: bool) -> Scope {
+        let l = &self.project.limits;
+        self.pick(if day { l.day_usd.is_some() } else { l.session_usd.is_some() })
+    }
+
     pub fn routing_scope(&self) -> Scope {
         self.pick(self.project.routing.enabled.is_some())
     }

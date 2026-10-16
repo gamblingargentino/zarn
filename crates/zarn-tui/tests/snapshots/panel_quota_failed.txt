@@ -1,0 +1,8 @@
+╭ zarn settings · changes save as you go ────────────────────────────────────────────────────────────────────╮
+│Providers │ Models │ Skills │ MCP │ Agents │ Modes │ Quota │ Permissions │ General                          │
+│                                                                                                            │
+│› claude  anthropic  FAILED: claude: the key was rejected (HTTP 401)                                        │
+│                                                                                                            │
+│                                                                                                            │
+│↑↓ move · ←→ tab · r refresh this provider · R refresh all · esc close                                      │
+╰────────────────────────────────────────────────────────────────────────────────────────────────────────────╯

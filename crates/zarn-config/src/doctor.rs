@@ -143,7 +143,7 @@ pub async fn run(store: &KeyStore, project: PathBuf, user: Option<PathBuf>, prob
 
     for (name, spec) in &cfg.providers {
         let area = format!("provider {name}");
-        let key = store.has(name, spec.api_key_env.as_deref());
+        let key = store.has_with(name, spec.api_key_env.as_deref(), spec.api_key_helper.as_deref());
         let key_text = match (&key, catalog::needs_key(spec)) {
             (Some(source), _) => format!("key from {}", source.describe(store)),
             (None, true) => "NO KEY: run zarn login ".to_string() + name,

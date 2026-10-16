@@ -4,9 +4,9 @@
 │  /compact     summarize the conversation to free context             │
 │  /cost        show token usage and cost for this session             │
 │  /context     show what fills the context window                     │
+│  /limits      show or set the spend caps                             │
 │  /resume      resume an earlier session in this directory            │
 │  /tools       list the registered tools                              │
-│  /login       add or replace a provider's API key                    │
 ╰──────────────────────────────────────────────────────────────────────╯
 default mode  ·  m  ·  0 in / 0 out  ·  no rate configured
 ╭────────────────────────────────────────────────────────────────────────────────────────╮

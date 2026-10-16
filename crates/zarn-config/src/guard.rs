@@ -72,7 +72,7 @@ pub fn guarded_named(
         .map(|(name, spec)| {
             zarn_providers::build(spec)
                 .map(RedactingProvider::wrap)
-                .map(|p| (name.clone(), p))
+                .map(|p| (name.clone(), crate::health::Measured::wrap(name.clone(), p)))
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(redact_error)?;

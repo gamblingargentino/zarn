@@ -77,6 +77,9 @@ pub fn plan(
     for (name, resolved) in names.into_iter().zip(chain) {
         let missing = catalog::needs_key(&resolved) && resolved.api_key.is_none();
         if missing && name == primary {
+            if let Some(err) = store.helper_error(&name) {
+                bail!("{err}. Fix the helper command, or run /login {name}.");
+            }
             bail!(
                 "provider '{name}' has no API key. Run /login {name} or `zarn login {name}`."
             );

@@ -56,6 +56,7 @@ impl ProviderRow {
     pub fn key_label(&self) -> String {
         match (&self.key, self.needs_key) {
             (Some(KeySource::Env(var)), _) => format!("key from ${var}"),
+            (Some(KeySource::Helper), _) => "key from api_key_helper".into(),
             (Some(KeySource::Store), _) => "key in credential store".into(),
             (Some(KeySource::File), _) => "key in fallback file".into(),
             (None, true) => "NO KEY".into(),
@@ -77,7 +78,7 @@ pub fn providers(layers: &Layers, store: &KeyStore) -> Vec<ProviderRow> {
             kind: spec.kind.clone(),
             base_url: spec.base_url.clone(),
             api_key_env: spec.api_key_env.clone(),
-            key: store.has(name, spec.api_key_env.as_deref()),
+            key: store.has_with(name, spec.api_key_env.as_deref(), spec.api_key_helper.as_deref()),
             needs_key: catalog::needs_key(spec),
             scope: layers.provider_scope(name),
             is_default: default.as_deref() == Some(name.as_str()),
@@ -331,11 +332,36 @@ pub async fn list_models(spec: &ProviderSpec) -> Vec<String> {
     models
 }
 
+pub async fn model_choices(name: &str, spec: &ProviderSpec) -> Vec<(String, Option<u32>)> {
+    let dir = crate::quota::cache_dir();
+    let mut found: Vec<(String, Option<u32>)> = crate::quota::cached_models(&dir, name)
+        .into_iter()
+        .map(|m| (m.id, m.context_window))
+        .collect();
+    let usable = !catalog::needs_key(spec) || spec.api_key.as_deref().is_some_and(|k| !k.is_empty());
+    if found.is_empty()
+        && usable
+        && let Ok(Ok(listed)) =
+            tokio::time::timeout(Duration::from_secs(8), zarn_providers::discovery::models(name, spec)).await
+    {
+        found = listed.into_iter().map(|m| (m.id, m.context_window)).collect();
+    }
+    for model in catalog::suggested_models(&spec.kind).iter().rev() {
+        if !found.iter().any(|(id, _)| id == model) {
+            found.insert(0, (model.to_string(), None));
+        }
+    }
+    found
+}
+
 pub async fn test_named(layers: &Layers, store: &KeyStore, name: &str) -> Result<String, String> {
     let cfg = layers.merged();
     let spec = spec_with_key(&cfg, store, name).map_err(|e| e.to_string())?;
     let model = model_for(&cfg, name).unwrap_or_default();
-    test_provider(&spec, &model).await
+    let started = std::time::Instant::now();
+    let result = test_provider(&spec, &model).await;
+    crate::health::record_test(name, started.elapsed(), result.is_ok());
+    result
 }
 
 fn save_profile(layers: &mut Layers, profile: &str, edit: impl FnOnce(&mut ProfileSpec)) -> Result<()> {
@@ -443,6 +469,36 @@ pub fn set_general(
     edit(&mut layers.layer_mut(scope).general);
     layers.save(scope)?;
     Ok(())
+}
+
+pub fn set_spend_cap(layers: &mut Layers, day: bool, usd: Option<f64>) -> Result<Scope> {
+    if let Some(v) = usd
+        && (!v.is_finite() || v <= 0.0)
+    {
+        bail!("a spend cap must be a positive number of dollars, or off");
+    }
+    let scope = layers.limits_scope(day);
+    let limits = &mut layers.layer_mut(scope).limits;
+    if day {
+        limits.day_usd = usd;
+    } else {
+        limits.session_usd = usd;
+    }
+    layers.save(scope)?;
+    Ok(scope)
+}
+
+pub fn parse_cap(text: &str) -> Result<Option<f64>> {
+    let text = text.trim().trim_start_matches('$');
+    match text {
+        "off" | "none" | "" => Ok(None),
+        n => n
+            .parse::<f64>()
+            .ok()
+            .filter(|v| v.is_finite() && *v > 0.0)
+            .map(Some)
+            .ok_or_else(|| anyhow!("'{n}' is not a positive dollar amount; use a number like 5 or 2.50, or off")),
+    }
 }
 
 pub fn set_routing_enabled(layers: &mut Layers, enabled: bool) -> Result<Scope> {

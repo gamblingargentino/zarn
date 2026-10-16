@@ -61,6 +61,20 @@ pub enum Command {
         #[command(subcommand)]
         action: Option<McpAction>,
     },
+    #[command(about = "List each provider's models, rate limits and credit balance")]
+    Models {
+        #[arg(long, value_name = "NAME", help = "Only this provider")]
+        provider: Option<String>,
+        #[arg(long, help = "Ignore the cache and ask the providers again")]
+        refresh: bool,
+    },
+    #[command(about = "Show or set the session and daily spend caps")]
+    Limits {
+        #[arg(long, value_name = "USD", help = "Session cap in dollars, or off")]
+        session: Option<String>,
+        #[arg(long, value_name = "USD", help = "Daily cap in dollars, or off")]
+        day: Option<String>,
+    },
     #[command(about = "List and inspect modes")]
     Modes {
         #[command(subcommand)]

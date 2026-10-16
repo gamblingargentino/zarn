@@ -48,7 +48,7 @@ pub fn config_check() -> Result<()> {
             let state = if std::env::var(var).is_ok() { "set" } else { "not set" };
             println!("    api_key_env   {var} ({state})");
         }
-        let key = match store.has(name, spec.api_key_env.as_deref()) {
+        let key = match store.has_with(name, spec.api_key_env.as_deref(), spec.api_key_helper.as_deref()) {
             Some(source) => source.describe(&store),
             None if catalog::needs_key(spec) => format!("MISSING: run zarn login {name}"),
             None => "not needed".into(),
@@ -407,5 +407,44 @@ pub fn modes_show(name: &str) -> Result<()> {
         );
     };
     println!("{}", zarn_config::modes::describe(file));
+    Ok(())
+}
+
+pub async fn models(provider: Option<&str>, refresh: bool) -> Result<()> {
+    let cfg = Config::load()?;
+    if let Some(name) = provider
+        && !cfg.providers.contains_key(name)
+    {
+        bail!("no provider named '{name}'");
+    }
+    let store = KeyStore::shared();
+    let dir = zarn_config::quota::cache_dir();
+    let reports = zarn_config::quota::reports(&cfg, &store, provider, refresh, &dir).await;
+    println!("{}", zarn_config::auth::redact(&zarn_config::quota::render(&reports)));
+    Ok(())
+}
+
+pub fn limits(session: Option<&str>, day: Option<&str>) -> Result<()> {
+    let mut layers = layers()?;
+    for (is_day, value) in [(false, session), (true, day)] {
+        if let Some(value) = value {
+            let usd = ops::parse_cap(value)?;
+            let scope = ops::set_spend_cap(&mut layers, is_day, usd)?;
+            println!(
+                "{} spend cap {} in the {} config",
+                if is_day { "daily" } else { "session" },
+                usd.map(|v| format!("set to ${v:.2}")).unwrap_or_else(|| "removed".into()),
+                scope.label()
+            );
+        }
+    }
+    let limits = layers.merged().limits;
+    let show = |v: Option<f64>| v.map(|v| format!("${v:.2}")).unwrap_or_else(|| "off".into());
+    println!("session cap  {}", show(limits.session_usd));
+    println!(
+        "daily cap    {} (spent today ${:.4})",
+        show(limits.day_usd),
+        zarn_config::spend::Ledger::system().today()
+    );
     Ok(())
 }

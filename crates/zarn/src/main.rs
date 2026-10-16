@@ -12,6 +12,7 @@ use zarn_config::auth::{KeyStore, redact};
 use zarn_config::guard::RedactingWriter;
 use zarn_config::{Config, modes, runtime};
 use zarn_core::agent::{Agent, AgentEvent};
+use zarn_core::cost::CostTracker;
 use zarn_core::provider::Event;
 use zarn_core::session;
 use zarn_core::tools::Ctx;
@@ -117,6 +118,8 @@ async fn run_command(command: &Command) -> Result<()> {
             }) => commands::mcp_add(name, *project, target),
             Some(McpAction::Remove { name }) => commands::mcp_remove(name),
         },
+        Command::Models { provider, refresh } => commands::models(provider.as_deref(), *refresh).await,
+        Command::Limits { session, day } => commands::limits(session.as_deref(), day.as_deref()),
         Command::Modes { action } => match action {
             None | Some(cli::ModesAction::List) => commands::modes_list(),
             Some(cli::ModesAction::Show { name }) => commands::modes_show(name),
@@ -193,10 +196,45 @@ async fn run_print(args: &Args, prompt: String) -> Result<()> {
     let agent = Agent::new(rt.provider.clone(), rt.tools.clone(), ctx, rt.agent_config())
         .with_gate(Arc::new(gate));
 
+    let limits = cfg.limits;
+    let ledger = zarn_config::spend::Ledger::system();
+    let mut tracker = CostTracker::new(zarn_config::pricing::table(&cfg), rt.model.clone());
+    let priced = tracker.rates().is_some();
+    let day_base = ledger.today();
+    if let Some(note) = zarn_config::spend::unenforceable(&limits, &rt.model, priced) {
+        eprintln!("{note}");
+    } else if let zarn_config::spend::Check::Stop(text) =
+        zarn_config::spend::check(&limits, 0.0, day_base)
+    {
+        bail!("stopped: {text}");
+    }
+
+    let cancel = CancellationToken::new();
+    let stop = cancel.clone();
     let (tx, mut rx) = tokio::sync::mpsc::channel(256);
     let printer = tokio::spawn(async move {
         let mut out = std::io::stdout();
+        let mut stopped = false;
         while let Some(event) = rx.recv().await {
+            if let AgentEvent::Provider(event) = &event {
+                tracker.observe(event);
+                if priced && !stopped && matches!(event, Event::Usage { .. }) {
+                    let session = tracker.total().usd.unwrap_or(0.0);
+                    match zarn_config::spend::check(&limits, session, day_base + session) {
+                        zarn_config::spend::Check::Stop(text) => {
+                            stopped = true;
+                            eprintln!("stopped: {text}");
+                            stop.cancel();
+                        }
+                        zarn_config::spend::Check::Warn(warnings) => {
+                            for warning in warnings {
+                                eprintln!("{warning}");
+                            }
+                        }
+                        zarn_config::spend::Check::Ok => {}
+                    }
+                }
+            }
             match event {
                 AgentEvent::Provider(Event::TextDelta(text)) => {
                     let _ = write!(out, "{}", redact(&text));
@@ -214,13 +252,18 @@ async fn run_print(args: &Args, prompt: String) -> Result<()> {
                 _ => {}
             }
         }
+        tracker
     });
 
-    let cancel = CancellationToken::new();
     let mut messages = vec![Message::System(rt.system.clone()), Message::user(&prompt)];
     let result = agent.run(&mut messages, &tx, &cancel).await;
     drop(tx);
-    let _ = printer.await;
+    if let Ok(tracker) = printer.await
+        && let Some(usd) = tracker.total().usd
+        && let Err(err) = ledger.add(usd)
+    {
+        eprintln!("daily spend not recorded: {err}");
+    }
     println!();
 
     if let Err(err) = result {

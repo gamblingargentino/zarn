@@ -1,7 +1,7 @@
 use crate::brand;
 use crate::markdown;
 use crate::popup;
-use crate::state::{App, Block, CardStatus, COLLAPSED_LINES, Mode, Overlay, ToolCard};
+use crate::state::{App, Block, CardStatus, COLLAPSED_LINES, CompareSide, Mode, Overlay, ToolCard};
 use crate::views;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
@@ -66,7 +66,7 @@ fn scrollback(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::raw(""));
     }
     for block in &app.blocks {
-        lines.extend(block_lines(block, app.theme.accent));
+        lines.extend(block_lines(block, app.theme.accent, area.width as usize));
         lines.push(Line::raw(""));
     }
     if let Some(request) = &app.pending {
@@ -90,8 +90,78 @@ fn scrollback(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-fn block_lines(block: &Block, accent: Color) -> Vec<Line<'static>> {
+pub fn wrap(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(4);
+    let mut out = Vec::new();
+    for raw in text.split('\n') {
+        let mut line = String::new();
+        for word in raw.split(' ') {
+            let needed = line.chars().count() + usize::from(!line.is_empty()) + word.chars().count();
+            if needed > width && !line.is_empty() {
+                out.push(std::mem::take(&mut line));
+            }
+            let mut rest: String = word.to_string();
+            while rest.chars().count() > width {
+                let head: String = rest.chars().take(width).collect();
+                out.push(head);
+                rest = rest.chars().skip(width).collect();
+            }
+            if !line.is_empty() {
+                line.push(' ');
+            }
+            line.push_str(&rest);
+        }
+        out.push(line);
+    }
+    out
+}
+
+fn compare_lines(sides: &[CompareSide], accent: Color, width: usize) -> Vec<Line<'static>> {
+    let col = width.saturating_sub(3).max(8) / 2;
+    let edge = Style::default().fg(Color::DarkGray);
+    let columns: Vec<Vec<(String, Style)>> = sides
+        .iter()
+        .map(|side| {
+            let mut rows = vec![(
+                truncate(&side.label, col),
+                Style::default().fg(accent).add_modifier(Modifier::BOLD),
+            )];
+            rows.push((truncate(&side.meta, col), edge));
+            let body = if side.failed {
+                Style::default().fg(Color::Red)
+            } else {
+                Style::default()
+            };
+            rows.extend(wrap(&side.text, col).into_iter().map(|l| (l, body)));
+            rows
+        })
+        .collect();
+    let height = columns.iter().map(Vec::len).max().unwrap_or(0);
+    (0..height)
+        .map(|i| {
+            let cell = |c: usize| {
+                columns
+                    .get(c)
+                    .and_then(|rows| rows.get(i))
+                    .cloned()
+                    .unwrap_or_default()
+            };
+            let (left, left_style) = cell(0);
+            let (right, right_style) = cell(1);
+            let pad = col.saturating_sub(left.chars().count());
+            Line::from(vec![
+                Span::styled(left, left_style),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(" │ ", edge),
+                Span::styled(right, right_style),
+            ])
+        })
+        .collect()
+}
+
+fn block_lines(block: &Block, accent: Color, width: usize) -> Vec<Line<'static>> {
     match block {
+        Block::Compare(sides) => compare_lines(sides, accent, width),
         Block::User(text) => text
             .split('\n')
             .map(|l| {
@@ -357,6 +427,13 @@ mod tests {
     fn short_output_gets_no_count_line() {
         let lines = card_lines(&card("only", false));
         assert!(!text(&lines).iter().any(|l| l.contains("more lines")));
+    }
+
+    #[test]
+    fn wrapping_respects_the_width_and_keeps_every_word() {
+        let lines = wrap("alpha beta gamma delta", 11);
+        assert_eq!(lines, vec!["alpha beta", "gamma delta"]);
+        assert!(wrap(&"x".repeat(25), 10).iter().all(|l| l.chars().count() <= 10));
     }
 
     #[test]
