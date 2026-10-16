@@ -111,12 +111,7 @@ impl Agent {
                 temperature: self.config.temperature,
             };
 
-            let collected = match self.consume(req, sink, cancel).await? {
-                Some(c) => c,
-                None => {
-                    return Ok(StopReason::Cancelled);
-                }
-            };
+            let collected = self.consume(req, sink, cancel).await?;
 
             messages.push(Message::Assistant {
                 content: if collected.text.is_empty() {
@@ -126,6 +121,10 @@ impl Agent {
                 },
                 tool_calls: collected.calls.clone(),
             });
+
+            if collected.stop == StopReason::Cancelled {
+                return Ok(StopReason::Cancelled);
+            }
 
             if collected.calls.is_empty() {
                 return Ok(collected.stop);
@@ -153,7 +152,7 @@ impl Agent {
         req: Request,
         sink: &Sender<AgentEvent>,
         cancel: &CancellationToken,
-    ) -> Result<Option<Collected>, ProviderError> {
+    ) -> Result<Collected, ProviderError> {
         let mut stream = self.provider.stream(req).await?;
         let mut text = String::new();
         let mut calls: Vec<ToolCall> = Vec::new();
@@ -165,7 +164,8 @@ impl Agent {
                 biased;
                 _ = cancel.cancelled() => {
                     let _ = sink.send(AgentEvent::Provider(Event::Done(StopReason::Cancelled))).await;
-                    return Ok(None);
+                    stop = StopReason::Cancelled;
+                    break;
                 }
                 next = stream.next() => match next {
                     Some(e) => e,
@@ -208,11 +208,11 @@ impl Agent {
             });
         }
 
-        if !calls.is_empty() {
+        if !calls.is_empty() && stop != StopReason::Cancelled {
             stop = StopReason::ToolUse;
         }
 
-        Ok(Some(Collected { text, calls, stop }))
+        Ok(Collected { text, calls, stop })
     }
 
     async fn invoke(&self, call: &ToolCall, sink: &Sender<AgentEvent>) -> ToolOutput {

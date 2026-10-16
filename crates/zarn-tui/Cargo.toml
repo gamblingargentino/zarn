@@ -16,3 +16,6 @@ ratatui.workspace = true
 crossterm.workspace = true
 syntect.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
