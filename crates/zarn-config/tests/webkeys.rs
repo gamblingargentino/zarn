@@ -336,3 +336,34 @@ async fn the_default_port_is_a_fixed_four_digit_number() {
     assert_eq!(webkeys::DEFAULT_PORT, 9276);
     running.stop();
 }
+
+#[tokio::test]
+async fn forms_work_with_the_headers_a_real_browser_sends() {
+    let page = open().await;
+    page.post("/save", &[("provider", "mock"), ("key", GOOD)]).await;
+    let home = page
+        .client
+        .get(format!("{}/", page.base))
+        .header("cookie", page.cookie())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(home.headers().get("referrer-policy").unwrap(), "same-origin", "no-referrer makes browsers send Origin: null");
+    let browser_post = |origin: &'static str, site: &'static str| {
+        page.client
+            .post(format!("{}/remove", page.base))
+            .header("cookie", page.cookie())
+            .header("origin", origin)
+            .header("sec-fetch-site", site)
+            .header("content-type", "application/x-www-form-urlencoded")
+            .body(format!("provider=mock&csrf={}", page.token))
+            .send()
+    };
+    let cross = browser_post("http://attacker.example", "cross-site").await.unwrap();
+    assert_eq!(cross.status(), 403);
+    assert!(cross.text().await.unwrap().contains("Back to the setup page"));
+    assert!(page.store.has("mock", None).is_some());
+    let removed = browser_post("null", "same-origin").await.unwrap();
+    assert_eq!(removed.status(), 303, "a same-origin form with Origin: null is the browser's own page");
+    assert!(page.store.has("mock", None).is_none());
+}

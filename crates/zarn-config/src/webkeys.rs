@@ -396,7 +396,7 @@ fn same(a: &str, b: &str) -> bool {
 
 fn response(status: &str, extra: &[(&str, String)], body: &str) -> String {
     let mut out = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\nX-Frame-Options: DENY\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: no-referrer\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'\r\n",
+        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\nX-Frame-Options: DENY\r\nX-Content-Type-Options: nosniff\r\nReferrer-Policy: same-origin\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'\r\n",
         body.len()
     );
     for (name, value) in extra {
@@ -411,6 +411,32 @@ fn redirect(extra: &[(&str, String)]) -> String {
     let mut headers = vec![("Location", "/".to_string())];
     headers.extend(extra.iter().cloned());
     response("303 See Other", &headers, "")
+}
+
+fn same_site(request: &Request, state: &State) -> bool {
+    match request.header("sec-fetch-site") {
+        Some("same-origin") => return true,
+        Some("none") | None => {}
+        Some(_) => return false,
+    }
+    match request.header("origin") {
+        None | Some("null") => true,
+        Some(origin) => state.hosts().iter().any(|h| origin == format!("http://{h}")),
+    }
+}
+
+fn refused_with_link(reason: &str) -> String {
+    response(
+        "403 Forbidden",
+        &[],
+        &page(
+            "zarn · not allowed",
+            &format!(
+                "<section><h2>That request was refused</h2><p>{}</p><p><a href=\"/\">Back to the setup page</a></p></section>",
+                escape(reason)
+            ),
+        ),
+    )
 }
 
 fn refused(reason: &str) -> String {
@@ -465,16 +491,8 @@ async fn route(request: &Request, state: &State) -> String {
         ("GET", "/") => response("200 OK", &[], &home(state)),
         ("GET", "/favicon.ico") => response("404 Not Found", &[], ""),
         ("POST", path) => {
-            if let Some(origin) = request.header("origin")
-                && !state.hosts().iter().any(|h| origin == format!("http://{h}"))
-            {
-                return refused("the form was sent from another site");
-            }
-            if request
-                .header("sec-fetch-site")
-                .is_some_and(|s| s != "same-origin" && s != "none")
-            {
-                return refused("the form was sent from another site");
+            if !same_site(request, state) {
+                return refused_with_link("the form was sent from another site");
             }
             let form = form_decode(&String::from_utf8_lossy(&request.body));
             let field = |name: &str| {
@@ -484,7 +502,7 @@ async fn route(request: &Request, state: &State) -> String {
                     .unwrap_or_default()
             };
             if !same(&field("csrf"), &state.token) {
-                return refused("the form is missing its token; reload the page");
+                return refused_with_link("the form is missing its token; reload the page and try again");
             }
             match path {
                 "/save" => save(state, &field("provider"), &field("key"), !field("test").is_empty()).await,
