@@ -37,6 +37,28 @@ pub trait CredentialBackend: Send + Sync {
     fn delete(&self, provider: &str) -> Result<bool, StoreError>;
 }
 
+pub const STORE_ENV: &str = "ZARN_CREDENTIAL_STORE";
+
+pub struct FileOnly;
+
+impl CredentialBackend for FileOnly {
+    fn label(&self) -> String {
+        "owner-only key file".into()
+    }
+
+    fn get(&self, _provider: &str) -> Result<Option<String>, StoreError> {
+        Err(StoreError::Unavailable(format!("{STORE_ENV}=file")))
+    }
+
+    fn set(&self, _provider: &str, _key: &str) -> Result<(), StoreError> {
+        Err(StoreError::Unavailable(format!("{STORE_ENV}=file")))
+    }
+
+    fn delete(&self, _provider: &str) -> Result<bool, StoreError> {
+        Err(StoreError::Unavailable(format!("{STORE_ENV}=file")))
+    }
+}
+
 pub struct OsKeyring;
 
 impl OsKeyring {
@@ -344,6 +366,10 @@ impl KeyStore {
 
     pub fn system() -> Self {
         let file = crate::paths::auth_file().unwrap_or_else(|| PathBuf::from("auth.json"));
+        let only_file = std::env::var(STORE_ENV).is_ok_and(|v| v.eq_ignore_ascii_case("file"));
+        if only_file {
+            return Self::new(Arc::new(FileOnly), file);
+        }
         Self::new(Arc::new(OsKeyring), file)
     }
 
@@ -368,6 +394,10 @@ impl KeyStore {
         self.fallback_used.store(true, Ordering::SeqCst);
     }
 
+    fn notice_marker(&self) -> PathBuf {
+        self.file.path().with_extension("json.notified")
+    }
+
     pub fn fallback_notice(&self) -> Option<String> {
         if !self.fallback_used.load(Ordering::SeqCst) {
             return None;
@@ -375,6 +405,14 @@ impl KeyStore {
         if self.notice_shown.swap(true, Ordering::SeqCst) {
             return None;
         }
+        let marker = self.notice_marker();
+        if marker.exists() {
+            return None;
+        }
+        if let Some(dir) = marker.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(&marker, "");
         Some(format!(
             "The OS credential store is unavailable, so API keys are kept in {} with owner-only permissions. Remove a key with: zarn logout <provider>",
             self.file.path().display()

@@ -4413,6 +4413,7 @@ dependencies = [
  "futures",
  "reqwest",
  "serde",
+ "tempfile",
  "tokio",
  "tokio-util",
  "tracing-subscriber",

@@ -61,6 +61,9 @@ fn an_unavailable_store_falls_back_to_the_file_and_says_so_once() {
     assert!(notice.contains("zarn logout"));
     assert!(!notice.contains(KEY));
     assert!(store.fallback_notice().is_none());
+    let again = KeyStore::new(Arc::new(MemoryBackend::unavailable()), &path);
+    again.save("other", OTHER).unwrap();
+    assert!(again.fallback_notice().is_none(), "the notice is shown once, not once per run");
 
     assert_eq!(
         store.resolve("google", None),
