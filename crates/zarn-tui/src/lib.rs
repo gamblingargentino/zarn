@@ -11,5 +11,5 @@ pub mod terminal;
 pub mod views;
 pub mod widgets;
 
-pub use run::{Options, permission_channel, run};
+pub use run::{Controller, Options, permission_channel, run};
 pub use state::App;

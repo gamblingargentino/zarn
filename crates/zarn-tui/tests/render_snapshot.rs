@@ -298,7 +298,7 @@ fn cached_tokens_appear_in_status_when_present() {
 #[test]
 fn cost_appears_in_status_line() {
     let mut app = App::new("model");
-    app.status.cost = 0.0042;
+    app.status.cost = Some(0.0042);
 
     let output = render_app(80, 24, &app);
     let status_line = &output[20];

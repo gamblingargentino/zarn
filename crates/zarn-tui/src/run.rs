@@ -64,11 +64,12 @@ pub fn permission_channel() -> (Arc<TuiPrompt>, mpsc::Receiver<PermissionRequest
     (Arc::new(TuiPrompt { tx }), rx)
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub struct Options {
     pub profile: Option<String>,
     pub model: Option<String>,
     pub resume: Option<PathBuf>,
+    pub store: Option<Arc<KeyStore>>,
 }
 
 #[derive(Clone, Debug)]
@@ -100,6 +101,7 @@ enum UiEvent {
         result: Result<McpServer, String>,
     },
     Doctor(String),
+    Notice(String),
 }
 
 struct McpState {
@@ -130,7 +132,7 @@ pub async fn run(options: Options) -> Result<()> {
     outcome
 }
 
-struct Controller {
+pub struct Controller {
     app: App,
     options: Options,
     store: Arc<KeyStore>,
@@ -153,6 +155,7 @@ struct Controller {
     ui_rx: Option<mpsc::Receiver<UiEvent>>,
     cancel: CancellationToken,
     keyboard: bool,
+    fingerprint: u64,
 }
 
 fn flatten_messages(messages: &[Message]) -> Vec<Block> {
@@ -173,7 +176,7 @@ fn flatten_messages(messages: &[Message]) -> Vec<Block> {
 }
 
 impl Controller {
-    fn new(options: Options) -> Result<Self> {
+    pub fn new(options: Options) -> Result<Self> {
         let cwd = std::env::current_dir()?;
         let ctx = Arc::new(Ctx::new(&cwd));
         let (prompt, permissions) = permission_channel();
@@ -183,8 +186,8 @@ impl Controller {
 
         let mut controller = Controller {
             app: App::new(""),
-            options,
-            store: KeyStore::shared(),
+            options: options.clone(),
+            store: options.store.clone().unwrap_or_else(KeyStore::shared),
             layers: None,
             cwd,
             ctx,
@@ -204,6 +207,7 @@ impl Controller {
             ui_rx: Some(ui_rx),
             cancel: CancellationToken::new(),
             keyboard: terminal::keyboard_enhanced(),
+            fingerprint: 0,
         };
 
         if let Some(path) = controller.options.resume.clone() {
@@ -258,6 +262,9 @@ impl Controller {
             }
         }
         let cfg = self.cfg();
+        self.fingerprint = context::fingerprint(&self.cwd);
+        self.cost.set_table(zarn_config::pricing::table(&cfg));
+        self.app.status.cost = self.cost.total().usd;
         self.app.theme.accent = brand::accent(cfg.general.accent.as_deref());
         self.app.theme.banner = cfg.general.banner();
         self.app.theme.show_cost = cfg.general.show_cost();
@@ -294,7 +301,15 @@ impl Controller {
             .filter_map(|m| m.server.as_ref())
             .flat_map(|s| s.tools())
             .collect();
-        match runtime::assemble(&cfg, plan, &self.cwd, self.ctx.clone(), tools) {
+        let tx = self.ui_tx.clone();
+        let notify: runtime::Notify = Arc::new(move |text: String| {
+            let _ = tx.try_send(UiEvent::Notice(zarn_config::auth::redact(&text)));
+        });
+        let assembly = runtime::Assembly {
+            store: self.store.clone(),
+            notify: Some(notify),
+        };
+        match runtime::assemble(&cfg, plan, &self.cwd, self.ctx.clone(), tools, assembly) {
             Ok(rt) => {
                 let agent = Agent::new(
                     rt.provider.clone(),
@@ -310,6 +325,8 @@ impl Controller {
                 self.cost.set_model(rt.plan.model.clone());
                 self.app.not_ready = None;
                 self.runtime = Some(rt);
+                self.app.status.cost = self.cost.total().usd;
+                self.update_meter();
             }
             Err(err) => {
                 self.agent = None;
@@ -469,17 +486,7 @@ impl Controller {
                 _ = frames.tick(), if self.app.streaming => self.app.advance_frame(),
                 event = keys.next() => {
                     let Some(Ok(event)) = event else { continue };
-                    let action = match event {
-                        TermEvent::Key(key) => self.app.on_key(key),
-                        TermEvent::Paste(text) => {
-                            self.app.paste(&text);
-                            None
-                        }
-                        _ => None,
-                    };
-                    if let Some(action) = action
-                        && !self.act(action)
-                    {
+                    if !self.on_terminal(event) {
                         break;
                     }
                 }
@@ -497,13 +504,102 @@ impl Controller {
             }
         }
 
+        self.shutdown().await;
+        Ok(())
+    }
+
+    fn on_terminal(&mut self, event: TermEvent) -> bool {
+        let action = match event {
+            TermEvent::Key(key) => self.app.on_key(key),
+            TermEvent::Paste(text) => {
+                self.app.paste(&text);
+                None
+            }
+            _ => None,
+        };
+        match action {
+            Some(action) => self.act(action),
+            None => true,
+        }
+    }
+
+    async fn shutdown(&mut self) {
         self.cancel.cancel();
         for state in std::mem::take(&mut self.mcp).into_values() {
             if let Some(server) = state.server {
                 server.shutdown().await;
             }
         }
-        Ok(())
+    }
+
+    pub fn app(&self) -> &App {
+        &self.app
+    }
+
+    pub fn app_mut(&mut self) -> &mut App {
+        &mut self.app
+    }
+
+    pub fn messages(&self) -> &[Message] {
+        &self.messages
+    }
+
+    pub fn key(&mut self, key: crossterm::event::KeyEvent) -> bool {
+        self.on_terminal(TermEvent::Key(key))
+    }
+
+    pub fn paste(&mut self, text: &str) {
+        self.on_terminal(TermEvent::Paste(text.to_string()));
+    }
+
+    pub fn type_line(&mut self, text: &str) -> bool {
+        self.app.set_input(text);
+        self.key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ))
+    }
+
+    pub async fn pump(&mut self, wait: std::time::Duration) -> bool {
+        let Some(mut ui_rx) = self.ui_rx.take() else {
+            return false;
+        };
+        let got = tokio::select! {
+            event = ui_rx.recv() => match event {
+                Some(event) => {
+                    self.on_ui(event);
+                    true
+                }
+                None => false,
+            },
+            request = self.permissions.recv() => match request {
+                Some(request) => {
+                    self.app.pending = Some(request);
+                    true
+                }
+                None => false,
+            },
+            _ = tokio::time::sleep(wait) => false,
+        };
+        self.ui_rx = Some(ui_rx);
+        got
+    }
+
+    pub async fn settle(&mut self, limit: std::time::Duration) {
+        let deadline = tokio::time::Instant::now() + limit;
+        while tokio::time::Instant::now() < deadline {
+            let got = self.pump(std::time::Duration::from_millis(60)).await;
+            if !got && !self.busy() && self.app.pending.is_none() {
+                break;
+            }
+            if self.app.pending.is_some() && !got {
+                break;
+            }
+        }
+    }
+
+    fn busy(&self) -> bool {
+        self.app.streaming
     }
 
     fn act(&mut self, action: Action) -> bool {
@@ -515,6 +611,7 @@ impl Controller {
             Action::Panel(effect) => self.panel_effect(effect),
             Action::Onboard(effect) => self.onboard_effect(effect),
             Action::Picked(purpose, value) => self.picked(purpose, value),
+            Action::SendQueued => self.send_next(),
             Action::Login(provider, secret) => {
                 let store = self.store.clone();
                 let result = match self.layers() {
@@ -535,11 +632,86 @@ impl Controller {
         true
     }
 
-    fn submit(&mut self, text: String) {
+    fn send_next(&mut self) {
         if self.app.streaming {
-            self.app.notice("still streaming — press esc to cancel first");
             return;
         }
+        if let Some(text) = self.app.next_queued() {
+            self.submit(text);
+        }
+    }
+
+    fn update_meter(&mut self) {
+        let Some(agent) = &self.agent else {
+            self.app.status.context = None;
+            return;
+        };
+        let provider = agent.provider();
+        let window = provider.caps().context_window;
+        let used = provider.count_tokens(&self.messages).unwrap_or(0);
+        self.app.status.context = Some((used, window));
+    }
+
+    fn reload_if_changed(&mut self) {
+        let now = context::fingerprint(&self.cwd);
+        if now != self.fingerprint {
+            self.rebuild();
+            self.app.notice("ZARN.md or skills changed on disk; reloaded them for this turn");
+        }
+    }
+
+    fn start_compaction(&mut self, auto: bool) {
+        let Some(agent) = self.agent.clone() else {
+            self.app.notice("cannot compact: no provider is ready");
+            return;
+        };
+        if compact::split_point(&self.messages, compact::KEEP_TURNS).is_none() {
+            if !auto {
+                self.app.notice("the conversation is too short to compact");
+            }
+            return;
+        }
+        self.app.streaming = true;
+        if auto {
+            let pct = self
+                .app
+                .status
+                .context
+                .map(|(u, w)| if w == 0 { 0 } else { u64::from(u) * 100 / u64::from(w) })
+                .unwrap_or(0);
+            self.app.notice(format!(
+                "context is {pct}% full; compacting before the next turn"
+            ));
+        } else {
+            self.app.notice("compacting…");
+        }
+        let messages = self.messages.clone();
+        let model = agent.config().model.clone();
+        let tx = self.ui_tx.clone();
+        tokio::spawn(async move {
+            let result = compact::compact(agent.provider().as_ref(), &messages, &model, compact::KEEP_TURNS)
+                .await
+                .map_err(|e| zarn_config::auth::redact(&e.to_string()));
+            let _ = tx.send(UiEvent::Compacted(result)).await;
+        });
+    }
+
+    fn needs_auto_compact(&self) -> bool {
+        let Some(agent) = &self.agent else {
+            return false;
+        };
+        self.cfg().general.auto_compact()
+            && compact::should_compact(agent.provider().as_ref(), &self.messages)
+            && compact::split_point(&self.messages, compact::KEEP_TURNS).is_some()
+    }
+
+    fn submit(&mut self, text: String) {
+        if self.app.streaming {
+            self.app.queue.push(text.clone());
+            self.app.blocks.push(Block::Queued(text));
+            return;
+        }
+        self.reload_if_changed();
         let Some(agent) = self.agent.clone() else {
             let why = self
                 .app
@@ -562,18 +734,29 @@ impl Controller {
                     self.cost.observe(provider_event);
                 }
                 self.app.apply(event);
-                self.app.status.cost = self.cost.total().usd.unwrap_or(0.0);
+                self.app.status.cost = self.cost.total().usd;
             }
             UiEvent::TurnDone { messages, result } => {
                 self.app.streaming = false;
                 self.messages = messages;
                 self.set_system();
                 self.cost.end_turn();
+                self.app.status.cost = self.cost.total().usd;
                 self.persist();
+                self.update_meter();
                 match result {
-                    Ok(StopReason::Cancelled) => self.app.notice("cancelled"),
+                    Ok(StopReason::Cancelled) => {
+                        self.app.notice("cancelled");
+                        self.app.pause_queue();
+                        return;
+                    }
                     Ok(_) => {}
                     Err(err) => self.app.notice(format!("error: {err}")),
+                }
+                if self.needs_auto_compact() {
+                    self.start_compaction(true);
+                } else {
+                    self.send_next();
                 }
             }
             UiEvent::Compacted(result) => {
@@ -592,6 +775,8 @@ impl Controller {
                     }
                     Err(err) => self.app.notice(format!("compaction failed: {err}")),
                 }
+                self.update_meter();
+                self.send_next();
             }
             UiEvent::PanelTest { name, result } => {
                 if let Mode::Panel(panel) = &mut self.app.mode {
@@ -653,6 +838,7 @@ impl Controller {
                 self.rebuild();
             }
             UiEvent::Doctor(report) => self.app.notice(report),
+            UiEvent::Notice(text) => self.app.notice(text),
         }
     }
 
@@ -1007,25 +1193,24 @@ impl Controller {
                 self.app.notice("conversation cleared");
             }
             "compact" => {
-                let Some(agent) = self.agent.clone() else {
-                    self.app.notice("cannot compact: no provider is ready");
-                    return true;
-                };
                 if self.app.streaming {
                     self.app.notice("wait for the current turn to finish");
                     return true;
                 }
-                self.app.streaming = true;
-                self.app.notice("compacting…");
-                let messages = self.messages.clone();
-                let model = agent.config().model.clone();
-                let tx = self.ui_tx.clone();
-                tokio::spawn(async move {
-                    let result = compact::compact(agent.provider().as_ref(), &messages, &model, compact::KEEP_TURNS)
-                        .await
-                        .map_err(|e| e.to_string());
-                    let _ = tx.send(UiEvent::Compacted(result)).await;
-                });
+                self.start_compaction(false);
+            }
+            "context" => {
+                let Some(agent) = self.agent.clone() else {
+                    self.app.notice("no provider is ready");
+                    return true;
+                };
+                let parts = self.runtime.as_ref().map(|rt| rt.parts.clone()).unwrap_or_default();
+                let tools = self.runtime.as_ref().map(|rt| rt.tools.specs()).unwrap_or_default();
+                let provider = agent.provider().clone();
+                let count = move |m: &[Message]| provider.count_tokens(m).unwrap_or(0);
+                let rows = context::breakdown(&count, &parts, &tools, &self.messages);
+                let window = agent.provider().caps().context_window;
+                self.app.notice(context::render_breakdown(&rows, window));
             }
             "cost" => {
                 let report = self.cost.report();

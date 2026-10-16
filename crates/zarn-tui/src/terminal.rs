@@ -20,7 +20,8 @@ pub fn color_depth() -> (Status, String) {
 }
 
 pub fn keyboard_enhanced() -> bool {
-    crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
+    std::io::stdout().is_terminal()
+        && crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false)
 }
 
 pub fn checks(known_keyboard: Option<bool>) -> Vec<Check> {

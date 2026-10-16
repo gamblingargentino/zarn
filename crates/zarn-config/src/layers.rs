@@ -135,6 +135,7 @@ impl Layers {
             GeneralField::Banner => g.banner.is_some(),
             GeneralField::ShowCost => g.show_cost.is_some(),
             GeneralField::ContextBudget => g.context_budget.is_some(),
+            GeneralField::AutoCompact => g.auto_compact.is_some(),
         })
     }
 }
@@ -146,6 +147,7 @@ pub enum GeneralField {
     Banner,
     ShowCost,
     ContextBudget,
+    AutoCompact,
 }
 
 #[cfg(test)]

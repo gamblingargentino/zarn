@@ -333,6 +333,17 @@ fn toggling_a_skill_persists_and_esc_closes_the_panel() {
 }
 
 #[test]
+fn the_auto_compact_toggle_persists_through_ops() {
+    let fx = Fixture::new("");
+    let mut panel = fx.panel().open_at(Tab::General);
+    for _ in 0..3 {
+        panel.on_key(key(KeyCode::Down));
+    }
+    assert_eq!(panel.on_key(key(KeyCode::Enter)), Some(Effect::Reload));
+    assert!(fx.user_config().contains("auto_compact = false"));
+}
+
+#[test]
 fn general_toggles_write_to_the_user_config() {
     let fx = Fixture::new("");
     let mut panel = fx.panel().open_at(Tab::General);

@@ -7,6 +7,7 @@ pub mod guard;
 pub mod layers;
 pub mod ops;
 pub mod paths;
+pub mod pricing;
 pub mod runtime;
 
 use anyhow::{Context, Result, bail};
@@ -14,6 +15,7 @@ use auth::{KeySource, KeyStore};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use zarn_core::cost::Rates;
 use zarn_providers::ProviderSpec;
 use zarn_tools::mcp::ServerConfig;
 use zarn_tools::permissions::Policy;
@@ -42,6 +44,8 @@ pub struct General {
     pub show_cost: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_budget: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact: Option<bool>,
 }
 
 impl General {
@@ -51,6 +55,7 @@ impl General {
         self.banner = self.banner.or(other.banner);
         self.show_cost = self.show_cost.or(other.show_cost);
         self.context_budget = self.context_budget.or(other.context_budget);
+        self.auto_compact = self.auto_compact.or(other.auto_compact);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -63,6 +68,10 @@ impl General {
 
     pub fn show_cost(&self) -> bool {
         self.show_cost.unwrap_or(true)
+    }
+
+    pub fn auto_compact(&self) -> bool {
+        self.auto_compact.unwrap_or(true)
     }
 }
 
@@ -104,6 +113,8 @@ pub struct Config {
     pub skills: BTreeMap<String, bool>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub mcp: BTreeMap<String, ServerConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub pricing: BTreeMap<String, Rates>,
 }
 
 impl Config {
@@ -133,6 +144,9 @@ impl Config {
         }
         for (name, server) in other.mcp {
             self.mcp.entry(name).or_insert(server);
+        }
+        for (prefix, rates) in other.pricing {
+            self.pricing.entry(prefix).or_insert(rates);
         }
     }
 
@@ -177,6 +191,14 @@ impl Config {
                 bail!(
                     "provider '{name}' sets api_key inline. Secrets never belong in a config file: delete that line and run `zarn login {name}` to keep the key in the OS credential store, or set api_key_env = \"SOME_ENV_VAR\" naming the variable that holds it."
                 );
+            }
+        }
+        for (prefix, rates) in &self.pricing {
+            if [rates.input, rates.output, rates.cached]
+                .iter()
+                .any(|v| !v.is_finite() || *v < 0.0)
+            {
+                bail!("pricing for '{prefix}' has a negative or invalid rate");
             }
         }
         for (name, profile) in &self.profiles {

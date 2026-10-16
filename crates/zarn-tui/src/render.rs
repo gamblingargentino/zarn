@@ -103,6 +103,20 @@ fn block_lines(block: &Block, accent: Color) -> Vec<Line<'static>> {
             .map(|l| Line::styled(l.to_string(), Style::default().fg(Color::DarkGray)))
             .collect(),
         Block::Tool(card) => card_lines(card),
+        Block::Queued(text) => text
+            .split('\n')
+            .enumerate()
+            .map(|(i, l)| {
+                let mut spans = vec![
+                    Span::styled("› ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(l.to_string(), Style::default().fg(Color::DarkGray)),
+                ];
+                if i == 0 {
+                    spans.push(Span::styled("  (queued)", Style::default().fg(Color::Yellow)));
+                }
+                Line::from(spans)
+            })
+            .collect(),
     }
 }
 
@@ -221,8 +235,19 @@ fn status(frame: &mut Frame, app: &App, area: Rect) {
     if app.status.cached_tokens > 0 {
         parts.push(format!("{} cached", compact(app.status.cached_tokens)));
     }
+    if let Some((used, window)) = app.status.context
+        && window > 0
+    {
+        parts.push(format!("ctx {}%", (u64::from(used) * 100 / u64::from(window)).min(999)));
+    }
     if app.theme.show_cost {
-        parts.push(format!("${:.4}", app.status.cost));
+        parts.push(match app.status.cost {
+            Some(usd) => format!("${usd:.4}"),
+            None => "no rate configured".to_string(),
+        });
+    }
+    if !app.queue.is_empty() {
+        parts.push(format!("{} queued", app.queue.len()));
     }
     if let Some(reason) = &app.not_ready {
         parts.push(format!("not ready: {reason}"));

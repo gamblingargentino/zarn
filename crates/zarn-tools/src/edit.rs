@@ -79,6 +79,9 @@ impl Tool for Edit {
                 "read {path} before editing it"
             )));
         }
+        if let Some(reason) = crate::freshness::stale(ctx, &resolved) {
+            return Ok(ToolOutput::error(reason));
+        }
 
         let content = match std::fs::read_to_string(&resolved) {
             Ok(content) => content,
@@ -104,11 +107,14 @@ impl Tool for Edit {
         };
 
         match fsx::write_atomic(&resolved, &updated) {
-            Ok(()) => Ok(ToolOutput::ok(format!(
+            Ok(()) => {
+                crate::freshness::record(ctx, &resolved);
+                Ok(ToolOutput::ok(format!(
                 "replaced {} occurrence{} in {path}",
                 if replace_all { count } else { 1 },
                 if replace_all && count != 1 { "s" } else { "" }
-            ))),
+            )))
+            }
             Err(err) => Ok(ToolOutput::error(format!("cannot write {path}: {err}"))),
         }
     }

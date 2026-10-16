@@ -57,6 +57,7 @@ pub enum Block {
     Assistant(String),
     Tool(ToolCard),
     Notice(String),
+    Queued(String),
 }
 
 #[derive(Clone, Debug, Default)]
@@ -65,7 +66,8 @@ pub struct Status {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cached_tokens: u64,
-    pub cost: f64,
+    pub cost: Option<f64>,
+    pub context: Option<(u32, u32)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -105,6 +107,7 @@ pub enum Action {
     Onboard(onboarding::Effect),
     Picked(ChatPick, String),
     Login(String, Secret),
+    SendQueued,
 }
 
 #[derive(Clone, Debug)]
@@ -143,6 +146,8 @@ pub struct App {
     pub popup_hidden: bool,
     pub theme: Theme,
     pub not_ready: Option<String>,
+    pub queue: Vec<String>,
+    pub queue_paused: bool,
     ctrl_c_armed: bool,
 }
 
@@ -281,13 +286,56 @@ impl App {
         self.input.clear();
         self.cursor = 0;
         self.input_changed();
-        self.blocks.push(Block::User(text.clone()));
         self.scroll_up = 0;
         if text.starts_with('/') && popup::split(&text).is_some() {
-            Some(Action::Command(text))
-        } else {
-            Some(Action::Submit(text))
+            self.blocks.push(Block::User(text.clone()));
+            return Some(Action::Command(text));
         }
+        if self.streaming || self.queue_paused {
+            self.queue.push(text.clone());
+            self.blocks.push(Block::Queued(text));
+            return None;
+        }
+        self.blocks.push(Block::User(text.clone()));
+        Some(Action::Submit(text))
+    }
+
+    pub fn next_queued(&mut self) -> Option<String> {
+        if self.queue_paused || self.queue.is_empty() {
+            return None;
+        }
+        let text = self.queue.remove(0);
+        if let Some(at) = self
+            .blocks
+            .iter()
+            .position(|b| matches!(b, Block::Queued(t) if *t == text))
+        {
+            self.blocks.remove(at);
+        }
+        self.blocks.push(Block::User(text.clone()));
+        Some(text)
+    }
+
+    pub fn pause_queue(&mut self) {
+        if !self.queue.is_empty() {
+            self.queue_paused = true;
+            self.notice(format!(
+                "{} queued message{} kept: enter sends, esc clears",
+                self.queue.len(),
+                if self.queue.len() == 1 { "" } else { "s" }
+            ));
+        }
+    }
+
+    pub fn clear_queue(&mut self) {
+        let dropped = self.queue.len();
+        self.queue.clear();
+        self.queue_paused = false;
+        self.blocks.retain(|b| !matches!(b, Block::Queued(_)));
+        self.notice(format!(
+            "dropped {dropped} queued message{}",
+            if dropped == 1 { "" } else { "s" }
+        ));
     }
 
     pub fn advance_frame(&mut self) {
@@ -410,6 +458,9 @@ impl App {
                 if self.streaming {
                     return Some(Action::Cancel);
                 }
+                if !self.queue.is_empty() {
+                    self.clear_queue();
+                }
             }
             (KeyCode::Enter, m)
                 if m.contains(KeyModifiers::SHIFT) || m.contains(KeyModifiers::ALT) =>
@@ -420,6 +471,10 @@ impl App {
                 let text = self.input.trim().to_string();
                 if !text.is_empty() {
                     return self.submit_line(text);
+                }
+                if self.queue_paused && !self.streaming {
+                    self.queue_paused = false;
+                    return Some(Action::SendQueued);
                 }
             }
             (KeyCode::Backspace, _) => {
@@ -530,6 +585,62 @@ mod tests {
             Some(Action::Submit("h".into()))
         );
         assert!(app.input.is_empty());
+    }
+
+    fn typed(app: &mut App, text: &str) -> Option<Action> {
+        for c in text.chars() {
+            app.on_key(key(KeyCode::Char(c)));
+        }
+        app.on_key(key(KeyCode::Enter))
+    }
+
+    #[test]
+    fn input_while_streaming_is_queued_and_shown_as_queued() {
+        let mut app = App::new("m");
+        app.streaming = true;
+        assert_eq!(typed(&mut app, "first"), None);
+        assert_eq!(typed(&mut app, "second"), None);
+        assert_eq!(app.queue, vec!["first", "second"]);
+        assert!(matches!(app.blocks.last(), Some(Block::Queued(t)) if t == "second"));
+        app.streaming = false;
+        assert_eq!(app.next_queued().as_deref(), Some("first"));
+        assert!(matches!(app.blocks.last(), Some(Block::User(t)) if t == "first"));
+        assert_eq!(app.next_queued().as_deref(), Some("second"));
+        assert_eq!(app.next_queued(), None);
+    }
+
+    #[test]
+    fn esc_cancels_and_keeps_the_queue_then_a_second_esc_clears_it() {
+        let mut app = App::new("m");
+        app.streaming = true;
+        typed(&mut app, "later");
+        assert_eq!(app.on_key(key(KeyCode::Esc)), Some(Action::Cancel));
+        assert_eq!(app.queue.len(), 1);
+        app.streaming = false;
+        app.pause_queue();
+        assert_eq!(app.next_queued(), None);
+        app.on_key(key(KeyCode::Esc));
+        assert!(app.queue.is_empty());
+        assert!(!app.blocks.iter().any(|b| matches!(b, Block::Queued(_))));
+    }
+
+    #[test]
+    fn enter_on_an_empty_line_resumes_a_paused_queue() {
+        let mut app = App::new("m");
+        app.streaming = true;
+        typed(&mut app, "later");
+        app.streaming = false;
+        app.pause_queue();
+        assert_eq!(app.on_key(key(KeyCode::Enter)), Some(Action::SendQueued));
+        assert_eq!(app.next_queued().as_deref(), Some("later"));
+    }
+
+    #[test]
+    fn commands_still_run_while_streaming() {
+        let mut app = App::new("m");
+        app.streaming = true;
+        assert_eq!(typed(&mut app, "/cost"), Some(Action::Command("/cost".into())));
+        assert!(app.queue.is_empty());
     }
 
     #[test]

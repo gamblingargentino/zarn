@@ -3,16 +3,18 @@ pub mod fallback;
 pub mod google;
 pub mod openai;
 pub mod ollama;
+pub mod pinned;
 pub mod exec;
 
 #[cfg(feature = "local")]
 pub mod llamacpp;
 
 pub use anthropic::AnthropicProvider;
-pub use fallback::FallbackProvider;
+pub use fallback::{FallbackProvider, Switch, SwitchSink};
 pub use google::GoogleProvider;
 pub use openai::OpenAiCompatProvider;
 pub use ollama::OllamaProvider;
+pub use pinned::PinnedModel;
 pub use exec::ExecProvider;
 
 #[cfg(feature = "local")]

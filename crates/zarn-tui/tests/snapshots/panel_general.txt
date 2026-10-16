@@ -4,8 +4,8 @@
 │› accent color          violet                                                                    │
 │  banner                on                                                                        │
 │  cost display          on                                                                        │
+│  auto-compact          on  compact when the context is 80% full                                  │
 │  ZARN.md token budget  8000                                                                      │
-│                                                                                                  │
 │                                                                                                  │
 │                                                                                                  │
 │↑↓ move · ←→ tab · enter change · esc close                                                       │

@@ -59,11 +59,21 @@ impl Tool for Write {
             ));
         }
 
+        if resolved.exists()
+            && let Some(reason) = crate::freshness::stale(ctx, &resolved)
+        {
+            return Ok(ToolOutput::error(reason));
+        }
+
         match crate::fsx::write_atomic(&resolved, content) {
-            Ok(()) => Ok(ToolOutput::ok(format!(
-                "wrote {} bytes to {path}",
-                content.len()
-            ))),
+            Ok(()) => {
+                ctx.mark_read(&resolved);
+                crate::freshness::record(ctx, &resolved);
+                Ok(ToolOutput::ok(format!(
+                    "wrote {} bytes to {path}",
+                    content.len()
+                )))
+            }
             Err(err) => Ok(ToolOutput::error(format!("cannot write {path}: {err}"))),
         }
     }

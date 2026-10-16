@@ -136,6 +136,7 @@ async fn tui(args: &Args, resume: Option<PathBuf>) -> Result<()> {
         profile: args.profile.clone(),
         model: args.model.clone(),
         resume,
+        ..zarn_tui::Options::default()
     })
     .await
 }
@@ -158,7 +159,18 @@ async fn run_print(args: &Args, prompt: String) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let ctx = Arc::new(Ctx::new(&cwd));
     let mcp_tools = zarn_tools::mcp::connect_all(&mcp).await;
-    let rt = runtime::assemble(&cfg, plan, &cwd, ctx.clone(), mcp_tools)?;
+    let notify: runtime::Notify = Arc::new(|text: String| eprintln!("{}", redact(&text)));
+    let rt = runtime::assemble(
+        &cfg,
+        plan,
+        &cwd,
+        ctx.clone(),
+        mcp_tools,
+        runtime::Assembly {
+            store: store.clone(),
+            notify: Some(notify),
+        },
+    )?;
     let agent = Agent::new(rt.provider.clone(), rt.tools.clone(), ctx, rt.agent_config())
         .with_gate(Arc::new(Permissions::headless().with_tools(cfg.permissions.clone())));
 

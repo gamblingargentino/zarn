@@ -26,6 +26,7 @@ pub const BUILTINS: &[(&str, &str, &str)] = &[
     ("clear", "", "drop the conversation and start over"),
     ("compact", "", "summarize the conversation to free context"),
     ("cost", "", "show token usage and cost for this session"),
+    ("context", "", "show what fills the context window"),
     ("resume", "[id]", "resume an earlier session in this directory"),
     ("tools", "", "list the registered tools"),
     ("login", "[provider]", "add or replace a provider's API key"),

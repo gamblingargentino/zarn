@@ -1,7 +1,7 @@
 use crate::agents::{self, AgentFile};
 use crate::auth::KeyStore;
 use crate::context::{self, DEFAULT_BUDGET};
-use crate::guard::{guarded_chain, redacting};
+use crate::guard::{guarded_named, redacting};
 use crate::{Config, catalog};
 use anyhow::{Result, bail};
 use std::path::Path;
@@ -10,7 +10,7 @@ use zarn_core::agent::AgentConfig;
 use zarn_core::provider::Provider;
 use zarn_core::subagent::{ProviderFactory, TaskTool, ToolFactory};
 use zarn_core::tools::{Ctx, Tool, ToolRegistry};
-use zarn_providers::ProviderSpec;
+use zarn_providers::{PinnedModel, ProviderSpec, Switch, SwitchSink};
 use zarn_tools::skill::{Skill, SkillTool};
 
 #[derive(Clone, Debug, PartialEq)]
@@ -18,8 +18,22 @@ pub struct Plan {
     pub profile: String,
     pub provider_name: String,
     pub model: String,
+    pub names: Vec<String>,
     pub specs: Vec<ProviderSpec>,
     pub skipped: Vec<String>,
+}
+
+impl Plan {
+    pub fn entries(&self) -> Vec<(String, ProviderSpec)> {
+        self.names.iter().cloned().zip(self.specs.iter().cloned()).collect()
+    }
+}
+
+pub type Notify = Arc<dyn Fn(String) + Send + Sync>;
+
+pub fn switch_sink(notify: &Option<Notify>) -> Option<SwitchSink> {
+    let notify = notify.clone()?;
+    Some(Arc::new(move |switch: &Switch| notify(switch.notice())))
 }
 
 pub fn active_profile(cfg: &Config, requested: Option<&str>) -> String {
@@ -54,6 +68,7 @@ pub fn plan(
     names.extend(spec.fallback.iter().flatten().cloned());
 
     let mut specs = Vec::new();
+    let mut kept = Vec::new();
     let mut skipped = Vec::new();
     for (name, resolved) in names.into_iter().zip(chain) {
         let missing = catalog::needs_key(&resolved) && resolved.api_key.is_none();
@@ -66,6 +81,7 @@ pub fn plan(
             skipped.push(name);
             continue;
         }
+        kept.push(name);
         specs.push(resolved);
     }
 
@@ -73,9 +89,98 @@ pub fn plan(
         profile: profile.to_string(),
         provider_name: primary,
         model,
+        names: kept,
         specs,
         skipped,
     })
+}
+
+pub fn resolve_model(cfg: &Config, requested: &str) -> Option<(Vec<String>, String)> {
+    if let Some((provider, model)) = requested.split_once(':')
+        && cfg.providers.contains_key(provider)
+        && !model.is_empty()
+    {
+        return Some((vec![provider.to_string()], model.to_string()));
+    }
+    let chain = |p: &crate::ProfileSpec| {
+        let mut names: Vec<String> = p.provider.iter().cloned().collect();
+        names.extend(p.fallback.iter().flatten().cloned());
+        names
+    };
+    if let Some(profile) = cfg.profiles.get(requested)
+        && profile.provider.is_some()
+        && let Some(model) = &profile.model
+    {
+        return Some((chain(profile), model.clone()));
+    }
+    cfg.profiles
+        .values()
+        .find(|p| p.provider.is_some() && p.model.as_deref() == Some(requested))
+        .map(|p| (chain(p), requested.to_string()))
+}
+
+#[derive(Clone)]
+pub struct Providers {
+    pub cfg: Config,
+    pub store: Arc<KeyStore>,
+    pub main: Arc<dyn Provider>,
+    pub main_model: String,
+    pub notify: Option<Notify>,
+}
+
+impl Providers {
+    fn say(&self, text: String) {
+        if let Some(notify) = &self.notify {
+            notify(text);
+        }
+    }
+
+    pub fn chain(&self, names: &[String]) -> Result<Arc<dyn Provider>, String> {
+        let mut entries = Vec::new();
+        let mut missing = Vec::new();
+        for name in names {
+            let Ok(spec) = crate::ops::spec_with_key(&self.cfg, &self.store, name) else {
+                missing.push(format!("{name} is not configured"));
+                continue;
+            };
+            if catalog::needs_key(&spec) && spec.api_key.is_none() {
+                missing.push(format!("{name} has no API key"));
+                continue;
+            }
+            entries.push((name.clone(), spec));
+        }
+        if entries.is_empty() {
+            return Err(missing.join(", "));
+        }
+        guarded_named(&entries, switch_sink(&self.notify)).map_err(|e| e.to_string())
+    }
+
+    pub fn for_model(&self, requested: Option<&str>) -> (Arc<dyn Provider>, String) {
+        let Some(requested) = requested.filter(|m| !m.trim().is_empty()) else {
+            return (self.main.clone(), self.main_model.clone());
+        };
+        match resolve_model(&self.cfg, requested) {
+            None => (self.main.clone(), requested.to_string()),
+            Some((names, model)) => match self.chain(&names) {
+                Ok(provider) => (provider, model),
+                Err(why) => {
+                    self.say(format!(
+                        "{requested}: {why}, answered by the main model {}",
+                        self.main_model
+                    ));
+                    (self.main.clone(), self.main_model.clone())
+                }
+            },
+        }
+    }
+
+    pub fn factory(&self) -> ProviderFactory {
+        let me = self.clone();
+        Arc::new(move |model: Option<&str>| {
+            let (provider, model) = me.for_model(model);
+            PinnedModel::wrap(provider, model)
+        })
+    }
 }
 
 pub struct Runtime {
@@ -83,8 +188,10 @@ pub struct Runtime {
     pub provider: Arc<dyn Provider>,
     pub tools: Arc<ToolRegistry>,
     pub system: String,
+    pub parts: context::SystemParts,
     pub skills: Vec<Skill>,
     pub agents: Vec<AgentFile>,
+    pub providers: Providers,
 }
 
 impl Runtime {
@@ -116,18 +223,32 @@ pub fn enabled_skills(cfg: &Config, all: Vec<Skill>) -> Vec<Skill> {
         .collect()
 }
 
+pub struct Assembly {
+    pub store: Arc<KeyStore>,
+    pub notify: Option<Notify>,
+}
+
 pub fn assemble(
     cfg: &Config,
     plan: Plan,
     cwd: &Path,
     ctx: Arc<Ctx>,
     extra_tools: Vec<Box<dyn Tool>>,
+    assembly: Assembly,
 ) -> Result<Runtime> {
-    let provider = guarded_chain(&plan.specs)?;
+    let provider = guarded_named(&plan.entries(), switch_sink(&assembly.notify))?;
+    let providers = Providers {
+        cfg: cfg.clone(),
+        store: assembly.store.clone(),
+        main: provider.clone(),
+        main_model: plan.model.clone(),
+        notify: assembly.notify.clone(),
+    };
     let skills = enabled_skills(cfg, context::discover_skills());
     let agents = agents::load();
     let budget = cfg.general.context_budget.unwrap_or(DEFAULT_BUDGET);
-    let system = context::system_prompt(cwd, &skills, budget);
+    let parts = context::system_parts(cwd, &skills, budget);
+    let system = parts.join();
 
     let mut registry = ToolRegistry::new();
     for tool in zarn_tools::builtin_list() {
@@ -137,11 +258,9 @@ pub fn assemble(
         registry.register(redacting(Box::new(SkillTool::new(skills.clone()))));
     }
     if !agents.is_empty() {
-        let shared = provider.clone();
-        let providers: ProviderFactory = Arc::new(move |_model: Option<&str>| shared.clone());
         let task = TaskTool::new(
             agents.iter().map(|a| a.def.clone()).collect(),
-            providers,
+            providers.factory(),
             subagent_tools(),
             ctx,
             AgentConfig {
@@ -160,8 +279,10 @@ pub fn assemble(
         provider,
         tools: Arc::new(registry),
         system,
+        parts,
         skills,
         agents,
+        providers,
     })
 }
 

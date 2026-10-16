@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub struct Rates {
     pub input: f64,
     pub output: f64,
+    #[serde(default)]
     pub cached: f64,
 }
 
@@ -65,13 +66,28 @@ impl CostTable {
     pub fn lookup(&self, model: &str) -> Option<Rates> {
         self.entries
             .iter()
-            .find(|(prefix, _)| model.starts_with(prefix.as_str()))
+            .find(|(prefix, _)| prefix_matches(prefix, model))
             .map(|(_, rates)| *rates)
+    }
+
+    pub fn entries(&self) -> &[(String, Rates)] {
+        &self.entries
     }
 
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+}
+
+fn prefix_matches(prefix: &str, model: &str) -> bool {
+    let Some(rest) = model.strip_prefix(prefix) else {
+        return false;
+    };
+    let ends_open = prefix
+        .chars()
+        .last()
+        .is_some_and(|c| !c.is_ascii_alphanumeric());
+    rest.is_empty() || ends_open || rest.starts_with(['-', '@', ':', '/', '_'])
 }
 
 #[derive(Clone, Debug, Default)]
@@ -100,6 +116,14 @@ impl CostTracker {
 
     pub fn set_model(&mut self, model: impl Into<String>) {
         self.model = model.into();
+    }
+
+    pub fn set_table(&mut self, table: CostTable) {
+        self.table = table;
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
     }
 
     pub fn rates(&self) -> Option<Rates> {
@@ -190,6 +214,16 @@ mod tests {
         assert_eq!(table.lookup("test-small").unwrap().input, 1.0);
         assert_eq!(table.lookup("test-big-1").unwrap().input, 10.0);
         assert!(table.lookup("other").is_none());
+    }
+
+    #[test]
+    fn a_prefix_does_not_match_a_different_version_of_the_model() {
+        let mut table = CostTable::empty();
+        table.set("gpt-5", Rates::new(1.0, 2.0, 0.1));
+        assert!(table.lookup("gpt-5").is_some());
+        assert!(table.lookup("gpt-5-2025-08-07").is_some());
+        assert!(table.lookup("gpt-5.5").is_none());
+        assert!(table.lookup("gpt-50").is_none());
     }
 
     #[test]

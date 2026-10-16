@@ -113,6 +113,7 @@ pub enum RowKind {
     Banner,
     ShowCost,
     ContextBudget,
+    AutoCompact,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -569,6 +570,8 @@ impl Panel {
                 ),
                 Row::new("banner", on_off(cfg.general.banner()), RowKind::Banner),
                 Row::new("cost display", on_off(cfg.general.show_cost()), RowKind::ShowCost),
+                Row::new("auto-compact", on_off(cfg.general.auto_compact()), RowKind::AutoCompact)
+                    .note("compact when the context is 80% full"),
                 Row::new(
                     "ZARN.md token budget",
                     cfg.general
@@ -997,6 +1000,13 @@ impl Panel {
                     g.show_cost = Some(value)
                 });
                 self.saved(format!("cost display {}", on_off(value)), result)
+            }
+            RowKind::AutoCompact => {
+                let value = !cfg.general.auto_compact();
+                let result = ops::set_general(&mut self.layers, GeneralField::AutoCompact, |g| {
+                    g.auto_compact = Some(value)
+                });
+                self.saved(format!("auto-compact {}", on_off(value)), result)
             }
             RowKind::ContextBudget => {
                 let current = cfg
