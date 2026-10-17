@@ -110,6 +110,7 @@ Everything after that is done from inside zarn, with no hand-edited files:
 | `/commands [list\|new <name>]` | list or scaffold your own slash commands |
 | `/diff [path]` | show the uncommitted changes, untracked files included, colored and folded; nothing is sent to the model (`/attach-output` adds it to your next message) |
 | `/system [show\|edit\|reset] [--project]` | show the system prompt, or replace it with your own |
+| `/chain [show\|add\|remove\|set\|clear]` | the models to fall back to when one fails |
 | `/style [name]` | how replies are written: `default`, `explanatory`, `learning`, `concise` or your own |
 | `/review`, `/security-review`, `/test`, `/explain <code>` | review the uncommitted changes, look for security problems, run and fix the tests, explain part of the code |
 | `/memory [add <note>]`, `/add-dir <path>`, `/todos` | ZARN.md memory files, another directory for this session, the model's todo list |
@@ -255,6 +256,7 @@ credits_format = "openrouter"
 provider = "anthropic"
 model = "claude-sonnet-5-5"
 fallback = ["local"]
+chain = ["anthropic:claude-haiku-5-5", "local:qwen3-coder"]
 
 [routing]
 enabled = true
@@ -391,6 +393,36 @@ pointer to `/model`. When you connect a key, zarn sends one short test request
 to the model it picked; if that model cannot be used with the key (retired for
 new users, no quota), it tries the next suggested models and keeps the first
 that answers.
+
+### Model chains and switching
+
+A chain lists the models to fall back to, in order, as `provider:model`
+(`chain` under a profile, or `/chain`). When the model in use fails with a
+rate limit, an outage, a dropped connection, no credit, a conversation too
+long for it, or a model the provider no longer offers, the same turn goes to
+the next model in the chain and zarn says which one answered. A model that
+fails twice in a row sits out for 5 minutes (30 for a rejected key, no credit
+or a missing model), so later turns go straight to the next one; after its
+rest it is tried first again and zarn says when it is back. A model whose
+context window is too small for the conversation is skipped while a bigger one
+is in the chain. Older `fallback = ["provider"]` entries still work and now
+use that provider's own model.
+
+| Command | What it does |
+|---|---|
+| `/chain` | the chain for this profile, and which models are resting |
+| `/chain add <provider:model> …` | add models (completion lists every model your keys can use) |
+| `/chain remove <n or provider:model>` | drop one |
+| `/chain set <provider:model> …` | replace the chain |
+| `/chain clear` | use only the main model |
+
+Before a message goes out, zarn compacts the conversation when it no longer
+fits the current model (for example after `/model` picks one with a smaller
+window), and when there is no earlier turn to summarize it shortens old tool
+outputs instead. Replies may use up to 16384 output tokens, or the provider's
+`max_output`; a model that allows fewer gets the request again with its own
+limit. A tool call cut off by that limit is never run: the model is told to
+write large files in smaller steps.
 
 ## Permissions
 

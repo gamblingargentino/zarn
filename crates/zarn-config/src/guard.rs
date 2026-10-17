@@ -63,6 +63,40 @@ pub fn guarded_chain(specs: &[zarn_providers::ProviderSpec]) -> Result<Arc<dyn P
     }
 }
 
+pub type Chain = Arc<zarn_providers::FallbackProvider>;
+
+pub fn guarded_pinned(
+    entries: &[(String, zarn_providers::ProviderSpec, Option<String>)],
+    sink: Option<zarn_providers::SwitchSink>,
+) -> Result<(Arc<dyn Provider>, Option<Chain>), ProviderError> {
+    let providers = entries
+        .iter()
+        .map(|(name, spec, model)| {
+            zarn_providers::build(spec)
+                .map(RedactingProvider::wrap)
+                .map(|p| crate::health::Measured::wrap(name.clone(), p))
+                .map(|p| match model {
+                    Some(model) => zarn_providers::PinnedModel::wrap(p, model.clone()),
+                    None => p,
+                })
+                .map(|p| (name.clone(), p))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(redact_error)?;
+    match providers.len() {
+        0 => Err(ProviderError::Other("no providers configured".into())),
+        1 => Ok((providers.into_iter().next().expect("one provider").1, None)),
+        _ => {
+            let chain = zarn_providers::FallbackProvider::named(providers);
+            let chain = Arc::new(match sink {
+                Some(sink) => chain.with_sink(sink),
+                None => chain,
+            });
+            Ok((chain.clone(), Some(chain)))
+        }
+    }
+}
+
 pub fn guarded_named(
     entries: &[(String, zarn_providers::ProviderSpec)],
     sink: Option<zarn_providers::SwitchSink>,

@@ -66,12 +66,51 @@ pub async fn compact(
     Ok(out)
 }
 
+pub const PART_CHARS: usize = 4000;
+
+fn clip_middle(text: &str, max: usize) -> String {
+    let count = text.chars().count();
+    if count <= max {
+        return text.to_string();
+    }
+    let head: String = text.chars().take(max / 2).collect();
+    let tail: String = text.chars().skip(count - max / 2).collect();
+    format!("{head}\n[… {} characters left out …]\n{tail}", count - max)
+}
+
+pub fn fit_transcript(parts: &[String], budget: usize) -> String {
+    let clipped: Vec<String> = parts.iter().map(|p| clip_middle(p, PART_CHARS)).collect();
+    let joined = clipped.join("\n\n");
+    clip_middle(&joined, budget.max(2000))
+}
+
+pub fn shrink_tool_results(messages: &[Message], keep_last: usize, max_chars: usize) -> (Vec<Message>, usize) {
+    let results: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| matches!(m, Message::ToolResult { .. }))
+        .map(|(i, _)| i)
+        .collect();
+    let old = results.len().saturating_sub(keep_last);
+    let mut shrunk = 0;
+    let mut out = messages.to_vec();
+    for &i in &results[..old] {
+        if let Message::ToolResult { content, .. } = &mut out[i]
+            && content.chars().count() > max_chars
+        {
+            *content = clip_middle(content, max_chars);
+            shrunk += 1;
+        }
+    }
+    (out, shrunk)
+}
+
 async fn summarize(
     provider: &dyn Provider,
     head: &[Message],
     model: &str,
 ) -> Result<String, ProviderError> {
-    let transcript = head
+    let parts: Vec<String> = head
         .iter()
         .map(|m| {
             let role = match m {
@@ -82,8 +121,10 @@ async fn summarize(
             };
             format!("[{role}] {}", m.text())
         })
-        .collect::<Vec<_>>()
-        .join("\n\n");
+        .collect();
+    let window = provider.caps().context_window as usize;
+    let budget = if window == 0 { usize::MAX } else { window.saturating_sub(4096) * 3 };
+    let transcript = fit_transcript(&parts, budget);
 
     let request = Request {
         messages: vec![
@@ -249,5 +290,39 @@ mod tests {
 
         let result = compact(&Empty, &convo(6), "m", KEEP_TURNS).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn a_transcript_is_cut_to_fit_and_keeps_both_ends() {
+        let parts: Vec<String> = (0..50).map(|i| format!("[tool] {i} {}", "x".repeat(10_000))).collect();
+        let fitted = fit_transcript(&parts, 20_000);
+        assert!(fitted.chars().count() < 21_000, "{}", fitted.len());
+        assert!(fitted.starts_with("[tool] 0 "));
+        assert!(fitted.trim_end().ends_with(&"x".repeat(100)));
+        assert!(fitted.contains("characters left out"));
+        let small = vec!["[user] hi".to_string(), "[assistant] hello".to_string()];
+        assert_eq!(fit_transcript(&small, 20_000), "[user] hi\n\n[assistant] hello");
+    }
+
+    #[test]
+    fn old_tool_results_shrink_and_recent_ones_stay_whole() {
+        let big = "y".repeat(9_000);
+        let messages = vec![
+            Message::user("go"),
+            Message::ToolResult { id: "1".into(), content: big.clone(), is_error: false },
+            Message::ToolResult { id: "2".into(), content: "short".into(), is_error: false },
+            Message::ToolResult { id: "3".into(), content: big.clone(), is_error: false },
+            Message::ToolResult { id: "4".into(), content: big.clone(), is_error: false },
+        ];
+        let (out, shrunk) = shrink_tool_results(&messages, 2, 1_000);
+        assert_eq!(shrunk, 1);
+        let text = |i: usize| match &out[i] {
+            Message::ToolResult { content, .. } => content.clone(),
+            _ => unreachable!(),
+        };
+        assert!(text(1).chars().count() < 1_100 && text(1).contains("left out"));
+        assert_eq!(text(2), "short");
+        assert_eq!(text(3), big, "the last results stay whole");
+        assert_eq!(text(4), big);
     }
 }

@@ -24,12 +24,36 @@ pub struct Plan {
     pub model: String,
     pub names: Vec<String>,
     pub specs: Vec<ProviderSpec>,
+    pub models: Vec<Option<String>>,
     pub skipped: Vec<String>,
 }
 
 impl Plan {
     pub fn entries(&self) -> Vec<(String, ProviderSpec)> {
         self.names.iter().cloned().zip(self.specs.iter().cloned()).collect()
+    }
+
+    pub fn pinned(&self) -> Vec<(String, ProviderSpec, Option<String>)> {
+        self.names
+            .iter()
+            .cloned()
+            .zip(self.specs.iter().cloned())
+            .zip(self.models.iter().cloned().chain(std::iter::repeat(None)))
+            .map(|((name, spec), model)| (name, spec, model))
+            .collect()
+    }
+
+    pub fn chain_labels(&self) -> Vec<String> {
+        self.names
+            .iter()
+            .zip(self.models.iter().cloned().chain(std::iter::repeat(None)))
+            .enumerate()
+            .map(|(i, (name, model))| match (i, model) {
+                (0, _) => format!("{name}:{}", self.model),
+                (_, Some(model)) if !name.contains(':') => format!("{name}:{model}"),
+                _ => name.clone(),
+            })
+            .collect()
     }
 }
 
@@ -71,25 +95,49 @@ pub fn plan(
     let mut names = vec![primary.clone()];
     names.extend(spec.fallback.iter().flatten().cloned());
 
+    let mut candidates: Vec<(String, ProviderSpec, Option<String>, String)> = Vec::new();
+    let mut fallbacks = names.into_iter().zip(chain);
+    if let Some((name, resolved)) = fallbacks.next() {
+        candidates.push((name.clone(), resolved, None, name));
+    }
+    for (provider, chained) in spec.chain_entries() {
+        let Some(mut resolved) = cfg.providers.get(&provider).cloned() else {
+            continue;
+        };
+        resolved.api_key = cfg.resolve_key(store, &provider).map(|(key, _)| key);
+        candidates.push((format!("{provider}:{chained}"), resolved, Some(chained), provider));
+    }
+    for (name, resolved) in fallbacks {
+        let pinned = crate::ops::model_for(cfg, &name).filter(|m| *m != model);
+        candidates.push((name.clone(), resolved, pinned, name));
+    }
+
     let mut specs = Vec::new();
     let mut kept = Vec::new();
+    let mut models = Vec::new();
     let mut skipped = Vec::new();
-    for (name, resolved) in names.into_iter().zip(chain) {
+    let mut seen = HashSet::new();
+    for (label, resolved, pinned, provider) in candidates {
+        let key = (provider.clone(), pinned.clone().unwrap_or_else(|| model.clone()));
+        if !seen.insert(key) {
+            continue;
+        }
         let missing = catalog::needs_key(&resolved) && resolved.api_key.is_none();
-        if missing && name == primary {
-            if let Some(err) = store.helper_error(&name) {
-                bail!("{err}. Fix the helper command, or run /login {name}.");
+        if missing && kept.is_empty() {
+            if let Some(err) = store.helper_error(&provider) {
+                bail!("{err}. Fix the helper command, or run /login {provider}.");
             }
             bail!(
-                "provider '{name}' has no API key. Run /login {name} or `zarn login {name}`."
+                "provider '{provider}' has no API key. Run /login {provider} or `zarn login {provider}`."
             );
         }
         if missing {
-            skipped.push(name);
+            skipped.push(label);
             continue;
         }
-        kept.push(name);
+        kept.push(label);
         specs.push(resolved);
+        models.push(pinned);
     }
 
     Ok(Plan {
@@ -98,6 +146,7 @@ pub fn plan(
         model,
         names: kept,
         specs,
+        models,
         skipped,
     })
 }
@@ -330,6 +379,7 @@ pub struct Runtime {
     pub warnings: Vec<String>,
     pub parallel: usize,
     pub deferred: Option<Arc<zarn_tools::tool_search::Deferred>>,
+    pub chain: Option<crate::guard::Chain>,
 }
 
 impl Runtime {
@@ -403,7 +453,7 @@ pub fn assemble(
     extra_tools: Vec<Box<dyn Tool>>,
     assembly: Assembly,
 ) -> Result<Runtime> {
-    let base = guarded_named(&plan.entries(), switch_sink(&assembly.notify))?;
+    let (base, chain) = crate::guard::guarded_pinned(&plan.pinned(), switch_sink(&assembly.notify))?;
     let providers = Providers {
         cfg: cfg.clone(),
         store: assembly.store.clone(),
@@ -509,6 +559,7 @@ pub fn assemble(
         warnings,
         parallel,
         deferred,
+        chain,
     })
 }
 

@@ -166,11 +166,13 @@ async fn a_fallback_switch_appears_once_in_the_scrollback() {
     let mut c = env.controller();
     turn(&mut c, "one").await;
     turn(&mut c, "two").await;
+    turn(&mut c, "three").await;
     let switched: Vec<String> = notices(&c)
         .into_iter()
         .filter(|n| n.contains("anthropic rate-limited, answered by openai"))
         .collect();
-    assert_eq!(switched.len(), 1);
+    assert_eq!(switched.len(), 2, "{switched:?}");
+    assert!(switched[1].ends_with("anthropic keeps failing, so it sits out for 5 min"), "{switched:?}");
 }
 
 #[tokio::test]

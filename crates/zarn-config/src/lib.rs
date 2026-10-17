@@ -46,6 +46,8 @@ pub struct ProfileSpec {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub chain: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
@@ -258,6 +260,29 @@ impl ProfileSpec {
         self.provider = self.provider.take().or(other.provider);
         self.model = self.model.take().or(other.model);
         self.fallback = self.fallback.take().or(other.fallback);
+        self.chain = self.chain.take().or(other.chain);
+    }
+
+    pub fn chain_entries(&self) -> Vec<(String, String)> {
+        let primary = self.provider.clone().unwrap_or_default();
+        self.chain
+            .iter()
+            .flatten()
+            .filter_map(|entry| split_chain_entry(entry, &primary))
+            .collect()
+    }
+}
+
+pub fn split_chain_entry(entry: &str, primary: &str) -> Option<(String, String)> {
+    let entry = entry.trim();
+    if entry.is_empty() {
+        return None;
+    }
+    match entry.split_once(':') {
+        Some((provider, model)) if !provider.contains('/') && !model.is_empty() => {
+            Some((provider.trim().to_string(), model.trim().to_string()))
+        }
+        _ => Some((primary.to_string(), entry.to_string())),
     }
 }
 
@@ -500,6 +525,13 @@ impl Config {
                 if !self.providers.contains_key(fallback) {
                     bail!(
                         "profile '{name}' falls back to provider '{fallback}', which is not configured"
+                    );
+                }
+            }
+            for (provider, model) in profile.chain_entries() {
+                if !self.providers.contains_key(&provider) {
+                    bail!(
+                        "profile '{name}' chains to {provider}:{model}, but provider '{provider}' is not configured; fix it with /chain or edit [profiles.{name}]"
                     );
                 }
             }

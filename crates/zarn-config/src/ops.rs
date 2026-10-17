@@ -171,6 +171,13 @@ fn unlink_provider(profile: &mut ProfileSpec, name: &str) {
     if let Some(fallback) = profile.fallback.as_mut() {
         fallback.retain(|f| f != name);
     }
+    let primary = profile.provider.clone().unwrap_or_default();
+    if let Some(chain) = profile.chain.as_mut() {
+        chain.retain(|entry| crate::split_chain_entry(entry, &primary).is_none_or(|(p, _)| p != name));
+        if chain.is_empty() {
+            profile.chain = None;
+        }
+    }
     if profile.provider.as_deref() == Some(name) {
         let next = profile
             .fallback
@@ -196,7 +203,7 @@ pub fn remove_provider(layers: &mut Layers, store: &KeyStore, name: &str) -> Res
         }
         layer
             .profiles
-            .retain(|_, p| p.provider.is_some() || p.model.is_some() || p.fallback.is_some());
+            .retain(|_, p| p.provider.is_some() || p.model.is_some() || p.fallback.is_some() || p.chain.is_some());
     }
     for scope in Scope::ALL {
         if layers.path(scope).is_some_and(|p| p.exists()) {
@@ -700,6 +707,32 @@ pub fn set_fallback(layers: &mut Layers, profile: &str, order: Vec<String>) -> R
     save_profile(layers, profile, |p| {
         p.fallback = (!order.is_empty()).then_some(order);
     })
+}
+
+pub fn set_chain(layers: &mut Layers, profile: &str, entries: Vec<String>) -> Result<Vec<String>> {
+    let cfg = layers.merged();
+    let primary = cfg.profiles.get(profile).and_then(|p| p.provider.clone()).unwrap_or_default();
+    let mut normal: Vec<String> = Vec::new();
+    for entry in &entries {
+        let Some((provider, model)) = crate::split_chain_entry(entry, &primary) else {
+            continue;
+        };
+        if provider.is_empty() {
+            bail!("'{entry}' names no provider; write it as provider:model");
+        }
+        if !cfg.providers.contains_key(&provider) {
+            bail!("no provider named '{provider}' (from '{entry}'); add it with /login {provider} or /provider add");
+        }
+        let full = format!("{provider}:{model}");
+        if !normal.contains(&full) {
+            normal.push(full);
+        }
+    }
+    let saved = normal.clone();
+    save_profile(layers, profile, |p| {
+        p.chain = (!normal.is_empty()).then_some(normal);
+    })?;
+    Ok(saved)
 }
 
 pub fn switch_provider(layers: &mut Layers, provider: &str) -> Result<String> {

@@ -246,6 +246,7 @@ pub struct Controller {
     interactive: bool,
     editor_pending: bool,
     pending_edit: Option<PathBuf>,
+    precompacted: bool,
     todos: zarn_tools::todo::TodoList,
     notifier: crate::notify::Notifier,
     shells: Arc<zarn_tools::shells::Shells>,
@@ -343,6 +344,7 @@ impl Controller {
             interactive: false,
             editor_pending: false,
             pending_edit: None,
+            precompacted: false,
             todos: Arc::default(),
             notifier: crate::notify::Notifier::stdout(),
             shells: zarn_tools::shells::Shells::new(),
@@ -387,13 +389,11 @@ impl Controller {
     }
 
     fn layers(&mut self) -> Option<&mut Layers> {
-        if self.layers.is_none() {
-            match Layers::load() {
-                Ok(layers) => self.layers = Some(layers),
-                Err(err) => {
-                    self.app.notice(format!("config error: {err:#}"));
-                    return None;
-                }
+        match Layers::load() {
+            Ok(layers) => self.layers = Some(layers),
+            Err(err) => {
+                self.app.notice(format!("config error: {err:#}"));
+                return None;
             }
         }
         self.layers.as_mut()
@@ -902,6 +902,25 @@ impl Controller {
         for key in ["skills show", "skills remove", "skills enable", "skills disable"] {
             args.insert(key.into(), skill_names.clone());
         }
+        let mut chainable: Vec<(String, String)> = Vec::new();
+        for (name, spec) in &cfg.providers {
+            if zarn_config::catalog::needs_key(spec) && cfg.resolve_key(&self.store, name).is_none() {
+                continue;
+            }
+            for model in zarn_config::quota::cached_models(&zarn_config::quota::cache_dir(), name) {
+                if ops::is_chat_model(&model.id) {
+                    chainable.push((format!("{name}:{}", model.id), zarn_config::quota::context_label(model.context_window)));
+                }
+            }
+            for model in zarn_config::catalog::suggested_for(spec) {
+                let id = format!("{name}:{model}");
+                if !chainable.iter().any(|(c, _)| *c == id) {
+                    chainable.push((id, format!("suggested for {name}")));
+                }
+            }
+        }
+        args.insert("chain add".into(), chainable.clone());
+        args.insert("chain set".into(), chainable);
         args.insert(
             "style".into(),
             zarn_config::styles::load().into_iter().map(|s| (s.name, s.description)).collect(),
@@ -1882,6 +1901,17 @@ impl Controller {
         });
     }
 
+    fn context_ratio(&self) -> f32 {
+        let Some(agent) = &self.agent else {
+            return 0.0;
+        };
+        let window = self
+            .context_window()
+            .unwrap_or_else(|| agent.provider().caps().context_window);
+        let used = agent.provider().count_tokens(&self.messages).unwrap_or(0);
+        if window == 0 { 0.0 } else { used as f32 / window as f32 }
+    }
+
     fn needs_auto_compact(&self) -> bool {
         let Some(agent) = &self.agent else {
             return false;
@@ -2258,6 +2288,23 @@ impl Controller {
         if self.app.streaming {
             self.app.enqueue(text.clone(), text);
             return;
+        }
+        if !resolved {
+            if self.precompacted {
+                self.precompacted = false;
+            } else if self.needs_auto_compact() {
+                self.precompacted = true;
+                self.app.enqueue(text.clone(), text);
+                self.start_compaction(true);
+                return;
+            } else if self.context_ratio() >= compact::TRIGGER {
+                let (messages, shrunk) = compact::shrink_tool_results(&self.messages, 4, 2_000);
+                if shrunk > 0 {
+                    self.messages = messages;
+                    self.update_meter();
+                    self.app.notice(format!("shortened {shrunk} old tool outputs so the conversation fits this model's context"));
+                }
+            }
         }
         let refs = if resolved { Vec::new() } else { self.resource_refs(&text) };
         if !refs.is_empty() {
@@ -3523,6 +3570,86 @@ impl Controller {
         }
     }
 
+    fn chain_profile(&self) -> String {
+        self.runtime
+            .as_ref()
+            .map(|rt| rt.plan.profile.clone())
+            .unwrap_or_else(|| runtime::active_profile(&self.cfg(), self.options.profile.as_deref()))
+    }
+
+    fn chain_command(&mut self, words: &[String]) {
+        let cfg = self.cfg();
+        let profile = self.chain_profile();
+        let spec = cfg.profiles.get(&profile).cloned().unwrap_or_default();
+        let current: Vec<String> = spec.chain_entries().into_iter().map(|(p, m)| format!("{p}:{m}")).collect();
+        let rest: Vec<String> = words.iter().skip(1).cloned().collect();
+        let next = match words.first().map(String::as_str) {
+            None | Some("show") | Some("list") => return self.show_chain(&profile),
+            Some("add") if rest.is_empty() => return self.app.notice("usage: /chain add <provider:model> [more…]"),
+            Some("add") => current.iter().cloned().chain(rest).collect(),
+            Some("set") => rest,
+            Some("clear") => Vec::new(),
+            Some("remove") | Some("rm") => {
+                let Some(target) = rest.first() else {
+                    return self.app.notice("usage: /chain remove <number or provider:model>");
+                };
+                let at = target
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|n| n.checked_sub(2))
+                    .filter(|i| *i < current.len())
+                    .or_else(|| current.iter().position(|e| e == target || e.ends_with(&format!(":{target}"))));
+                let Some(at) = at else {
+                    return self.app.notice(format!("'{target}' is not in the chain; /chain shows it"));
+                };
+                let mut next = current.clone();
+                next.remove(at);
+                next
+            }
+            Some(other) => {
+                return self.app.notice(format!(
+                    "unknown /chain {other}; use /chain [show|add|remove|set|clear], entries written provider:model"
+                ));
+            }
+        };
+        let result = match self.layers() {
+            Some(layers) => ops::set_chain(layers, &profile, next),
+            None => return,
+        };
+        match result {
+            Ok(_) => {
+                self.rebuild();
+                self.show_chain(&profile);
+            }
+            Err(err) => self.app.notice(format!("{err:#}")),
+        }
+    }
+
+    fn show_chain(&mut self, profile: &str) {
+        let Some(rt) = &self.runtime else {
+            return self.app.notice("no provider is ready; /login first");
+        };
+        let resting: Vec<(String, std::time::Duration)> = rt.chain.as_ref().map(|c| c.resting()).unwrap_or_default();
+        let mut lines = vec![format!("model chain for profile {profile} (tried in order; a model that keeps failing sits out a while):")];
+        for (i, label) in rt.plan.chain_labels().iter().enumerate() {
+            let name = rt.plan.names.get(i).cloned().unwrap_or_default();
+            let note = match resting.iter().find(|(n, _)| *n == name) {
+                Some((_, left)) => format!("  (resting, {} min left)", left.as_secs().div_ceil(60)),
+                None if i == 0 => "  (main model)".to_string(),
+                None => String::new(),
+            };
+            lines.push(format!("  {}. {label}{note}", i + 1));
+        }
+        for skipped in &rt.plan.skipped {
+            lines.push(format!("  -  {skipped}  (skipped: no API key)"));
+        }
+        if rt.plan.names.len() < 2 {
+            lines.push("only the main model is in the chain, so a failure ends the turn".into());
+        }
+        lines.push("/chain add provider:model adds one, /chain remove <n>, /chain set a b c, /chain clear; /rank finds good ones".into());
+        self.app.notice(lines.join("\n"));
+    }
+
     fn system_source(&self) -> String {
         match context::system_override(&self.cwd, paths::user_dir().as_deref()) {
             Some((label, path, _)) => format!("{} ({label})", path.display()),
@@ -3907,6 +4034,7 @@ impl Controller {
             "add-dir" => self.add_dir(args.trim()),
             "memory" => self.memory_command(&args),
             "system" => self.system_command(&words),
+            "chain" => self.chain_command(&words),
             "todos" => {
                 let todos = self.todos.lock().map(|t| t.clone()).unwrap_or_default();
                 self.app.notice(zarn_tools::todo::render(&todos));
