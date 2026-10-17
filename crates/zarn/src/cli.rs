@@ -136,6 +136,13 @@ pub enum Command {
         #[arg(long, help = "Ignore the cache and ask the providers again")]
         refresh: bool,
     },
+    #[command(about = "Check models with one short tool-call request each and rank them")]
+    Rank {
+        #[arg(value_name = "PROVIDER | PROVIDER:MODEL", help = "One provider, or provider:model entries; empty ranks the chain and a few suggested models")]
+        entries: Vec<String>,
+        #[arg(long, value_name = "N", num_args = 0..=1, default_missing_value = "3", help = "Save the best N working models (not the main one) as the profile's chain")]
+        save: Option<usize>,
+    },
     #[command(about = "Show or set the session and daily spend caps")]
     Limits {
         #[arg(long, value_name = "USD", help = "Session cap in dollars, or off")]

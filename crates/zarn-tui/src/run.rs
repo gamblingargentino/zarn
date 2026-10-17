@@ -131,6 +131,7 @@ enum UiEvent {
         chat: bool,
     },
     Compared(Vec<crate::state::CompareSide>),
+    Ranked(Vec<zarn_config::rank::Probe>),
     Prompted {
         text: String,
         blocked: Option<String>,
@@ -247,6 +248,7 @@ pub struct Controller {
     editor_pending: bool,
     pending_edit: Option<PathBuf>,
     precompacted: bool,
+    ranked: Vec<zarn_config::rank::Probe>,
     todos: zarn_tools::todo::TodoList,
     notifier: crate::notify::Notifier,
     shells: Arc<zarn_tools::shells::Shells>,
@@ -345,6 +347,7 @@ impl Controller {
             editor_pending: false,
             pending_edit: None,
             precompacted: false,
+            ranked: Vec::new(),
             todos: Arc::default(),
             notifier: crate::notify::Notifier::stdout(),
             shells: zarn_tools::shells::Shells::new(),
@@ -2529,6 +2532,15 @@ impl Controller {
                     self.send_next();
                 }
             }
+            UiEvent::Ranked(probes) => {
+                self.ranked = zarn_config::rank::ranked(probes);
+                let working = self.ranked.iter().filter(|p| p.answered).count();
+                self.app.notice(format!(
+                    "{}\n{working} of {} answered. /rank save [n] puts the best working ones (not the main model) in your chain; /model provider:model switches to one",
+                    zarn_config::rank::table(&self.ranked),
+                    self.ranked.len()
+                ));
+            }
             UiEvent::Compacted(result) => {
                 self.app.streaming = false;
                 match result {
@@ -3625,6 +3637,73 @@ impl Controller {
         }
     }
 
+    fn rank_command(&mut self, words: &[String]) {
+        let Some(rt) = &self.runtime else {
+            return self.app.notice("no provider is ready; /login first");
+        };
+        let labels = rt.plan.chain_labels();
+        if words.first().map(String::as_str) == Some("save") {
+            let limit = words.get(1).and_then(|n| n.parse::<usize>().ok()).unwrap_or(3).clamp(1, 8);
+            if self.ranked.is_empty() {
+                return self.app.notice("run /rank first; /rank save then puts the best working models in your chain");
+            }
+            let main = labels.first().cloned().unwrap_or_default();
+            let chain = zarn_config::rank::chain_from(&self.ranked, &main, limit);
+            if chain.is_empty() {
+                return self.app.notice("no other model answered, so the chain is unchanged");
+            }
+            let profile = self.chain_profile();
+            let result = match self.layers() {
+                Some(layers) => ops::set_chain(layers, &profile, chain),
+                None => return,
+            };
+            return match result {
+                Ok(_) => {
+                    self.rebuild();
+                    self.show_chain(&profile);
+                }
+                Err(err) => self.app.notice(format!("{err:#}")),
+            };
+        }
+        let cfg = self.cfg();
+        let candidates = match zarn_config::rank::candidates(&cfg, &self.store, &labels, words) {
+            Ok(candidates) => candidates,
+            Err(err) => return self.app.notice(err),
+        };
+        let mut jobs = Vec::new();
+        let mut broken = Vec::new();
+        for (label, provider, model) in candidates {
+            let context = zarn_config::rank::window_of(&provider, &model);
+            match rt.router.providers.chain(std::slice::from_ref(&provider)) {
+                Ok(built) => jobs.push((label, built, model, context)),
+                Err(why) => broken.push(zarn_config::rank::Probe {
+                    label,
+                    answered: false,
+                    tools: false,
+                    first: None,
+                    total: std::time::Duration::ZERO,
+                    error: Some(why),
+                    context,
+                }),
+            }
+        }
+        self.app.notice(format!(
+            "checking {} models with one short tool-call request each (a few tokens per model)…",
+            jobs.len() + broken.len()
+        ));
+        let tx = self.ui_tx.clone();
+        tokio::spawn(async move {
+            let probes = futures::future::join_all(
+                jobs.into_iter()
+                    .map(|(label, provider, model, context)| async move {
+                        zarn_config::rank::probe(label, provider, &model, context).await
+                    }),
+            )
+            .await;
+            let _ = tx.send(UiEvent::Ranked(probes.into_iter().chain(broken).collect())).await;
+        });
+    }
+
     fn show_chain(&mut self, profile: &str) {
         let Some(rt) = &self.runtime else {
             return self.app.notice("no provider is ready; /login first");
@@ -4035,6 +4114,7 @@ impl Controller {
             "memory" => self.memory_command(&args),
             "system" => self.system_command(&words),
             "chain" => self.chain_command(&words),
+            "rank" => self.rank_command(&words),
             "todos" => {
                 let todos = self.todos.lock().map(|t| t.clone()).unwrap_or_default();
                 self.app.notice(zarn_tools::todo::render(&todos));

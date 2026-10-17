@@ -21,6 +21,7 @@ pub mod schedule;
 pub mod secrets;
 pub mod skills;
 pub mod styles;
+pub mod rank;
 pub mod spend;
 pub mod titles;
 pub mod update;

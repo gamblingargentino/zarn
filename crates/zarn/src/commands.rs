@@ -527,6 +527,54 @@ pub async fn models(provider: Option<&str>, refresh: bool) -> Result<()> {
     Ok(())
 }
 
+pub async fn rank(entries: &[String], save: Option<usize>) -> Result<()> {
+    use zarn_config::rank;
+    let cfg = Config::load()?;
+    let store = KeyStore::shared();
+    let profile = zarn_config::runtime::active_profile(&cfg, None);
+    let labels = zarn_config::runtime::plan(&cfg, &store, &profile, None)
+        .map(|p| p.chain_labels())
+        .unwrap_or_default();
+    let candidates = rank::candidates(&cfg, &store, &labels, entries).map_err(anyhow::Error::msg)?;
+    eprintln!("checking {} models with one short tool-call request each…", candidates.len());
+    let probes = futures::future::join_all(candidates.into_iter().map(|(label, provider, model)| {
+        let cfg = &cfg;
+        let store = &store;
+        async move {
+            let context = rank::window_of(&provider, &model);
+            let built = ops::spec_with_key(cfg, store, &provider)
+                .map_err(|e| e.to_string())
+                .and_then(|spec| zarn_config::guard::guarded_named(&[(provider.clone(), spec)], None).map_err(|e| e.to_string()));
+            match built {
+                Ok(built) => rank::probe(label, built, &model, context).await,
+                Err(why) => rank::Probe {
+                    label,
+                    answered: false,
+                    tools: false,
+                    first: None,
+                    total: std::time::Duration::ZERO,
+                    error: Some(zarn_config::auth::redact(&why)),
+                    context,
+                },
+            }
+        }
+    }))
+    .await;
+    let ranked = rank::ranked(probes);
+    println!("{}", rank::table(&ranked));
+    if let Some(limit) = save {
+        let main = labels.first().cloned().unwrap_or_default();
+        let chain = rank::chain_from(&ranked, &main, limit.clamp(1, 8));
+        if chain.is_empty() {
+            bail!("no model other than the main one answered, so the chain is unchanged");
+        }
+        let mut layers = layers()?;
+        let saved = ops::set_chain(&mut layers, &profile, chain)?;
+        println!("chain for profile {profile}: {}", saved.join(", "));
+    }
+    Ok(())
+}
+
 pub fn limits(session: Option<&str>, day: Option<&str>) -> Result<()> {
     let mut layers = layers()?;
     for (is_day, value) in [(false, session), (true, day)] {

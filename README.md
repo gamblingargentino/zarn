@@ -111,6 +111,7 @@ Everything after that is done from inside zarn, with no hand-edited files:
 | `/diff [path]` | show the uncommitted changes, untracked files included, colored and folded; nothing is sent to the model (`/attach-output` adds it to your next message) |
 | `/system [show\|edit\|reset] [--project]` | show the system prompt, or replace it with your own |
 | `/chain [show\|add\|remove\|set\|clear]` | the models to fall back to when one fails |
+| `/rank [provider \| provider:model … \| save [n]]` | check models for speed and tool use, rank them, save the best as the chain |
 | `/style [name]` | how replies are written: `default`, `explanatory`, `learning`, `concise` or your own |
 | `/review`, `/security-review`, `/test`, `/explain <code>` | review the uncommitted changes, look for security problems, run and fix the tests, explain part of the code |
 | `/memory [add <note>]`, `/add-dir <path>`, `/todos` | ZARN.md memory files, another directory for this session, the model's todo list |
@@ -415,6 +416,16 @@ use that provider's own model.
 | `/chain remove <n or provider:model>` | drop one |
 | `/chain set <provider:model> …` | replace the chain |
 | `/chain clear` | use only the main model |
+
+`/rank` finds good models for the chain. It sends each candidate one short
+request (256 output tokens at most) that asks it to call an `add` tool, then
+ranks them: models that answer and call the tool with the right arguments
+first, then by time to the first token and by context window. With no
+arguments it checks the chain and a few suggested models from every provider
+with a key; `/rank openrouter` checks one provider's models, and `/rank
+a:b c:d` checks exactly those. `/rank save [n]` puts the best `n` working
+models (3 by default, never the main model) in the chain. From the shell:
+`zarn rank [provider | provider:model …] [--save [n]]`.
 
 Before a message goes out, zarn compacts the conversation when it no longer
 fits the current model (for example after `/model` picks one with a smaller

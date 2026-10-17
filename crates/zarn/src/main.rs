@@ -156,6 +156,7 @@ async fn run_command(command: &Command) -> Result<()> {
             Some(cli::PluginAction::Remove { name }) => commands::plugin_remove(name),
         },
         Command::Models { provider, refresh } => commands::models(provider.as_deref(), *refresh).await,
+        Command::Rank { entries, save } => commands::rank(entries, *save).await,
         Command::Limits { session, day } => commands::limits(session.as_deref(), day.as_deref()),
         Command::Modes { action } => match action {
             None | Some(cli::ModesAction::List) => commands::modes_list(),

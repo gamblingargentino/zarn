@@ -72,6 +72,7 @@ pub const BUILTINS: &[(&str, &str, &str)] = &[
     ("theme", "[dark|light|colorblind|auto|color]", "pick the theme or the accent color"),
     ("system", "[show|edit|reset] [--project]", "show or change the system prompt"),
     ("chain", "[show|add|remove|set|clear]", "the models to fall back to when one fails"),
+    ("rank", "[provider | provider:model … | save [n]]", "check models for speed and tool use, and rank them"),
     ("style", "[name]", "how replies are written: default, explanatory, learning, concise or your own"),
     ("quit", "", "exit zarn"),
 ];
@@ -100,6 +101,7 @@ pub const SUBCOMMANDS: &[(&str, &str, &str, &str)] = &[
     ("models", "refresh", "", "query every provider again"),
     ("login", "web", "", "set up API keys in your browser"),
     ("login", "auto", "", "paste any key; zarn works out the provider"),
+    ("rank", "save", "[n]", "put the best ranked models in your chain"),
     ("chain", "show", "", "list the chain and which models are resting"),
     ("chain", "add", "<provider:model>", "add a model to fall back to"),
     ("chain", "remove", "<n or provider:model>", "drop a model from the chain"),

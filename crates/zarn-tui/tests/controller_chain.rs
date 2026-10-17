@@ -143,3 +143,46 @@ async fn a_setting_changed_in_zarn_keeps_edits_made_to_the_config_file_meanwhile
     assert!(saved.contains("banner = false"), "the edit made outside zarn survives: {saved}");
     assert!(saved.contains("theme = \"light\""), "{saved}");
 }
+
+#[tokio::test]
+async fn rank_checks_models_orders_them_and_saves_the_best_as_the_chain() {
+    let main = echo_server("I would add them: 5").await;
+    let tools = server(|body| {
+        let model = body["model"].as_str().unwrap_or_default().to_string();
+        let args = if model == "wrong" { serde_json::json!({"a": 1, "b": 1}) } else { serde_json::json!({"a": 2, "b": 3}) };
+        (tool_sse("c1", "add", &args), 0)
+    })
+    .await;
+    let broken = missing_model_server().await;
+    let config = format!(
+        "{}\n[providers.broke]\nkind = \"openai-compat\"\nbase_url = \"{}\"\n",
+        two_providers(&main.uri(), &tools.uri(), ""),
+        broken.uri()
+    );
+    let env = Env::new(&config).await;
+    let mut c = env.controller();
+
+    c.type_line("/rank save");
+    assert!(notices(&c).last().unwrap().contains("run /rank first"));
+    c.type_line("/rank nowhere:x");
+    assert!(notices(&c).last().unwrap().contains("no provider named 'nowhere'"));
+
+    c.type_line("/rank main:m spare:good spare:wrong broke:gone");
+    assert!(notices(&c).last().unwrap().contains("checking 4 models"));
+    wait_for(&mut c, std::time::Duration::from_secs(20), |c| notices(c).iter().any(|n| n.contains("answered. /rank save"))).await;
+    let table = notices(&c).into_iter().find(|n| n.contains("answered. /rank save")).unwrap();
+    let rows: Vec<&str> = table.lines().skip(1).take(4).collect();
+    assert!(rows[0].contains("spare:good") && rows[0].contains("works, calls tools"), "{table}");
+    assert!(rows[3].contains("broke:gone"), "{table}");
+    assert!(table.contains("did not call the tool"), "{table}");
+    assert!(table.contains("3 of 4 answered"), "{table}");
+
+    let probe = &chat_bodies(&tools).await[0];
+    assert_eq!(probe["max_tokens"], 256, "probes are small");
+    assert_eq!(probe["tools"][0]["function"]["name"], "add");
+
+    c.type_line("/rank save 2");
+    let shown = notices(&c).last().unwrap().clone();
+    assert!(shown.contains("2. spare:good"), "{shown}");
+    assert!(!shown.contains("broke:gone") && !shown.contains("4. "), "{shown}");
+}
