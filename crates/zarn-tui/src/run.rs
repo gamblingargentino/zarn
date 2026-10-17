@@ -245,6 +245,7 @@ pub struct Controller {
     shell_runs: usize,
     interactive: bool,
     editor_pending: bool,
+    pending_edit: Option<PathBuf>,
     todos: zarn_tools::todo::TodoList,
     notifier: crate::notify::Notifier,
     shells: Arc<zarn_tools::shells::Shells>,
@@ -341,6 +342,7 @@ impl Controller {
             shell_runs: 0,
             interactive: false,
             editor_pending: false,
+            pending_edit: None,
             todos: Arc::default(),
             notifier: crate::notify::Notifier::stdout(),
             shells: zarn_tools::shells::Shells::new(),
@@ -1115,7 +1117,7 @@ impl Controller {
                     if !self.on_terminal(event) {
                         break;
                     }
-                    if self.editor_pending {
+                    if self.editor_pending || self.pending_edit.is_some() {
                         self.editor_pending = false;
                         let _ = crossterm::terminal::disable_raw_mode();
                         let _ = crossterm::execute!(
@@ -1123,7 +1125,10 @@ impl Controller {
                             crossterm::terminal::LeaveAlternateScreen,
                             crossterm::cursor::Show
                         );
-                        self.open_editor();
+                        match self.pending_edit.take() {
+                            Some(path) => self.edit_system(path),
+                            None => self.open_editor(),
+                        }
                         let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen);
                         let _ = crossterm::terminal::enable_raw_mode();
                         let _ = terminal.clear();
@@ -3470,6 +3475,90 @@ impl Controller {
         self.app.notice(format!("added {} for this session", real.display()));
     }
 
+    fn system_command(&mut self, words: &[String]) {
+        let mut words = words.to_vec();
+        let project = take_flag(&mut words, "--project");
+        let target = if project {
+            Some(self.cwd.join(paths::PROJECT_DIR).join(context::SYSTEM_FILE))
+        } else {
+            paths::user_dir().map(|d| d.join(context::SYSTEM_FILE))
+        };
+        match words.first().map(String::as_str) {
+            Some("edit") => match target {
+                Some(path) if self.interactive => self.pending_edit = Some(path),
+                Some(path) => self.edit_system(path),
+                None => self.app.notice("there is no home directory; use /system edit --project"),
+            },
+            Some("reset") => match target {
+                Some(path) => match std::fs::remove_file(&path) {
+                    Ok(()) => {
+                        self.rebuild();
+                        self.app.notice(format!("removed {}; the next message uses {}", path.display(), self.system_source()));
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                        self.app.notice(format!("{} does not exist; nothing to reset", path.display()))
+                    }
+                    Err(err) => self.app.notice(format!("could not remove {}: {err}", path.display())),
+                },
+                None => self.app.notice("there is no home directory; use /system reset --project"),
+            },
+            None | Some("show") => {
+                let base = self
+                    .runtime
+                    .as_ref()
+                    .map(|rt| rt.parts.base.clone())
+                    .unwrap_or_else(|| context::render_prompt(context::DEFAULT_PROMPT, &self.cwd));
+                self.app.notice(format!(
+                    "system prompt: {}\n/system edit changes yours (everywhere), /system edit --project changes it for this project, /system reset goes back. {{cwd}} and {{environment}} are filled in; ZARN.md, the mode and the style are added after it.\n\n{base}",
+                    self.system_source()
+                ));
+            }
+            Some(_) => self.app.notice("usage: /system [show|edit|reset] [--project]"),
+        }
+    }
+
+    fn system_source(&self) -> String {
+        match context::system_override(&self.cwd, paths::user_dir().as_deref()) {
+            Some((label, path, _)) => format!("{} ({label})", path.display()),
+            None => "the built-in default".into(),
+        }
+    }
+
+    fn edit_system(&mut self, path: PathBuf) {
+        let seed = std::fs::read_to_string(&path)
+            .ok()
+            .filter(|t| !t.trim().is_empty())
+            .unwrap_or_else(|| context::DEFAULT_PROMPT.to_string());
+        let editor = ["VISUAL", "EDITOR"]
+            .iter()
+            .find_map(|v| std::env::var(v).ok().filter(|e| !e.trim().is_empty()))
+            .or_else(|| cfg!(windows).then(|| "notepad".to_string()));
+        let save = |text: &str| -> std::io::Result<()> {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            std::fs::write(&path, format!("{}\n", text.trim_end()))
+        };
+        match crate::editor::edit_text(&seed, editor.as_deref()) {
+            Ok(text) if text.trim().is_empty() => self.app.notice("the prompt was empty, so nothing was saved"),
+            Ok(text) => match save(&text) {
+                Ok(()) => {
+                    self.rebuild();
+                    self.app.notice(format!("saved {}; the next message uses it", path.display()));
+                }
+                Err(err) => self.app.notice(format!("could not save {}: {err}", path.display())),
+            },
+            Err(err) => {
+                let written = path.exists() || save(&seed).is_ok();
+                self.app.notice(if written {
+                    format!("{err}. Edit {} in any editor; zarn picks up the change on the next message", path.display())
+                } else {
+                    err
+                });
+            }
+        }
+    }
+
     fn memory_command(&mut self, args: &str) {
         let project = self.cwd.join(context::MEMORY_FILE);
         let user = paths::user_dir().map(|d| d.join(context::MEMORY_FILE));
@@ -3811,6 +3900,7 @@ impl Controller {
             "update" => self.update_now(first == Some("check")),
             "add-dir" => self.add_dir(args.trim()),
             "memory" => self.memory_command(&args),
+            "system" => self.system_command(&words),
             "todos" => {
                 let todos = self.todos.lock().map(|t| t.clone()).unwrap_or_default();
                 self.app.notice(zarn_tools::todo::render(&todos));

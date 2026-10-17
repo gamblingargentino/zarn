@@ -70,6 +70,7 @@ pub const BUILTINS: &[(&str, &str, &str)] = &[
     ("update", "[check]", "install the latest zarn release, or just check for one"),
     ("status", "", "show profile, model, provider, cwd and session"),
     ("theme", "[dark|light|colorblind|auto|color]", "pick the theme or the accent color"),
+    ("system", "[show|edit|reset] [--project]", "show or change the system prompt"),
     ("style", "[name]", "how replies are written: default, explanatory, learning, concise or your own"),
     ("quit", "", "exit zarn"),
 ];
@@ -98,6 +99,9 @@ pub const SUBCOMMANDS: &[(&str, &str, &str, &str)] = &[
     ("models", "refresh", "", "query every provider again"),
     ("login", "web", "", "set up API keys in your browser"),
     ("login", "auto", "", "paste any key; zarn works out the provider"),
+    ("system", "show", "", "show the system prompt and where it comes from"),
+    ("system", "edit", "", "edit your system prompt in $EDITOR (--project for this project)"),
+    ("system", "reset", "", "go back to the built-in prompt"),
     ("theme", "dark", "", "dark background"),
     ("theme", "light", "", "light background"),
     ("theme", "colorblind", "", "colorblind-safe colors"),

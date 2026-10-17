@@ -109,6 +109,7 @@ Everything after that is done from inside zarn, with no hand-edited files:
 | `/skills list\|show\|new\|create\|install\|remove\|enable\|disable` | manage skills; `create` has the model write one with you, `install` takes a git URL, GitHub folder link, folder or `SKILL.md` link (`--project` for this project) |
 | `/commands [list\|new <name>]` | list or scaffold your own slash commands |
 | `/diff [path]` | show the uncommitted changes, untracked files included, colored and folded; nothing is sent to the model (`/attach-output` adds it to your next message) |
+| `/system [show\|edit\|reset] [--project]` | show the system prompt, or replace it with your own |
 | `/style [name]` | how replies are written: `default`, `explanatory`, `learning`, `concise` or your own |
 | `/review`, `/security-review`, `/test`, `/explain <code>` | review the uncommitted changes, look for security problems, run and fix the tests, explain part of the code |
 | `/memory [add <note>]`, `/add-dir <path>`, `/todos` | ZARN.md memory files, another directory for this session, the model's todo list |
@@ -501,6 +502,29 @@ Follow the notes in @docs/contributing.md
 `` !`command` `` runs before sending and is replaced by its output; it asks for
 permission exactly like the bash tool unless `allowed-tools` covers it.
 `@path` attaches files. `model` applies to that one turn.
+
+## System prompt
+
+zarn's built-in prompt tells the model how to work: read before changing,
+check its work, write files with the file tools instead of shell heredocs,
+work anywhere you point it rather than in a made-up scratch folder, and ask
+before anything hard to undo. `/system` shows the prompt in use and where it
+comes from.
+
+Replace it with your own:
+
+| File | Applies to |
+|---|---|
+| `.zarn/SYSTEM.md` | this project (wins over yours) |
+| `~/.config/zarn/SYSTEM.md` | you, everywhere |
+
+`/system edit` opens yours in `$VISUAL`/`$EDITOR` (Notepad on Windows when
+neither is set), starting from the built-in text; add `--project` for the
+project file. `/system reset` deletes it and goes back to the built-in prompt.
+`{cwd}` and `{environment}` in the file are replaced with the working
+directory and the OS and shell. Edits made in any editor apply from the next
+message. `ZARN.md` memory, the mode and the output style are still added after
+it.
 
 ## Memory
 
