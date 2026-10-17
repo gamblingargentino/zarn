@@ -31,7 +31,7 @@ impl Switch {
             format!("{failed}, answered by {}", self.answered)
         };
         for (name, minutes) in &self.resting {
-            text.push_str(&format!("; {name} keeps failing, so it sits out for {minutes} min"));
+            text.push_str(&format!("; {name} sits out for {minutes} min"));
         }
         text
     }
@@ -293,7 +293,7 @@ impl Provider for FallbackProvider {
                     });
                 }
                 Err(err) if switchable(&err) => {
-                    tracing::warn!(index, error = %err, "model failed, trying the next one");
+                    tracing::debug!(index, error = %err, "model failed, trying the next one");
                     resting.extend(self.strike(index, &err));
                     failed.push((self.names[index].clone(), reason(&err).to_string()));
                     if is_last {
@@ -445,7 +445,7 @@ mod tests {
             *seen,
             vec![
                 "anthropic rate-limited, answered by openai".to_string(),
-                "anthropic rate-limited, answered by openai; anthropic keeps failing, so it sits out for 5 min".to_string(),
+                "anthropic rate-limited, answered by openai; anthropic sits out for 5 min".to_string(),
             ],
             "the first switch and the rest are reported; later turns skip the resting model quietly"
         );
@@ -598,7 +598,7 @@ mod tests {
         assert!(chain.resting()[0].1 > Duration::from_secs(25 * 60));
         assert_eq!(
             seen.lock().unwrap()[0],
-            "openrouter:deepseek is out of credit, answered by google:gemini; openrouter:deepseek keeps failing, so it sits out for 30 min"
+            "openrouter:deepseek is out of credit, answered by google:gemini; openrouter:deepseek sits out for 30 min"
         );
     }
 

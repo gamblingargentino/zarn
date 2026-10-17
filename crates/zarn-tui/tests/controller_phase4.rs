@@ -215,6 +215,10 @@ async fn diff_shows_uncommitted_changes_without_the_model() {
         })
         .unwrap();
     assert!(output.contains("-before") && output.contains("+after"), "{output}");
+    assert!(
+        c.app().blocks.iter().any(|b| matches!(b, Block::Tool(card) if card.name == "git diff" && card.expanded)),
+        "a short diff opens unfolded"
+    );
     assert!(chat_bodies(&mock).await.is_empty(), "nothing goes to the model");
     c.type_line("/attach-output");
     turn(&mut c, "look at this").await;

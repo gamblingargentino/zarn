@@ -162,6 +162,7 @@ impl Provider for Patient {
         let mut spent = Vec::new();
         let mut req = req;
         let mut capped = false;
+        let mut credit_retried = false;
         loop {
             match self.inner.stream(req.clone()).await {
                 Ok(mut stream) => {
@@ -209,7 +210,8 @@ impl Provider for Patient {
                     req.max_tokens = cap;
                     capped = true;
                 }
-                Err(ProviderError::Other(message)) if out_of_credit(&message) && attempt < ATTEMPTS && req.max_tokens > 1024 => {
+                Err(ProviderError::Other(message)) if out_of_credit(&message) && !credit_retried && req.max_tokens > 1024 => {
+                    credit_retried = true;
                     req.max_tokens = (req.max_tokens / 2).max(1024);
                     tell(format!(
                         "the provider says this request would exceed your credits; asking again with room for {} output tokens",
@@ -486,11 +488,11 @@ mod tests {
         assert!(provider.stream(req.clone()).await.is_ok());
         assert_eq!(*inner.asked.lock().unwrap(), vec![16_384, 8192]);
 
-        let inner = recording(vec![credit(), credit(), credit()]);
+        let inner = recording(vec![credit(), credit()]);
         let provider = Patient::with_limit(inner.clone(), Duration::from_millis(10));
-        let Err(err) = provider.stream(req).await else { panic!("three refusals end in an error") };
+        let Err(err) = provider.stream(req).await else { panic!("a second refusal ends in an error") };
         assert!(out_of_credit(&err.to_string()));
-        assert_eq!(*inner.asked.lock().unwrap(), vec![16_384, 8192, 4096]);
+        assert_eq!(*inner.asked.lock().unwrap(), vec![16_384, 8192], "one smaller retry, then the chain can move on");
     }
 
     #[tokio::test]

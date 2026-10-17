@@ -31,7 +31,7 @@ async fn a_failing_model_hands_the_turn_to_the_next_in_the_chain_with_its_own_mo
     let sent = chat_bodies(&spare).await;
     assert_eq!(sent[0]["model"], "backup-model", "a chain entry uses its own model, not the main one");
     let switch = notices(&c).into_iter().find(|n| n.contains("answered by")).unwrap();
-    assert!(switch.contains("main does not offer this model, answered by spare:backup-model"), "{switch}");
+    assert!(switch.contains("main:m does not offer this model, answered by spare:backup-model"), "{switch}");
     assert!(switch.contains("sits out for 30 min"), "{switch}");
 
     let asked_main = main.received_requests().await.unwrap().len();
@@ -185,4 +185,26 @@ async fn rank_checks_models_orders_them_and_saves_the_best_as_the_chain() {
     let shown = notices(&c).last().unwrap().clone();
     assert!(shown.contains("2. spare:good"), "{shown}");
     assert!(!shown.contains("broke:gone") && !shown.contains("4. "), "{shown}");
+}
+
+#[tokio::test]
+async fn model_accepts_provider_colon_model_and_switches_provider_when_needed() {
+    let main = echo_server("from main").await;
+    let spare = echo_server("from spare").await;
+    let env = Env::new(&two_providers(&main.uri(), &spare.uri(), "")).await;
+    let mut c = env.controller();
+    let profile = || {
+        let text = std::fs::read_to_string(env.user_dir().join("config.toml")).unwrap();
+        let value: toml::Value = toml::from_str(&text).unwrap();
+        let p = &value["profiles"]["default"];
+        (p["provider"].as_str().unwrap().to_string(), p["model"].as_str().unwrap().to_string())
+    };
+
+    c.type_line("/model main:m2");
+    assert_eq!(profile(), ("main".to_string(), "m2".to_string()), "the prefix of the current provider is dropped");
+    c.type_line("/model spare:s1");
+    assert_eq!(profile(), ("spare".to_string(), "s1".to_string()));
+    turn(&mut c, "hi").await;
+    assert_eq!(chat_bodies(&spare).await[0]["model"], "s1");
+    assert_eq!(assistant(&c).last().map(String::as_str), Some("from spare"));
 }

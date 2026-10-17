@@ -2745,11 +2745,20 @@ impl Controller {
             UiEvent::HookFailed(text) => self.app.notice(text),
             UiEvent::Shell { id, command, output } => {
                 self.last_shell = Some((command, output.content.clone()));
+                let short = output.content.lines().count() <= 60;
                 self.app.apply(AgentEvent::ToolFinished {
-                    id,
+                    id: id.clone(),
                     name: "bash".into(),
                     output,
                 });
+                for block in self.app.blocks.iter_mut().rev() {
+                    if let Block::Tool(card) = block
+                        && card.id == id
+                    {
+                        card.expanded = short && card.name == "git diff";
+                        break;
+                    }
+                }
                 self.app.notice("not sent to the model; /attach-output adds it to your next message");
             }
             UiEvent::Prompted { text, blocked } => {
@@ -3154,6 +3163,31 @@ impl Controller {
     }
 
     fn set_model(&mut self, model: &str) {
+        let cfg = self.cfg();
+        let current = cfg.profiles.get(&self.profile()).and_then(|p| p.provider.clone()).unwrap_or_default();
+        if let Some((provider, rest)) = model.trim().split_once(':')
+            && cfg.providers.contains_key(provider)
+            && !rest.is_empty()
+        {
+            if provider != current {
+                let profile = self.profile();
+                let result = match self.layers() {
+                    Some(layers) => ops::set_profile_provider(layers, &profile, provider)
+                        .and_then(|()| ops::set_profile_model(layers, &profile, rest)),
+                    None => return,
+                };
+                match result {
+                    Ok(()) => {
+                        self.options.model = None;
+                        self.rebuild();
+                        self.app.notice(format!("profile {profile} now uses {provider} with {rest}"));
+                    }
+                    Err(err) => self.app.notice(format!("{err:#}")),
+                }
+                return;
+            }
+            return self.set_model(rest);
+        }
         let model = match self.known_model(model.trim()) {
             Ok(model) => model,
             Err(err) => {
@@ -3711,8 +3745,7 @@ impl Controller {
         let resting: Vec<(String, std::time::Duration)> = rt.chain.as_ref().map(|c| c.resting()).unwrap_or_default();
         let mut lines = vec![format!("model chain for profile {profile} (tried in order; a model that keeps failing sits out a while):")];
         for (i, label) in rt.plan.chain_labels().iter().enumerate() {
-            let name = rt.plan.names.get(i).cloned().unwrap_or_default();
-            let note = match resting.iter().find(|(n, _)| *n == name) {
+            let note = match resting.iter().find(|(n, _)| n == label) {
                 Some((_, left)) => format!("  (resting, {} min left)", left.as_secs().div_ceil(60)),
                 None if i == 0 => "  (main model)".to_string(),
                 None => String::new(),

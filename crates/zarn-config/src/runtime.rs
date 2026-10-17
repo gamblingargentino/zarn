@@ -33,13 +33,13 @@ impl Plan {
         self.names.iter().cloned().zip(self.specs.iter().cloned()).collect()
     }
 
-    pub fn pinned(&self) -> Vec<(String, ProviderSpec, Option<String>)> {
-        self.names
-            .iter()
-            .cloned()
+    pub fn pinned(&self) -> Vec<(String, String, ProviderSpec, Option<String>)> {
+        self.chain_labels()
+            .into_iter()
+            .zip(self.names.iter().map(|n| n.split_once(':').map(|(p, _)| p.to_string()).unwrap_or_else(|| n.clone())))
             .zip(self.specs.iter().cloned())
             .zip(self.models.iter().cloned().chain(std::iter::repeat(None)))
-            .map(|((name, spec), model)| (name, spec, model))
+            .map(|(((label, name), spec), model)| (label, name, spec, model))
             .collect()
     }
 

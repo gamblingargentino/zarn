@@ -99,7 +99,7 @@ pub async fn probe(label: String, provider: Arc<dyn Provider>, model: &str, cont
         context,
     };
     let run = async {
-        let mut stream = provider.stream(request(model)).await.map_err(|e| e.to_string())?;
+        let mut stream = provider.stream(request(model)).await?;
         let mut name = String::new();
         let mut args = String::new();
         while let Some(event) = stream.next().await {
@@ -115,17 +115,20 @@ pub async fn probe(label: String, provider: Arc<dyn Provider>, model: &str, cont
                 }
                 Event::ToolCallDelta(delta) => args.push_str(&delta),
                 Event::ToolCallEnd => out.tools |= called_add(&name, &args),
-                Event::Error(err) => return Err(err.to_string()),
+                Event::Error(err) => return Err(err),
                 Event::Done(_) => break,
                 _ => {}
             }
         }
         out.tools |= called_add(&name, &args);
-        Ok(())
+        Ok::<(), zarn_core::provider::ProviderError>(())
     };
     match tokio::time::timeout(TIMEOUT, run).await {
         Ok(Ok(())) => {}
-        Ok(Err(err)) => out.error = Some(crate::auth::redact(&shorten(&err))),
+        Ok(Err(err)) => {
+            let why = zarn_providers::fallback::reason(&err).trim_start_matches("is ");
+            out.error = Some(crate::auth::redact(&format!("{why}: {}", shorten(&err.to_string()))));
+        }
         Err(_) => out.error = Some(format!("no answer within {}s", TIMEOUT.as_secs())),
     }
     out.total = started.elapsed();

@@ -17,7 +17,7 @@ fn a_fallback_switch_is_reported_once_on_stderr_in_print_mode() {
     assert!(stdout(&out).contains("from backup"));
     let err = stderr(&out);
     assert_eq!(
-        err.matches("anthropic rate-limited, answered by openai").count(),
+        err.matches("anthropic:m rate-limited, answered by openai").count(),
         1,
         "{err}"
     );
