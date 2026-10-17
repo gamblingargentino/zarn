@@ -437,3 +437,61 @@ async fn cancelling_mid_stream_keeps_the_text_that_already_arrived() {
 
     std::fs::remove_dir_all(dir).ok();
 }
+
+#[tokio::test]
+async fn a_tool_call_cut_off_by_the_output_limit_is_not_run() {
+    let dir = temp_dir("cut");
+    let target = dir.join("made.txt").display().to_string().replace('\\', "/");
+    let first_part = format!(r#"{{"path":"{target}","content":"half of a big fi"#);
+    let provider = ScriptedProvider::new(vec![
+        vec![
+            Event::ToolCallStart { id: "whole".into(), name: "write".into() },
+            Event::ToolCallDelta(format!(r#"{{"path":"{target}.first","content":"done"}}"#)),
+            Event::ToolCallEnd,
+            Event::ToolCallStart { id: "cut".into(), name: "write".into() },
+            Event::ToolCallDelta(first_part),
+            Event::Done(StopReason::MaxTokens),
+        ],
+        vec![
+            Event::ToolCallStart { id: "closed-but-cut".into(), name: "write".into() },
+            Event::ToolCallDelta(format!(r#"{{"path":"{target}","content":"also cut"}}"#)),
+            Event::ToolCallEnd,
+            Event::Done(StopReason::MaxTokens),
+        ],
+        vec![Event::TextDelta("I will split it".into()), Event::Done(StopReason::EndTurn)],
+    ]);
+    let tools = Arc::new(zarn_tools::builtins());
+    let ctx = Arc::new(Ctx::new(&dir));
+    let config = AgentConfig { max_tokens: 1000, ..AgentConfig::default() };
+    let agent = Agent::new(provider, tools, ctx, config).with_gate(Arc::new(Permissions::headless().with_tool("write", zarn_tools::permissions::Policy::Allow)));
+    let (tx, mut rx) = mpsc::channel(100);
+    let mut messages = vec![Message::user("write a big file")];
+    let reason = agent.run(&mut messages, &tx, &CancellationToken::new()).await.unwrap();
+    assert_eq!(reason, StopReason::EndTurn);
+    assert!(std::path::Path::new(&format!("{target}.first")).exists(), "a complete call before the cut still runs");
+    assert!(!std::path::Path::new(&target).exists(), "a cut-off call never runs");
+
+    let results: Vec<(&str, &str, bool)> = messages
+        .iter()
+        .filter_map(|m| match m {
+            Message::ToolResult { id, content, is_error } => Some((id.as_str(), content.as_str(), *is_error)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(results.len(), 3, "every call gets an answer so the conversation stays valid");
+    for (id, content, is_error) in &results[1..] {
+        assert!(is_error, "{id}");
+        assert!(content.contains("cut off") && content.contains("1000 tokens"), "{id}: {content}");
+    }
+    drop(tx);
+    let mut finished_cut = 0;
+    while let Some(event) = rx.recv().await {
+        if let zarn_core::agent::AgentEvent::ToolFinished { id, output, .. } = event
+            && id != "whole"
+        {
+            assert!(output.is_error);
+            finished_cut += 1;
+        }
+    }
+    assert_eq!(finished_cut, 2, "the UI shows each cut-off call as failed");
+}

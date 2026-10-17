@@ -44,13 +44,14 @@ pub struct AgentConfig {
 }
 
 pub const DEFAULT_PARALLEL: usize = 4;
+pub const DEFAULT_MAX_TOKENS: u32 = 16_384;
 pub const PARALLEL_TOOLS: [&str; 1] = ["task"];
 
 impl Default for AgentConfig {
     fn default() -> Self {
         AgentConfig {
             model: String::new(),
-            max_tokens: 4096,
+            max_tokens: DEFAULT_MAX_TOKENS,
             temperature: 1.0,
             max_iterations: 32,
             parallel: DEFAULT_PARALLEL,
@@ -89,6 +90,13 @@ struct Collected {
     text: String,
     calls: Vec<ToolCall>,
     stop: StopReason,
+    cut: Option<String>,
+}
+
+pub fn cut_off_note(max_tokens: u32) -> String {
+    format!(
+        "This tool call was cut off because the reply reached the output limit of {max_tokens} tokens, so it was not run. Do not send it again as one large call: write a big file in several smaller steps (write the first part, then add the rest with edit), and keep each tool call well under the limit."
+    )
 }
 
 impl Agent {
@@ -180,7 +188,12 @@ impl Agent {
                 return Ok(collected.stop);
             }
 
-            for batch in batches(collected.calls) {
+            let mut calls = collected.calls;
+            let cut = collected
+                .cut
+                .and_then(|id| calls.iter().position(|c| c.id == id))
+                .map(|at| calls.remove(at));
+            for batch in batches(calls) {
                 let outputs = if batch.len() == 1 {
                     vec![self.invoke(&batch[0], sink, cancel).await]
                 } else {
@@ -193,6 +206,17 @@ impl Agent {
                         is_error: output.is_error,
                     });
                 }
+            }
+
+            if let Some(call) = cut {
+                let output = ToolOutput::error(cut_off_note(self.config.max_tokens));
+                self.started(&call, sink).await;
+                self.finished(&call, &output, sink).await;
+                messages.push(Message::ToolResult {
+                    id: call.id,
+                    content: output.content,
+                    is_error: true,
+                });
             }
 
             if cancel.is_cancelled() {
@@ -218,6 +242,7 @@ impl Agent {
         let mut calls: Vec<ToolCall> = Vec::new();
         let mut pending: Option<(String, String, String)> = None;
         let mut stop = StopReason::EndTurn;
+        let mut cut = None;
 
         loop {
             let event = tokio::select! {
@@ -261,18 +286,21 @@ impl Agent {
         }
 
         if let Some((id, name, buf)) = pending.take() {
+            cut = Some(id.clone());
             calls.push(ToolCall {
                 id,
                 name,
                 args: parse_args(&buf),
             });
+        } else if stop == StopReason::MaxTokens {
+            cut = calls.last().map(|c| c.id.clone());
         }
 
         if !calls.is_empty() && stop != StopReason::Cancelled {
             stop = StopReason::ToolUse;
         }
 
-        Ok(Collected { text, calls, stop })
+        Ok(Collected { text, calls, stop, cut })
     }
 
     async fn started(&self, call: &ToolCall, sink: &Sender<AgentEvent>) {

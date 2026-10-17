@@ -352,6 +352,7 @@ impl Runtime {
             model: self.model.clone(),
             parallel: self.parallel,
             max_iterations: self.mode.max_iterations.unwrap_or(defaults.max_iterations),
+            max_tokens: self.plan.specs.first().and_then(|s| s.max_output).unwrap_or(defaults.max_tokens),
             ..defaults
         }
     }

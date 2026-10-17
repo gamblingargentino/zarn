@@ -88,6 +88,40 @@ pub fn retry_after(message: &str) -> Option<Duration> {
     found.then(|| Duration::from_secs_f64(total))
 }
 
+const DROPPED_WAITS: [Duration; 2] = [Duration::from_secs(1), Duration::from_secs(3)];
+
+pub fn dropped(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    !busy(message)
+        && !lower.contains("(http ")
+        && ["error sending request", "connection", "timed out", "timeout", "reset", "broken pipe", "eof", "dns", "tcp connect", "unexpected end"]
+            .iter()
+            .any(|cue| lower.contains(cue))
+}
+
+pub fn output_cap(message: &str, asked: u32) -> Option<u32> {
+    let lower = message.to_ascii_lowercase();
+    let about_output = ["max_tokens", "max_completion_tokens", "maxoutputtokens", "max_output_tokens", "output tokens", "completion tokens"]
+        .iter()
+        .any(|cue| lower.contains(cue));
+    let too_big = ["too large", "too many", "must be", "less than", "at most", "exceed", "maximum", "<=", " > ", "range"]
+        .iter()
+        .any(|cue| lower.contains(cue));
+    if !about_output || !too_big {
+        return None;
+    }
+    let numbers = lower
+        .split(|c: char| !c.is_ascii_digit())
+        .filter_map(|n| n.parse::<u32>().ok())
+        .filter(|n| (256..asked).contains(n));
+    Some(numbers.max().unwrap_or(4096).min(asked.saturating_sub(1)).max(256))
+}
+
+pub fn out_of_credit(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.ends_with("(http 402)") || lower.contains("insufficient credits") || lower.contains("exceed your available credits")
+}
+
 pub fn no_quota(message: &str) -> bool {
     message.contains("limit: 0")
 }
@@ -126,6 +160,8 @@ impl Provider for Patient {
     async fn stream(&self, req: Request) -> Result<BoxStream<'static, Event>, ProviderError> {
         let mut attempt = 1;
         let mut spent = Vec::new();
+        let mut req = req;
+        let mut capped = false;
         loop {
             match self.inner.stream(req.clone()).await {
                 Ok(mut stream) => {
@@ -138,6 +174,12 @@ impl Provider for Patient {
                     match first {
                         Some(event) if glitch(&event) && attempt < ATTEMPTS => {
                             tell("the model sent a broken tool call; asking again".into());
+                            attempt += 1;
+                        }
+                        Some(Event::Error(ProviderError::Network(message))) if dropped(&message) && attempt < ATTEMPTS => {
+                            let wait = DROPPED_WAITS[attempt - 1];
+                            tell(format!("the connection to the provider dropped; trying again in {}s", wait.as_secs()));
+                            tokio::time::sleep(wait.min(self.max_wait)).await;
                             attempt += 1;
                         }
                         first => {
@@ -160,6 +202,27 @@ impl Provider for Patient {
                         }
                         _ => return Err(explain(message, asked, self.max_wait)),
                     }
+                }
+                Err(ProviderError::BadRequest(message)) if !capped && output_cap(&message, req.max_tokens).is_some() => {
+                    let cap = output_cap(&message, req.max_tokens).unwrap_or(4096);
+                    tracing::info!(from = req.max_tokens, to = cap, "the model allows fewer output tokens; asking again");
+                    req.max_tokens = cap;
+                    capped = true;
+                }
+                Err(ProviderError::Other(message)) if out_of_credit(&message) && attempt < ATTEMPTS && req.max_tokens > 1024 => {
+                    req.max_tokens = (req.max_tokens / 2).max(1024);
+                    tell(format!(
+                        "the provider says this request would exceed your credits; asking again with room for {} output tokens",
+                        req.max_tokens
+                    ));
+                    tokio::time::sleep(Duration::from_secs(2).min(self.max_wait)).await;
+                    attempt += 1;
+                }
+                Err(ProviderError::Network(message)) if dropped(&message) && attempt < ATTEMPTS => {
+                    let wait = DROPPED_WAITS[attempt - 1];
+                    tell(format!("the connection to the provider dropped; trying again in {}s", wait.as_secs()));
+                    tokio::time::sleep(wait.min(self.max_wait)).await;
+                    attempt += 1;
                 }
                 Err(ProviderError::Network(message)) if busy(&message) && attempt < ATTEMPTS => {
                     let wait = BUSY_WAITS[attempt - 1];
@@ -352,5 +415,95 @@ mod tests {
         assert_eq!(*inner.calls.lock().unwrap(), 1);
         assert_eq!(events[1], Event::TextDelta("partial".into()));
         assert!(events.last().is_some_and(glitch));
+    }
+
+    #[test]
+    fn reads_the_allowed_output_size_from_each_providers_wording() {
+        let cap = |m: &str| output_cap(m, 16_384);
+        assert_eq!(cap("max_tokens: 16384 > 8192, which is the maximum allowed number of output tokens for claude-3-5-sonnet-20240620 (HTTP 400)"), Some(8192));
+        assert_eq!(cap("`max_tokens` must be less than or equal to `8192`, the maximum value for `max_tokens` (HTTP 400)"), Some(8192));
+        assert_eq!(cap("Invalid max_tokens value, the valid range of max_tokens is [1, 8192] (HTTP 400)"), Some(8192));
+        assert_eq!(cap("max_completion_tokens is too large: 16384. This model supports at most 4096 completion tokens"), Some(4096));
+        assert_eq!(cap("max_tokens is too large"), Some(4096));
+        assert_eq!(cap("This model's maximum context length is 128000 tokens (HTTP 400)"), None);
+        assert_eq!(cap("Invalid tool schema (HTTP 400)"), None);
+        assert!(dropped("error sending request for url (https://openrouter.ai/api/v1/chat/completions)"));
+        assert!(dropped("connection closed before message completed"));
+        assert!(!dropped("Service Unavailable (HTTP 503)"));
+        assert!(!dropped("Internal error (HTTP 500)"));
+    }
+
+    struct Recording {
+        asked: Mutex<Vec<u32>>,
+        script: Mutex<Vec<Result<Vec<Event>, ProviderError>>>,
+    }
+
+    #[async_trait]
+    impl Provider for Recording {
+        async fn stream(&self, req: Request) -> Result<BoxStream<'static, Event>, ProviderError> {
+            self.asked.lock().unwrap().push(req.max_tokens);
+            match self.script.lock().unwrap().remove(0) {
+                Ok(events) => Ok(futures::stream::iter(events).boxed()),
+                Err(err) => Err(err),
+            }
+        }
+
+        fn caps(&self) -> Caps {
+            Caps::default()
+        }
+
+        fn count_tokens(&self, _msgs: &[Message]) -> Result<u32, ProviderError> {
+            Ok(0)
+        }
+    }
+
+    fn recording(script: Vec<Result<Vec<Event>, ProviderError>>) -> Arc<Recording> {
+        Arc::new(Recording { asked: Mutex::new(Vec::new()), script: Mutex::new(script) })
+    }
+
+    #[tokio::test]
+    async fn asks_again_with_the_output_size_the_model_allows() {
+        let ok = vec![Event::TextDelta("ok".into())];
+        let inner = recording(vec![
+            Err(ProviderError::BadRequest("max_tokens: 16384 > 8192, the maximum (HTTP 400)".into())),
+            Ok(ok.clone()),
+        ]);
+        let provider = Patient::with_limit(inner.clone(), Duration::from_millis(10));
+        let mut req = Request::new("m", vec![]);
+        req.max_tokens = 16_384;
+        let events: Vec<Event> = provider.stream(req).await.unwrap().collect().await;
+        assert_eq!(events, ok);
+        assert_eq!(*inner.asked.lock().unwrap(), vec![16_384, 8192]);
+    }
+
+    #[tokio::test]
+    async fn out_of_credit_asks_again_with_less_room_then_gives_up() {
+        let credit = || Err(ProviderError::Other("This request would exceed your available credits given your current in-flight requests. Retry after in-flight requests settle, or add credits. (HTTP 402)".into()));
+        let inner = recording(vec![credit(), Ok(vec![Event::TextDelta("ok".into())])]);
+        let provider = Patient::with_limit(inner.clone(), Duration::from_millis(10));
+        let mut req = Request::new("m", vec![]);
+        req.max_tokens = 16_384;
+        assert!(provider.stream(req.clone()).await.is_ok());
+        assert_eq!(*inner.asked.lock().unwrap(), vec![16_384, 8192]);
+
+        let inner = recording(vec![credit(), credit(), credit()]);
+        let provider = Patient::with_limit(inner.clone(), Duration::from_millis(10));
+        let Err(err) = provider.stream(req).await else { panic!("three refusals end in an error") };
+        assert!(out_of_credit(&err.to_string()));
+        assert_eq!(*inner.asked.lock().unwrap(), vec![16_384, 8192, 4096]);
+    }
+
+    #[tokio::test]
+    async fn a_dropped_connection_is_tried_again_before_or_at_the_first_event() {
+        let ok = vec![Event::TextDelta("ok".into())];
+        let inner = recording(vec![
+            Err(ProviderError::Network("error sending request for url (https://x)".into())),
+            Ok(vec![Event::Error(ProviderError::Network("connection reset by peer".into()))]),
+            Ok(ok.clone()),
+        ]);
+        let provider = Patient::with_limit(inner.clone(), Duration::from_millis(10));
+        let events: Vec<Event> = provider.stream(Request::new("m", vec![])).await.unwrap().collect().await;
+        assert_eq!(events, ok);
+        assert_eq!(inner.asked.lock().unwrap().len(), 3);
     }
 }
