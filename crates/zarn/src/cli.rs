@@ -80,6 +80,11 @@ pub enum Command {
         #[arg(help = "Provider name, e.g. anthropic, openai, google, groq, openrouter, or one you added; leave it out and zarn works it out from the key")]
         provider: Option<String>,
     },
+    #[command(about = "Update zarn to the latest release from GitHub")]
+    Update {
+        #[arg(long, help = "Only say whether a newer version exists")]
+        check: bool,
+    },
     #[command(about = "Open a page on localhost to add, test and remove API keys in your browser")]
     Setup {
         #[arg(long, value_name = "PORT", help = "Port to listen on; the default is 9276, or the next free one up to 9299")]

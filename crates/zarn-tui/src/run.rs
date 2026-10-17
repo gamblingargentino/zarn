@@ -36,6 +36,7 @@ use zarn_tools::mcp::{McpServer, ServerConfig};
 use zarn_tools::permissions::{Answer, PermissionPrompt, Permissions, Policy};
 
 const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(140);
+const BATCH_WINDOW: std::time::Duration = std::time::Duration::from_millis(12);
 const MCP_START_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub const INIT_PROMPT: &str = "Inspect this repository and write a ZARN.md file at its root for future coding sessions. Use glob, grep and read to learn the layout, the build, test and lint commands, the main modules and how they fit together, and any conventions the code follows. Keep it short and specific to this project: commands that work, where things live, rules that are not obvious from the code. If a ZARN.md already exists, read it first and improve it rather than starting over. Write the file with the write tool, then reply with a two-line summary.";
@@ -172,6 +173,7 @@ pub async fn run(options: Options) -> Result<()> {
     let outcome = match Controller::new(options) {
         Ok(mut controller) => {
             controller.interactive = true;
+            controller.check_for_update();
             controller.event_loop(&mut terminal).await
         }
         Err(err) => Err(err),
@@ -1127,7 +1129,16 @@ impl Controller {
                 event = ui_rx.recv() => {
                     match event {
                         None => break,
-                        Some(event) => self.on_ui(event),
+                        Some(event) => {
+                            self.on_ui(event);
+                            let started = std::time::Instant::now();
+                            while started.elapsed() < BATCH_WINDOW {
+                                match ui_rx.try_recv() {
+                                    Ok(event) => self.on_ui(event),
+                                    Err(_) => break,
+                                }
+                            }
+                        }
                     }
                 }
                 request = self.permissions.recv() => {
@@ -3198,6 +3209,43 @@ impl Controller {
         }
     }
 
+    fn check_for_update(&mut self) {
+        if !self.cfg().general.update_check() {
+            return;
+        }
+        let tx = self.ui_tx.clone();
+        tokio::spawn(async move {
+            if let Some(text) = zarn_config::update::notice(zarn_config::update::VERSION).await {
+                let _ = tx.send(UiEvent::Notice(text)).await;
+            }
+        });
+    }
+
+    fn update_now(&mut self, check: bool) {
+        use zarn_config::update;
+        self.app.notice(format!("checking {} for a newer zarn…", update::repo()));
+        let tx = self.ui_tx.clone();
+        tokio::spawn(async move {
+            let text = if check {
+                match update::latest().await {
+                    Ok(release) if update::newer(release.version(), update::VERSION) => format!(
+                        "zarn {} is available (you have {}); /update installs it",
+                        release.version(),
+                        update::VERSION
+                    ),
+                    Ok(_) => format!("zarn {} is the latest version", update::VERSION),
+                    Err(err) => format!("update check failed: {err:#}"),
+                }
+            } else {
+                match update::update_self().await {
+                    Ok(outcome) => outcome.summary(),
+                    Err(err) => format!("update failed: {err:#}"),
+                }
+            };
+            let _ = tx.send(UiEvent::Notice(text)).await;
+        });
+    }
+
     fn skills_list(&mut self) {
         let cfg = self.cfg();
         let skills = context::discover_skills();
@@ -3708,6 +3756,7 @@ impl Controller {
                     self.submit(zarn_config::git::explain_prompt(&args));
                 }
             }
+            "update" => self.update_now(first == Some("check")),
             "add-dir" => self.add_dir(args.trim()),
             "memory" => self.memory_command(&args),
             "todos" => {

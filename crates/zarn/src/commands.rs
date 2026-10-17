@@ -144,6 +144,22 @@ pub async fn login(provider: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+pub async fn update(check: bool) -> Result<()> {
+    use zarn_config::update;
+    if check {
+        let release = update::latest().await?;
+        if update::newer(release.version(), update::VERSION) {
+            println!("zarn {} is available (you have {}); run zarn update", release.version(), update::VERSION);
+        } else {
+            println!("zarn {} is the latest version", update::VERSION);
+        }
+        return Ok(());
+    }
+    println!("checking {} for a newer zarn…", update::repo());
+    println!("{}", update::update_self().await?.summary());
+    Ok(())
+}
+
 pub async fn setup(port: Option<u16>, no_browser: bool) -> Result<()> {
     use zarn_config::webkeys::{self, Change};
     let store = KeyStore::shared();

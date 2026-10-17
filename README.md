@@ -19,6 +19,27 @@ scripts/release.ps1         # Windows PowerShell
 
 The result is in `target/dist/release/`.
 
+### Updates
+
+`zarn update` installs the newest release from GitHub over the running
+binary (`zarn update --check` only looks), and `/update` does the same inside
+zarn. Every download is checked against the release's SHA-256 checksums
+before anything is replaced. zarn checks for a new release at most once a day
+when it starts and tells you in the chat; turn that off with
+`general.update_check = false` or `ZARN_NO_UPDATE_CHECK=1`. A private fork can
+set `ZARN_UPDATE_REPO=owner/repo` and `GITHUB_TOKEN`.
+
+To publish a release, bump `version` in `[workspace.package]` in `Cargo.toml`,
+commit, then tag and push it:
+
+```sh
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+The `release` workflow builds Windows, Linux and macOS binaries plus the
+Windows installer and publishes them with a `SHA256SUMS` file; that release
+is what `zarn update` installs.
+
 For a Windows installer (`zarn-setup-<version>.exe`, with the zarn icon, an
 optional PATH entry, Start Menu and desktop shortcuts, and an uninstaller),
 install [Inno Setup 6](https://jrsoftware.org/isdl.php) once
@@ -295,6 +316,7 @@ What the less obvious keys do:
 | `general.theme` | `dark`, `light`, `colorblind` or `auto` (reads `COLORFGBG`, falls back to dark) |
 | `general.status_line` | template with `{model}`, `{mode}`, `{profile}`, `{context}`, `{cost}`, `{cwd}`, `{branch}`; `{{` and `}}` are literal braces |
 | `general.notifications` | bell and window title after turns over 10 seconds and on permission prompts while the terminal may be unfocused; never written when stdout is not a terminal |
+| `general.update_check` | on by default: look for a new zarn release at most once a day at startup and say so in the chat; `zarn update` or `/update` installs it |
 | `general.mouse` | on by default: the wheel scrolls the conversation and menus take clicks; native text selection needs shift (option in macOS Terminal). Turn it off to select without shift; the wheel then sends arrow keys in most terminals (see `/doctor`) |
 | `general.context_budget` | token budget for all `ZARN.md` text, including nested files and imports |
 | `general.read_only_commands`, `auto_allow_read_only` | shell commands that run without asking |

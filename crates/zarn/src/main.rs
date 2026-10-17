@@ -65,6 +65,9 @@ async fn main() -> std::process::ExitCode {
 }
 
 async fn start() -> Result<()> {
+    if let Ok(exe) = std::env::current_exe() {
+        zarn_config::update::cleanup(&exe);
+    }
     let args = Args::parse();
     let interactive = args.command.is_none() && !matches!(args.run_mode(), RunMode::OneShot(_));
     init_logging(interactive);
@@ -97,6 +100,7 @@ async fn run_command(command: &Command) -> Result<()> {
         },
         Command::Login { provider } => commands::login(provider.as_deref()).await,
         Command::Setup { port, no_browser } => commands::setup(*port, *no_browser).await,
+        Command::Update { check } => commands::update(*check).await,
         Command::Logout { provider } => commands::logout(provider),
         Command::Providers { action } => match action {
             None | Some(ProvidersAction::List) => commands::providers_list().await,

@@ -9,7 +9,7 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block as Border, BorderType, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block as Border, BorderType, Borders, Paragraph};
 use serde_json::Value;
 
 const MAX_INPUT_ROWS: u16 = 8;
@@ -159,107 +159,323 @@ fn line_text(line: &Line) -> String {
     line.spans.iter().map(|s| s.content.as_ref()).collect()
 }
 
-pub fn search_hits(lines: &[Line], query: &str) -> Vec<usize> {
-    let needle = query.to_lowercase();
-    if needle.is_empty() {
-        return Vec::new();
-    }
-    lines
-        .iter()
-        .enumerate()
-        .filter(|(_, l)| line_text(l).to_lowercase().contains(&needle))
-        .map(|(i, _)| i)
-        .collect()
+const CHUNK_LINES: usize = 12;
+
+struct Part {
+    hash: u64,
+    lines: Vec<Line<'static>>,
+    rows: Vec<Line<'static>>,
+    width: usize,
 }
 
-fn transcript_lines(app: &App, width: usize) -> Vec<Line<'static>> {
-    let mut lines = vec![
-        Line::styled(
-            "transcript · every tool output in full · ↑↓ pgup pgdn scroll · esc or ctrl+o returns",
-            Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD),
-        ),
-        Line::raw(""),
-    ];
-    for block in &app.blocks {
-        match block {
-            Block::Tool(card) => lines.extend(card_lines_full(card, true)),
-            other => lines.extend(block_lines(other, app.theme.accent, width)),
+impl Part {
+    fn new(hash: u64, lines: Vec<Line<'static>>) -> Self {
+        Part { hash, lines, rows: Vec::new(), width: 0 }
+    }
+}
+
+struct Cached {
+    key: u64,
+    parts: Vec<Part>,
+}
+
+impl Cached {
+    fn rows(&self) -> usize {
+        self.parts.iter().map(|p| p.rows.len()).sum()
+    }
+}
+
+#[derive(Default)]
+struct RowCache {
+    accent: Option<Color>,
+    palette: Option<theme::Palette>,
+    transcript: bool,
+    blocks: Vec<Option<Cached>>,
+}
+
+fn hash_text(text: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut h);
+    h.finish()
+}
+
+pub fn markdown_chunks(text: &str) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    let mut lines = 0;
+    let mut fenced = false;
+    let mut at = 0;
+    for raw in text.split('\n') {
+        let end = at + raw.len();
+        let trimmed = raw.trim_start();
+        if trimmed.starts_with("```") {
+            fenced = !fenced;
         }
-        lines.push(Line::raw(""));
+        lines += 1;
+        if !fenced && raw.trim().is_empty() && lines >= CHUNK_LINES && end < text.len() {
+            chunks.push(&text[start..end]);
+            start = end + 1;
+            lines = 0;
+        }
+        at = end + 1;
     }
-    lines
+    chunks.push(&text[start.min(text.len())..]);
+    chunks
 }
 
-fn scroll_lines(app: &App, width: usize) -> (Vec<Line<'static>>, Option<usize>) {
-    if app.transcript {
-        return (transcript_lines(app, width), None);
+impl RowCache {
+    fn sync(&mut self, app: &App) {
+        let accent = Some(app.theme.accent);
+        let palette = Some(app.theme.palette);
+        if self.accent != accent || self.palette != palette || self.transcript != app.transcript {
+            self.blocks.clear();
+            self.accent = accent;
+            self.palette = palette;
+            self.transcript = app.transcript;
+        }
+        self.blocks.resize_with(app.blocks.len(), || None);
     }
-    let mut lines = Vec::new();
-    if app.theme.banner {
-        lines = brand::header_in(&app.status.model, app.theme.accent);
-        lines.push(Line::raw(""));
+
+    fn ensure(&mut self, app: &App, i: usize, width: usize) -> usize {
+        let block = &app.blocks[i];
+        let key = fingerprint(block);
+        let slot = &mut self.blocks[i];
+        if slot.as_ref().is_none_or(|c| c.key != key) {
+            let mut old = slot.take().map(|c| c.parts).unwrap_or_default();
+            let mut parts: Vec<Part> = match block {
+                Block::Assistant(text) => markdown_chunks(text)
+                    .into_iter()
+                    .enumerate()
+                    .map(|(n, chunk)| {
+                        let hash = hash_text(chunk);
+                        match old.get_mut(n).filter(|p| p.hash == hash) {
+                            Some(part) => std::mem::replace(part, Part::new(0, Vec::new())),
+                            None => Part::new(hash, markdown::render(chunk)),
+                        }
+                    })
+                    .collect(),
+                Block::Tool(card) if app.transcript => vec![Part::new(key, card_lines_full(card, true))],
+                other => vec![Part::new(key, block_lines(other, app.theme.accent, width))],
+            };
+            parts.push(Part::new(0, vec![Line::raw("")]));
+            *slot = Some(Cached { key, parts });
+        }
+        let cached = slot.as_mut().expect("filled above");
+        let reflow = matches!(block, Block::Compare(_)) && cached.parts.first().is_some_and(|p| p.width != width);
+        if reflow {
+            cached.parts[0].lines = block_lines(block, app.theme.accent, width);
+        }
+        for part in &mut cached.parts {
+            if part.width != width {
+                part.rows = wrap_rows(part.lines.clone(), width);
+                part.width = width;
+            }
+        }
+        cached.rows()
     }
-    for block in &app.blocks {
-        lines.extend(block_lines(block, app.theme.accent, width));
-        lines.push(Line::raw(""));
+}
+
+thread_local! {
+    static ROWS: std::cell::RefCell<RowCache> = std::cell::RefCell::new(RowCache::default());
+    static SEARCH_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn fingerprint(block: &Block) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    std::mem::discriminant(block).hash(&mut h);
+    match block {
+        Block::User(t) | Block::Assistant(t) | Block::Notice(t) | Block::Queued(t) => t.hash(&mut h),
+        Block::Compare(sides) => {
+            for side in sides {
+                (&side.label, &side.text, &side.meta, side.failed).hash(&mut h);
+            }
+        }
+        Block::Tool(card) => {
+            (&card.id, &card.name, &card.output, card.expanded, &card.detail, &card.live).hash(&mut h);
+            card.args.to_string().hash(&mut h);
+            (card.status as u8).hash(&mut h);
+        }
     }
-    let mut menu = None;
-    if let Some(request) = &app.pending {
-        let body = permission_lines(request, app.pending_expanded, app.permission_choice);
-        let options = permission_options(&request.pattern).len();
-        menu = Some(lines.len() + body.len() - options - 1);
-        lines.extend(body);
+    h.finish()
+}
+
+fn flush(row: &mut Vec<(String, Style)>, style: Style) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    for (symbol, s) in row.drain(..) {
+        match spans.last_mut() {
+            Some(last) if last.style == s => last.content.to_mut().push_str(&symbol),
+            _ => spans.push(Span::styled(symbol, s)),
+        }
     }
-    (lines, menu)
+    Line::from(spans).style(style)
+}
+
+pub fn wrap_line(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    if line.width() <= width {
+        return vec![line];
+    }
+    let style = line.style;
+    let mut rows = Vec::new();
+    let mut row: Vec<(String, Style)> = Vec::new();
+    let mut row_width = 0;
+    let mut space: Option<usize> = None;
+    for grapheme in line.styled_graphemes(Style::default()) {
+        let symbol = grapheme.symbol.to_string();
+        let w = Span::raw(symbol.as_str()).width();
+        let blank = symbol == " ";
+        if row_width + w > width && !row.is_empty() {
+            let carry = match space {
+                Some(at) if at > 0 => row.split_off(at + 1),
+                _ => Vec::new(),
+            };
+            if space.is_some_and(|at| at > 0) {
+                row.pop();
+            }
+            rows.push(flush(&mut row, style));
+            row = carry;
+            row_width = row.iter().map(|(sym, _)| Span::raw(sym.as_str()).width()).sum();
+            space = None;
+            if blank && row.is_empty() {
+                continue;
+            }
+        }
+        if blank {
+            space = Some(row.len());
+        }
+        row_width += w;
+        row.push((symbol, grapheme.style));
+    }
+    if !row.is_empty() || rows.is_empty() {
+        rows.push(flush(&mut row, style));
+    }
+    rows
+}
+
+fn wrap_rows(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
+    lines.into_iter().flat_map(|l| wrap_line(l, width)).collect()
 }
 
 fn scrollback(frame: &mut Frame, app: &App, area: Rect) {
-    let (mut lines, menu) = scroll_lines(app, area.width as usize);
-
     let width = area.width.max(1) as usize;
-    let rows: Vec<usize> = lines.iter().map(|line| line.width().max(1).div_ceil(width)).collect();
-    let total = rows.iter().sum::<usize>().min(u16::MAX as usize) as u16;
-    let bottom = total.saturating_sub(area.height);
-    let scroll = if app.transcript { app.transcript_scroll } else { app.scroll_up };
-    let mut offset = bottom.saturating_sub(scroll);
-
-    if let Some(search) = &app.search {
-        let hits = search_hits(&lines, &search.query);
-        if !hits.is_empty() {
-            let current = hits[hits.len() - 1 - search.hit % hits.len()];
-            for &i in &hits {
-                let style = if i == current {
-                    Style::default().fg(Color::Black).bg(theme::warn())
-                } else {
-                    Style::default().add_modifier(Modifier::UNDERLINED)
-                };
-                lines[i] = lines[i].clone().patch_style(style);
+    let height = area.height as usize;
+    let prefix = if app.transcript {
+        vec![
+            Line::styled(
+                "transcript · every tool output in full · ↑↓ pgup pgdn scroll · esc or ctrl+o returns",
+                Style::default().fg(app.theme.accent).add_modifier(Modifier::BOLD),
+            ),
+            Line::raw(""),
+        ]
+    } else if app.theme.banner {
+        let mut lines = brand::header_in(&app.status.model, app.theme.accent);
+        lines.push(Line::raw(""));
+        lines
+    } else {
+        Vec::new()
+    };
+    let prefix = wrap_rows(prefix, width);
+    let mut pending = Vec::new();
+    let mut options_at = Vec::new();
+    if let Some(request) = app.pending.as_ref().filter(|_| !app.transcript) {
+        let body = permission_lines(request, app.pending_expanded, app.permission_choice);
+        let options = permission_options(&request.pattern).len();
+        let first = body.len() - options - 1;
+        for (i, line) in body.into_iter().enumerate() {
+            if (first..first + options).contains(&i) {
+                options_at.push(pending.len());
             }
-            if !search.typing {
-                let row = rows[..current].iter().sum::<usize>().min(u16::MAX as usize) as u16;
-                if row < offset || row >= offset.saturating_add(area.height) {
-                    offset = row.saturating_sub(area.height / 2).min(bottom);
+            pending.extend(wrap_line(line, width));
+        }
+    }
+
+    ROWS.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.sync(app);
+        let scroll = if app.transcript { app.transcript_scroll } else { app.scroll_up } as usize;
+        let needed = scroll.saturating_add(height);
+        let mut have = pending.len();
+        let mut first = app.blocks.len();
+        while first > 0 && (app.search.is_some() || have < needed) {
+            first -= 1;
+            have += cache.ensure(app, first, width);
+        }
+        let mut segments: Vec<&[Line<'static>]> = Vec::new();
+        if first == 0 {
+            segments.push(&prefix);
+        }
+        for cached in cache.blocks[first..].iter().flatten() {
+            segments.extend(cached.parts.iter().map(|p| p.rows.as_slice()));
+        }
+        segments.push(&pending);
+        let total: usize = segments.iter().map(|s| s.len()).sum();
+        let bottom = total.saturating_sub(height);
+        let mut offset = bottom.saturating_sub(scroll);
+
+        let mut marks: std::collections::HashMap<usize, Style> = std::collections::HashMap::new();
+        if let Some(search) = &app.search {
+            let needle = search.query.to_lowercase();
+            let found: Vec<usize> = if needle.is_empty() {
+                Vec::new()
+            } else {
+                segments
+                    .iter()
+                    .flat_map(|s| s.iter())
+                    .enumerate()
+                    .filter(|(_, l)| line_text(l).to_lowercase().contains(&needle))
+                    .map(|(i, _)| i)
+                    .collect()
+            };
+            SEARCH_COUNT.with(|c| c.set(found.len()));
+            if !found.is_empty() {
+                let current = found[found.len() - 1 - search.hit % found.len()];
+                for &i in &found {
+                    let style = if i == current {
+                        Style::default().fg(Color::Black).bg(theme::warn())
+                    } else {
+                        Style::default().add_modifier(Modifier::UNDERLINED)
+                    };
+                    marks.insert(i, style);
+                }
+                if !search.typing && (current < offset || current >= offset + height) {
+                    offset = current.saturating_sub(height / 2).min(bottom);
                 }
             }
         }
-    }
 
-    if let (Some(first), Some(request)) = (menu, &app.pending) {
-        for k in 0..permission_options(&request.pattern).len() {
-            let at = first + k;
-            let top = rows[..at].iter().sum::<usize>();
-            if let Some(y) = top.checked_sub(offset as usize).filter(|y| *y < area.height as usize) {
+        let mut visible = Vec::with_capacity(height);
+        let mut index = 0;
+        for segment in &segments {
+            if index + segment.len() <= offset {
+                index += segment.len();
+                continue;
+            }
+            for line in segment.iter() {
+                if index >= offset && visible.len() < height {
+                    let line = line.clone();
+                    visible.push(match marks.get(&index) {
+                        Some(style) => line.patch_style(*style),
+                        None => line,
+                    });
+                }
+                index += 1;
+            }
+            if visible.len() >= height {
+                break;
+            }
+        }
+
+        let pending_start = total - pending.len();
+        for (k, row) in options_at.iter().enumerate() {
+            if let Some(y) = (pending_start + row).checked_sub(offset).filter(|y| *y < height) {
                 hits::row(area, area.y + y as u16, Hit::Permission(k));
             }
         }
-    }
 
-    frame.render_widget(
-        Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((offset, 0)),
-        area,
-    );
+        frame.render_widget(Paragraph::new(visible), area);
+    });
 }
 
 pub fn wrap(text: &str, width: usize) -> Vec<String> {
@@ -683,7 +899,6 @@ pub fn menu_lines(options: &[String], choice: usize, accent: Style) -> Vec<Line<
 }
 
 fn status(frame: &mut Frame, app: &App, area: Rect) {
-    let width = area.width as usize;
     let mode = if app.status.mode.is_empty() { "default" } else { app.status.mode.as_str() };
     let mut parts = Vec::new();
     if let Some(vim) = app.vim {
@@ -736,7 +951,7 @@ fn status(frame: &mut Frame, app: &App, area: Rect) {
         parts = extras;
     }
     if let Some(search) = &app.search {
-        parts.insert(0, search_label(app, search, width));
+        parts.insert(0, search_label(search));
     }
     if app.transcript {
         parts.insert(0, "transcript".to_string());
@@ -773,11 +988,11 @@ pub fn elapsed_label(secs: u64) -> String {
     }
 }
 
-fn search_label(app: &App, search: &crate::state::Search, width: usize) -> String {
+fn search_label(search: &crate::state::Search) -> String {
     if search.typing {
         return format!("search: {}▏ (enter to find, esc to stop)", search.query);
     }
-    let hits = search_hits(&scroll_lines(app, width).0, &search.query).len();
+    let hits = SEARCH_COUNT.with(|c| c.get());
     if hits == 0 {
         format!("search '{}': no matches", search.query)
     } else {
@@ -849,6 +1064,36 @@ fn input(frame: &mut Frame, app: &App, area: Rect) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn rendering_a_reply_in_chunks_matches_rendering_it_whole() {
+        let mut text = String::new();
+        for n in 0..30 {
+            text.push_str(&format!(
+                "# Part {n}\n\nsome **bold** text\n\n| a | b |\n| - | - |\n| {n} | x |\n\n```rust\nlet a = 1;\n\nlet b = 2;\n```\n\n- item\n- item\n\n"
+            ));
+        }
+        for sample in [text.as_str(), "", "one line", "a\n\n", "```\nopen fence\n\nstill code"] {
+            let chunks = markdown_chunks(sample);
+            assert_eq!(chunks.concat().len() + chunks.len() - 1, sample.len());
+            let joined: Vec<Line> = chunks.iter().flat_map(|c| markdown::render(c)).collect();
+            assert_eq!(joined, markdown::render(sample), "{sample:?}");
+        }
+        assert!(markdown_chunks(&text).len() > 10);
+    }
+
+    #[test]
+    fn long_lines_wrap_at_spaces_and_keep_their_styles() {
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let line = Line::from(vec![Span::raw("alpha beta "), Span::styled("gamma delta", bold)]);
+        let rows = wrap_line(line, 12);
+        let text: Vec<String> = rows.iter().map(line_text).collect();
+        assert_eq!(text, ["alpha beta", "gamma delta"]);
+        assert_eq!(rows[1].spans[0].style, bold);
+        let rows = wrap_line(Line::raw("abcdefghij"), 4);
+        assert_eq!(rows.iter().map(line_text).collect::<Vec<_>>(), ["abcd", "efgh", "ij"]);
+        assert_eq!(wrap_line(Line::raw(""), 10).len(), 1);
+    }
 
     fn card(output: &str, expanded: bool) -> ToolCard {
         ToolCard {
