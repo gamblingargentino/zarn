@@ -2020,6 +2020,26 @@ impl Controller {
         });
     }
 
+    fn show_diff(&mut self, path: String) {
+        self.shell_runs += 1;
+        let id = format!("shell-{}", self.shell_runs);
+        let command = if path.is_empty() { "git diff HEAD".to_string() } else { format!("git diff HEAD -- {path}") };
+        self.app.apply(AgentEvent::ToolStarted {
+            id: id.clone(),
+            name: "git diff".into(),
+            args: serde_json::json!({ "command": command }),
+        });
+        let cwd = self.cwd.clone();
+        let tx = self.ui_tx.clone();
+        tokio::spawn(async move {
+            let output = match zarn_config::git::working_diff(&cwd, &path).await {
+                Ok(text) => zarn_core::tools::ToolOutput::ok(text),
+                Err(err) => zarn_core::tools::ToolOutput::error(err),
+            };
+            let _ = tx.send(UiEvent::Shell { id, command, output }).await;
+        });
+    }
+
     fn sync_todos(&mut self) {
         let todos = self.todos.lock().map(|t| t.clone()).unwrap_or_default();
         self.app.todos = todos.clone();
@@ -3622,6 +3642,10 @@ impl Controller {
             "review" => {
                 let focus = line.trim_start().trim_start_matches('/').trim_start_matches("review").trim();
                 self.submit(zarn_config::git::review_prompt(focus));
+            }
+            "diff" => {
+                let path = line.trim_start().trim_start_matches('/').trim_start_matches("diff").trim().to_string();
+                self.show_diff(path);
             }
             "commit" => self.start_commit(),
             "pr" => self.start_pr(),

@@ -106,6 +106,58 @@ pub async fn draft(provider: &dyn Provider, model: &str, instruction: &str, mate
     }
 }
 
+async fn git(cwd: &std::path::Path, args: &[&str]) -> Result<(bool, String), String> {
+    let output = tokio::process::Command::new("git")
+        .arg("--no-pager")
+        .args(args)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("could not run git: {e}"))?;
+    let text = if output.status.success() { output.stdout } else { output.stderr };
+    Ok((output.status.success(), String::from_utf8_lossy(&text).into_owned()))
+}
+
+pub async fn working_diff(cwd: &std::path::Path, path: &str) -> Result<String, String> {
+    let (inside, _) = git(cwd, &["rev-parse", "--is-inside-work-tree"]).await?;
+    if !inside {
+        return Err("this folder is not a git repository".into());
+    }
+    let (has_head, _) = git(cwd, &["rev-parse", "--verify", "--quiet", "HEAD"]).await?;
+    let base = if has_head {
+        "HEAD".to_string()
+    } else {
+        git(cwd, &["hash-object", "-t", "tree", "--stdin"]).await?.1.trim().to_string()
+    };
+    let mut args = vec!["diff", "--no-color", "--no-ext-diff", base.as_str()];
+    if !path.is_empty() {
+        args.extend(["--", path]);
+    }
+    let (ok, diff) = git(cwd, &args).await?;
+    if !ok {
+        return Err(diff.trim().to_string());
+    }
+    let mut listing = vec!["ls-files", "--others", "--exclude-standard"];
+    if !path.is_empty() {
+        listing.extend(["--", path]);
+    }
+    let (_, untracked) = git(cwd, &listing).await?;
+    let untracked: Vec<&str> = untracked.lines().filter(|l| !l.trim().is_empty()).collect();
+    let mut text = diff.trim_end().to_string();
+    if !untracked.is_empty() {
+        if !text.is_empty() {
+            text.push_str("\n\n");
+        }
+        text.push_str(&format!("untracked ({}):\n", untracked.len()));
+        text.push_str(&untracked.iter().map(|f| format!("  {f}")).collect::<Vec<_>>().join("\n"));
+    }
+    if text.is_empty() {
+        text = "no changes since the last commit".into();
+    }
+    Ok(redact(&text))
+}
+
 pub fn split_pr(raw: &str) -> (String, String) {
     let text = clean_message(raw, None);
     let mut lines = text.lines();

@@ -33,6 +33,7 @@ pub const BUILTINS: &[(&str, &str, &str)] = &[
     ("limits", "[session|day <usd|off>]", "show or set the spend caps"),
     ("resume", "[id]", "resume an earlier session in this directory"),
     ("rename", "<title>", "rename this session"),
+    ("diff", "[path]", "show the uncommitted changes (not sent to the model)"),
     ("review", "[focus]", "review the uncommitted changes"),
     ("security-review", "[focus]", "look for security problems in the uncommitted changes"),
     ("test", "[which tests]", "run the tests and fix what fails"),

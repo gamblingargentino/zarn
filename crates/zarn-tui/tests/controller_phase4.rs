@@ -180,3 +180,43 @@ async fn ctrl_g_edits_the_input_in_the_external_editor() {
     c.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::CONTROL));
     assert!(notices(&c).last().unwrap().contains("set $VISUAL or $EDITOR"));
 }
+
+#[tokio::test]
+async fn diff_shows_uncommitted_changes_without_the_model() {
+    let mock = echo_server("ok").await;
+    let env = Env::new(&provider_config(&mock.uri(), "")).await;
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.name=t", "-c", "user.email=t@example.com", "-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(env.project())
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    };
+    git(&["init", "-q"]);
+    std::fs::write(env.project().join("tracked.txt"), "before\n").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&["commit", "-q", "-m", "first"]);
+    std::fs::write(env.project().join("tracked.txt"), "after\n").unwrap();
+    let mut c = env.controller();
+    c.type_line("/diff");
+    wait_for(&mut c, Duration::from_secs(5), |c| {
+        c.app().blocks.iter().any(|b| matches!(b, Block::Tool(card) if card.name == "git diff" && card.output.is_some()))
+    })
+    .await;
+    let output = c
+        .app()
+        .blocks
+        .iter()
+        .find_map(|b| match b {
+            Block::Tool(card) if card.name == "git diff" => card.output.clone(),
+            _ => None,
+        })
+        .unwrap();
+    assert!(output.contains("-before") && output.contains("+after"), "{output}");
+    assert!(chat_bodies(&mock).await.is_empty(), "nothing goes to the model");
+    c.type_line("/attach-output");
+    turn(&mut c, "look at this").await;
+    assert!(text_of(&chat_bodies(&mock).await[0]).contains("+after"));
+}

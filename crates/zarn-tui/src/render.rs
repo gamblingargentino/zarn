@@ -585,6 +585,27 @@ fn block_lines(block: &Block, accent: Color, width: usize) -> Vec<Line<'static>>
     }
 }
 
+fn looks_like_diff(lines: &[&str]) -> bool {
+    lines.iter().take(50).any(|l| l.starts_with("diff --git ") || l.starts_with("@@ -"))
+}
+
+fn diff_span(text: String) -> Span<'static> {
+    let style = if text.starts_with("+++") || text.starts_with("---") || text.starts_with("diff --git") {
+        Style::default().add_modifier(Modifier::BOLD)
+    } else if text.starts_with('+') {
+        Style::default().fg(theme::ok())
+    } else if text.starts_with('-') {
+        Style::default().fg(theme::error())
+    } else if text.starts_with("@@") {
+        Style::default().fg(theme::info())
+    } else if text.starts_with("index ") || text.starts_with("new file") || text.starts_with("deleted file") {
+        Style::default().fg(theme::dim())
+    } else {
+        Style::default()
+    };
+    Span::styled(text, style)
+}
+
 fn status_style(status: CardStatus) -> Style {
     let color = match status {
         CardStatus::Pending => theme::dim(),
@@ -740,11 +761,11 @@ fn card_lines_full(card: &ToolCard, full: bool) -> Vec<Line<'static>> {
         } else {
             all.len().min(COLLAPSED_LINES)
         };
+        let diff = looks_like_diff(&all);
         for line in &all[..shown] {
-            lines.push(Line::from(vec![
-                Span::styled("│ ", edge),
-                Span::raw(untab(line)),
-            ]));
+            let text = untab(line);
+            let body = if diff { diff_span(text) } else { Span::raw(text) };
+            lines.push(Line::from(vec![Span::styled("│ ", edge), body]));
         }
         if all.len() > shown {
             lines.push(Line::from(vec![
@@ -1064,6 +1085,31 @@ fn input(frame: &mut Frame, app: &App, area: Rect) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn diff_output_in_a_card_is_colored_and_other_output_is_not() {
+        let card = |output: &str| ToolCard {
+            id: "1".into(),
+            name: "git diff".into(),
+            status: CardStatus::Done,
+            output: Some(output.into()),
+            expanded: true,
+            ..ToolCard::default()
+        };
+        let color = |lines: &[Line<'static>], text: &str| {
+            lines
+                .iter()
+                .find_map(|l| l.spans.iter().find(|s| s.content == text))
+                .and_then(|s| s.style.fg)
+        };
+        let diff = card_lines(&card("diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-old\n+new\n same"));
+        assert_eq!(color(&diff, "+new"), Some(theme::ok()));
+        assert_eq!(color(&diff, "-old"), Some(theme::error()));
+        assert_eq!(color(&diff, "@@ -1 +1 @@"), Some(theme::info()));
+        assert_eq!(color(&diff, "+++ b/x"), None);
+        let plain = card_lines(&card("-rw-r--r-- file\n+ not a diff"));
+        assert_eq!(color(&plain, "+ not a diff"), None);
+    }
 
     #[test]
     fn rendering_a_reply_in_chunks_matches_rendering_it_whole() {

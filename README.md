@@ -108,6 +108,7 @@ Everything after that is done from inside zarn, with no hand-edited files:
 | `/mode [name]` (shift+tab) | switch mode: default, plan, accept-edits, bypass, full or your own |
 | `/skills list\|show\|new\|create\|install\|remove\|enable\|disable` | manage skills; `create` has the model write one with you, `install` takes a git URL, GitHub folder link, folder or `SKILL.md` link (`--project` for this project) |
 | `/commands [list\|new <name>]` | list or scaffold your own slash commands |
+| `/diff [path]` | show the uncommitted changes, untracked files included, colored and folded; nothing is sent to the model (`/attach-output` adds it to your next message) |
 | `/review`, `/security-review`, `/test`, `/explain <code>` | review the uncommitted changes, look for security problems, run and fix the tests, explain part of the code |
 | `/memory [add <note>]`, `/add-dir <path>`, `/todos` | ZARN.md memory files, another directory for this session, the model's todo list |
 | `/mcp`, `/agents`, `/permissions`, `/hooks`, `/plugins` | open the matching panel tab or summary |
