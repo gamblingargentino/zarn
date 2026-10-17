@@ -61,10 +61,10 @@ pub struct Args {
     #[arg(long, value_name = "PROFILE", help = "Use this profile instead of the default")]
     pub profile: Option<String>,
 
-    #[arg(long, value_name = "NAME", help = "Start in this mode: default, plan, accept-edits, bypass or a custom mode")]
+    #[arg(long, value_name = "NAME", help = "Start in this mode: default, plan, accept-edits, bypass, full or a custom mode")]
     pub mode: Option<String>,
 
-    #[arg(long = "permission-mode", value_name = "NAME", help = "Permission policy to apply; --print needs --permission-mode bypass before it will run in bypass")]
+    #[arg(long = "permission-mode", value_name = "NAME", help = "Permission policy to apply; --print needs --permission-mode bypass (or full) before it will run in bypass or full mode")]
     pub permission_mode: Option<String>,
 }
 
@@ -258,6 +258,32 @@ pub enum SkillsAction {
     Disable {
         #[arg(help = "Skill name")]
         name: String,
+    },
+    #[command(about = "Install skills from a git URL, a GitHub folder link, a local folder or a link to a SKILL.md")]
+    Install {
+        #[arg(help = "Where the skills are, e.g. https://github.com/owner/repo/tree/main/skills/pdf")]
+        source: String,
+        #[arg(long, help = "Install into this project's .zarn/skills instead of your user folder")]
+        project: bool,
+    },
+    #[command(about = "Delete an installed skill")]
+    Remove {
+        #[arg(help = "Skill name")]
+        name: String,
+    },
+    #[command(about = "Print a skill's SKILL.md and list its files")]
+    Show {
+        #[arg(help = "Skill name")]
+        name: String,
+    },
+    #[command(about = "Make an empty skill from a template; /skills create in zarn has the model write one with you")]
+    New {
+        #[arg(help = "Skill name: lowercase letters, digits, '-' and '_'")]
+        name: String,
+        #[arg(help = "What the skill does and when to use it")]
+        description: Vec<String>,
+        #[arg(long, help = "Create it in this project's .zarn/skills instead of your user folder")]
+        project: bool,
     },
 }
 

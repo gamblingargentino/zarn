@@ -184,7 +184,7 @@ pub enum ChatPick {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ConfirmFor {
-    Bypass,
+    Mode(String),
     Commit(String),
     Prompted(String),
     Rewind(usize),
@@ -1800,16 +1800,16 @@ mod tests {
         assert!(app.plan_review.as_ref().unwrap().feedback.is_some());
 
         let mut app = App::new("m");
-        app.overlay = Some(Overlay::Confirm("sure?".into(), ConfirmFor::Bypass));
+        app.overlay = Some(Overlay::Confirm("sure?".into(), ConfirmFor::Mode("bypass".into())));
         app.on_key(key(KeyCode::Right));
         assert_eq!(app.confirm_choice, 1);
         assert_eq!(app.on_key(key(KeyCode::Enter)), None);
         assert!(app.overlay.is_none());
-        app.overlay = Some(Overlay::Confirm("sure?".into(), ConfirmFor::Bypass));
+        app.overlay = Some(Overlay::Confirm("sure?".into(), ConfirmFor::Mode("bypass".into())));
         assert_eq!(app.confirm_choice, 0);
         assert_eq!(
             app.on_key(key(KeyCode::Enter)),
-            Some(Action::Confirmed(ConfirmFor::Bypass))
+            Some(Action::Confirmed(ConfirmFor::Mode("bypass".into())))
         );
     }
 

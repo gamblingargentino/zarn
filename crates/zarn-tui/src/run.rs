@@ -120,6 +120,7 @@ enum UiEvent {
         result: Result<Box<McpServer>, String>,
     },
     Doctor(String),
+    Changed(Result<String, String>),
     Notice(String),
     WebKeys(zarn_config::webkeys::Change),
     LoginDone(Result<String, String>),
@@ -413,21 +414,21 @@ impl Controller {
         if wanted == "default" {
             return;
         }
-        if wanted == "bypass" {
+        if modes::needs_confirmation(&wanted) {
             if from_cli.is_some() {
-                self.ask_bypass();
+                self.ask_mode(&wanted);
             } else {
-                self.app.notice("general.mode is bypass, but bypass is never restored at startup; starting in default. /mode bypass enters it after a confirmation.");
+                self.app.notice(format!("general.mode is {wanted}, but {wanted} is never restored at startup; starting in default. /mode {wanted} enters it after a confirmation."));
             }
             return;
         }
         self.set_mode(&wanted, false);
     }
 
-    fn ask_bypass(&mut self) {
+    fn ask_mode(&mut self, name: &str) {
         self.app.overlay = Some(Overlay::Confirm(
-            format!("Enter bypass mode? {}", modes::BYPASS_RISK),
-            ConfirmFor::Bypass,
+            format!("Enter {name} mode? {}", modes::risk(name)),
+            ConfirmFor::Mode(name.to_string()),
         ));
     }
 
@@ -443,7 +444,7 @@ impl Controller {
         self.mode = name.to_string();
         self.app.status.mode = name.to_string();
         self.gate.set_overlay(modes::overlay(&file.def));
-        if persist && name != "bypass" {
+        if persist && !modes::needs_confirmation(name) {
             let result = match self.layers() {
                 Some(layers) => ops::set_general(layers, GeneralField::Mode, |g| {
                     g.mode = Some(name.to_string())
@@ -890,6 +891,13 @@ impl Controller {
                 .map(|a| (a.def.name, a.def.description))
                 .collect(),
         );
+        let skill_names: Vec<(String, String)> = context::discover_skills()
+            .into_iter()
+            .map(|s| (s.name, s.description))
+            .collect();
+        for key in ["skills show", "skills remove", "skills enable", "skills disable"] {
+            args.insert(key.into(), skill_names.clone());
+        }
         args.insert(
             "theme".into(),
             brand::ACCENTS.iter().map(|(n, _)| (n.to_string(), "accent color".to_string())).collect(),
@@ -1381,7 +1389,7 @@ impl Controller {
             Action::Picked(purpose, value) => self.picked(purpose, value),
             Action::SendQueued => self.send_next(),
             Action::CycleMode => self.cycle_mode(),
-            Action::Confirmed(ConfirmFor::Bypass) => self.set_mode("bypass", true),
+            Action::Confirmed(ConfirmFor::Mode(name)) => self.set_mode(&name, true),
             Action::Confirmed(ConfirmFor::Commit(message)) => self.commit(message),
             Action::Confirmed(ConfirmFor::Rewind(turn)) => self.rewind(turn),
             Action::Confirmed(ConfirmFor::Prompted(provider)) => {
@@ -1873,8 +1881,8 @@ impl Controller {
             .runtime
             .as_ref()
             .filter(|rt| rt.router.configured(role))
-            .map(|rt| (rt.router.for_role(role), rt.tools.clone()));
-        let Some((routed, tools)) = routed else {
+            .map(|rt| (rt.router.for_role(role), rt.tools.clone(), rt.agent_config()));
+        let Some((routed, tools, config)) = routed else {
             return self.submit(text);
         };
         if self.app.streaming {
@@ -1887,7 +1895,7 @@ impl Controller {
             self.ctx.clone(),
             zarn_core::agent::AgentConfig {
                 model: routed.model,
-                ..Default::default()
+                ..config
             },
         )
         .with_gate(self.hooked_gate());
@@ -2519,6 +2527,13 @@ impl Controller {
             }
             UiEvent::Doctor(report) => self.app.notice(report),
             UiEvent::Notice(text) => self.app.notice(text),
+            UiEvent::Changed(result) => {
+                match result {
+                    Ok(text) => self.app.notice(text),
+                    Err(err) => self.app.notice(err),
+                }
+                self.rebuild();
+            }
             UiEvent::WebKeys(change) => self.web_change(change),
             UiEvent::LoginDone(Ok(summary)) => {
                 self.app.notice(summary);
@@ -2753,9 +2768,9 @@ impl Controller {
 
     fn panel_effect(&mut self, effect: settings::Effect) {
         match effect {
-            settings::Effect::SetMode(name) if name == "bypass" => {
+            settings::Effect::SetMode(name) if modes::needs_confirmation(&name) => {
                 self.app.mode = Mode::Chat;
-                self.ask_bypass();
+                self.ask_mode(&name);
             }
             settings::Effect::SetMode(name) => self.set_mode(&name, false),
             settings::Effect::RefreshQuota(only) => self.fetch_quota(only, true, false),
@@ -2878,7 +2893,7 @@ impl Controller {
             ChatPick::Rewind => self.confirm_rewind(&value),
             ChatPick::Memory(note) => self.append_memory(&note, Path::new(&value)),
             ChatPick::History => self.app.set_input(value),
-            ChatPick::Mode if value == "bypass" => self.ask_bypass(),
+            ChatPick::Mode if modes::needs_confirmation(&value) => self.ask_mode(&value),
             ChatPick::Mode => self.set_mode(&value, true),
         }
     }
@@ -3183,6 +3198,214 @@ impl Controller {
         }
     }
 
+    fn skills_list(&mut self) {
+        let cfg = self.cfg();
+        let skills = context::discover_skills();
+        self.app.notice(if skills.is_empty() {
+            "no skills yet. /skills create writes one with the model, /skills new makes an empty one, /skills install <git URL or path> adds existing ones".to_string()
+        } else {
+            skills
+                .iter()
+                .map(|s| {
+                    let state = if cfg.skill_enabled(&s.name) { "on " } else { "off" };
+                    format!("[{state}] {:<16} {:<8} {}", s.name, s.source.label(), s.description)
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
+        });
+    }
+
+    fn skills_command(&mut self, args: &str) {
+        use zarn_config::skills::{self, Place};
+        let mut words = settings::split_words(args);
+        let project = take_flag(&mut words, "--project");
+        let place = Place::from_flag(project);
+        let sub = if words.is_empty() { String::new() } else { words.remove(0) };
+        let root = match place.root() {
+            Ok(root) => root,
+            Err(err) => return self.app.notice(format!("{err:#}")),
+        };
+        match sub.as_str() {
+            "" => {
+                self.open_panel(Tab::Skills);
+            }
+            "list" => self.skills_list(),
+            "show" => match words.first() {
+                Some(name) => match skills::show(name) {
+                    Ok(text) => self.app.notice(text),
+                    Err(err) => self.app.notice(format!("{err:#}")),
+                },
+                None => self.app.notice("usage: /skills show <name>"),
+            },
+            "new" => {
+                let Some(name) = words.first().cloned() else {
+                    return self.app.notice("usage: /skills new <name> [description] [--project]");
+                };
+                match skills::scaffold(&root, &name, &words[1..].join(" ")) {
+                    Ok(path) => {
+                        self.app.notice(format!(
+                            "created {}; fill in the steps, or run /skills create {name} to have the model write it",
+                            path.display()
+                        ));
+                        self.rebuild();
+                    }
+                    Err(err) => self.app.notice(format!("{err:#}")),
+                }
+            }
+            "create" => {
+                if self.agent.is_none() {
+                    return self.app.notice("cannot run /skills create: no provider is ready");
+                }
+                let named = words.first().filter(|w| skills::valid_name(w)).cloned();
+                let request = match &named {
+                    Some(_) => words[1..].join(" "),
+                    None => words.join(" "),
+                };
+                let prompt = skills::creator_prompt(named.as_deref().unwrap_or(""), &request, &root);
+                self.submit(prompt);
+            }
+            "install" | "add" => {
+                let Some(source) = words.first().cloned() else {
+                    return self.app.notice(
+                        "usage: /skills install <git URL, GitHub folder link, folder or SKILL.md link> [--project]",
+                    );
+                };
+                self.app.notice(format!("installing skills from {source}…"));
+                let tx = self.ui_tx.clone();
+                tokio::spawn(async move {
+                    let result = skills::install(&root, &source)
+                        .await
+                        .map(|done| done.summary(place))
+                        .map_err(|err| format!("skills install failed: {err:#}"));
+                    let _ = tx.send(UiEvent::Changed(result)).await;
+                });
+            }
+            "remove" | "uninstall" => match words.first() {
+                Some(name) => {
+                    let result = skills::remove(name)
+                        .map(|dir| format!("removed {name} ({})", dir.display()))
+                        .map_err(|err| format!("{err:#}"));
+                    let _ = self.ui_tx.try_send(UiEvent::Changed(result));
+                }
+                None => self.app.notice("usage: /skills remove <name>"),
+            },
+            "enable" | "disable" => {
+                let enable = sub == "enable";
+                let Some(name) = words.first().cloned() else {
+                    return self.app.notice(format!("usage: /skills {sub} <name>"));
+                };
+                if !context::discover_skills().iter().any(|s| s.name == name) {
+                    return self.app.notice(format!("no skill named {name}; /skills list shows them"));
+                }
+                let result = match self.layers() {
+                    Some(layers) => ops::set_skill_enabled(layers, &name, enable)
+                        .map(|scope| format!("{name} turned {} in the {} config", if enable { "on" } else { "off" }, scope.label()))
+                        .map_err(|err| format!("{err:#}")),
+                    None => return,
+                };
+                let _ = self.ui_tx.try_send(UiEvent::Changed(result));
+            }
+            other => self.app.notice(format!(
+                "unknown: /skills {other}; use list, show, new, create, install, remove, enable or disable"
+            )),
+        }
+    }
+
+    fn commands_command(&mut self, args: &str) {
+        use zarn_config::skills::{self, Place};
+        let mut words = settings::split_words(args);
+        let place = Place::from_flag(take_flag(&mut words, "--project"));
+        let sub = if words.is_empty() { String::new() } else { words.remove(0) };
+        match sub.as_str() {
+            "" | "list" => {
+                let custom = self.commands.custom();
+                self.app.notice(if custom.is_empty() {
+                    "no custom commands yet; /commands new <name> makes one".to_string()
+                } else {
+                    custom
+                        .iter()
+                        .map(|c| format!("/{:<20} {:<8} {}", c.name, c.source, c.description))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                });
+            }
+            "new" => {
+                let Some(name) = words.first().cloned() else {
+                    return self.app.notice("usage: /commands new <name> [description] [--project]");
+                };
+                let made = place
+                    .commands_root()
+                    .and_then(|root| skills::scaffold_command(&root, &name, &words[1..].join(" ")));
+                match made {
+                    Ok(path) => {
+                        self.app.notice(format!(
+                            "created {}; write the prompt there and run it with /{name}",
+                            path.display()
+                        ));
+                        self.rebuild();
+                    }
+                    Err(err) => self.app.notice(format!("{err:#}")),
+                }
+            }
+            other => self.app.notice(format!("unknown: /commands {other}; use list or new")),
+        }
+    }
+
+    fn add_dir(&mut self, path: &str) {
+        if path.is_empty() {
+            let dirs: Vec<String> = self.options.add_dirs.iter().map(|d| d.display().to_string()).collect();
+            return self.app.notice(if dirs.is_empty() {
+                "usage: /add-dir <path>; file tools then work there without asking about the path".to_string()
+            } else {
+                format!("extra directories: {}", dirs.join(", "))
+            });
+        }
+        let full = self.cwd.join(path);
+        let Ok(real) = full.canonicalize() else {
+            return self.app.notice(format!("{} does not exist", full.display()));
+        };
+        if !real.is_dir() {
+            return self.app.notice(format!("{} is not a directory", real.display()));
+        }
+        if !self.options.add_dirs.contains(&real) {
+            self.options.add_dirs.push(real.clone());
+        }
+        self.gate.set_boundary(Some(self.options.add_dirs.clone()));
+        self.app.notice(format!("added {} for this session", real.display()));
+    }
+
+    fn memory_command(&mut self, args: &str) {
+        let project = self.cwd.join(context::MEMORY_FILE);
+        let user = paths::user_dir().map(|d| d.join(context::MEMORY_FILE));
+        let mut words = settings::split_words(args);
+        let to_user = take_flag(&mut words, "--user");
+        match words.first().map(String::as_str) {
+            Some("add") if words.len() > 1 => {
+                let note = words[1..].join(" ");
+                let target = if to_user { user } else { Some(project) };
+                match target {
+                    Some(path) => self.append_memory(&note, &path),
+                    None => self.app.notice("no home directory, so there is no user ZARN.md"),
+                }
+            }
+            Some("add") => self.app.notice("usage: /memory add <note> [--user]"),
+            _ => {
+                let describe = |label: &str, path: Option<&Path>| match path {
+                    Some(path) => match std::fs::read_to_string(path) {
+                        Ok(text) => format!("{label}: {} ({} lines)", path.display(), text.lines().count()),
+                        Err(_) => format!("{label}: {} (not created yet)", path.display()),
+                    },
+                    None => format!("{label}: none"),
+                };
+                self.app.notice(format!(
+                    "{}\n{}\n/memory add <note> appends to the project file, --user to yours; /init writes the project file from the code",
+                    describe("project", Some(&project)),
+                    describe("user", user.as_deref())
+                ));
+            }
+        }
+    }
+
     fn command(&mut self, line: &str) -> bool {
         let Some((name, args)) = popup::split(line) else {
             return true;
@@ -3474,27 +3697,23 @@ impl Controller {
             "config" => {
                 self.open_panel(Tab::Providers);
             }
-            "skills" => match first {
-                Some("list") => {
-                    let cfg = self.cfg();
-                    let skills = context::discover_skills();
-                    self.app.notice(if skills.is_empty() {
-                        "no skills in ~/.config/zarn/skills or ./.zarn/skills".to_string()
-                    } else {
-                        skills
-                            .iter()
-                            .map(|s| {
-                                let state = if cfg.skill_enabled(&s.name) { "on " } else { "off" };
-                                format!("[{state}] {:<16} {:<8} {}", s.name, s.source.label(), s.description)
-                            })
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    });
+            "skills" => self.skills_command(&args),
+            "commands" => self.commands_command(&args),
+            "security-review" => self.submit(zarn_config::git::security_review_prompt(&args)),
+            "test" => self.submit(zarn_config::git::test_prompt(&args)),
+            "explain" => {
+                if args.trim().is_empty() {
+                    self.app.notice("usage: /explain <file, function or feature>");
+                } else {
+                    self.submit(zarn_config::git::explain_prompt(&args));
                 }
-                _ => {
-                    self.open_panel(Tab::Skills);
-                }
-            },
+            }
+            "add-dir" => self.add_dir(args.trim()),
+            "memory" => self.memory_command(&args),
+            "todos" => {
+                let todos = self.todos.lock().map(|t| t.clone()).unwrap_or_default();
+                self.app.notice(zarn_tools::todo::render(&todos));
+            }
             "permissions" => match first {
                 Some("edit") => {
                     self.open_panel(Tab::Permissions);
@@ -3593,7 +3812,7 @@ impl Controller {
                 self.app.notice(lines.join("\n"));
             }
             "mode" => match first {
-                Some("bypass") => self.ask_bypass(),
+                Some(name) if modes::needs_confirmation(name) => self.ask_mode(name),
                 Some(name) => self.set_mode(name, true),
                 None => {
                     self.modes = modes::load();
@@ -3850,6 +4069,12 @@ async fn run_git(ctx: &Ctx, gate: &dyn zarn_core::agent::ToolGate, command: &str
         Ok(out) => Err(out.content),
         Err(err) => Err(format!("{err:#}")),
     }
+}
+
+fn take_flag(words: &mut Vec<String>, flag: &str) -> bool {
+    let before = words.len();
+    words.retain(|w| w != flag);
+    words.len() != before
 }
 
 fn load_commands() -> Commands {

@@ -6,7 +6,7 @@
 │  /logout      remove a provider's API key                            │
 │  /permissions show rules, the mode overlay and what each tool resolve│
 │  /init        have the model inspect the repo and write ZARN.md      │
-│  /status      show profile, model, provider, cwd and session         │
+│  /memory      show the ZARN.md memory files or add a note            │
 ╰──────────────────────────────────────────────────────────────────────╯
 default mode  ·  m  ·  0 in / 0 out  ·  no rate configured
 ╭────────────────────────────────────────────────────────────────────────────────────────╮

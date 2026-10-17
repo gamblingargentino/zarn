@@ -58,8 +58,12 @@ Everything after that is done from inside zarn, with no hand-edited files:
 | `/provider list\|add\|switch` | manage providers |
 | `/model [name]`, `/models [refresh]` | pick a model; list every provider's models, limits and credits |
 | `/profile` (ctrl+p) | pick a profile for this session |
-| `/mode [name]` (shift+tab) | switch mode: default, plan, accept-edits, bypass or your own |
-| `/skills`, `/mcp`, `/agents`, `/permissions`, `/hooks`, `/plugins` | open the matching panel tab or summary |
+| `/mode [name]` (shift+tab) | switch mode: default, plan, accept-edits, bypass, full or your own |
+| `/skills list\|show\|new\|create\|install\|remove\|enable\|disable` | manage skills; `create` has the model write one with you, `install` takes a git URL, GitHub folder link, folder or `SKILL.md` link (`--project` for this project) |
+| `/commands [list\|new <name>]` | list or scaffold your own slash commands |
+| `/review`, `/security-review`, `/test`, `/explain <code>` | review the uncommitted changes, look for security problems, run and fix the tests, explain part of the code |
+| `/memory [add <note>]`, `/add-dir <path>`, `/todos` | ZARN.md memory files, another directory for this session, the model's todo list |
+| `/mcp`, `/agents`, `/permissions`, `/hooks`, `/plugins` | open the matching panel tab or summary |
 | `/doctor` | check config, keys, providers, MCP, modes, routing, caches, hooks, plugins, spend caps, sandbox, keybindings and the terminal |
 | `/context`, `/cost`, `/limits` | what fills the context window, what the session cost, spend caps |
 | `/compact`, `/clear`, `/rewind` (esc esc) | shrink, drop or rewind the conversation |
@@ -86,7 +90,9 @@ zarn providers list | test <name> | remove <name>
 zarn models [--provider NAME] [--refresh]
 zarn limits [--session 5] [--day 20]
 zarn modes list | show <name>
-zarn skills list
+zarn skills list | show <name> | new <name> [description] [--project]
+zarn skills install <git URL, GitHub folder link, folder or SKILL.md link> [--project]
+zarn skills remove <name> | enable <name> | disable <name>
 zarn mcp add files -- npx -y @modelcontextprotocol/server-filesystem .
 zarn hooks list
 zarn plugin add <dir or git URL> | list | approve <name> | revoke <name> | remove <name>
@@ -294,8 +300,11 @@ What the less obvious keys do:
 
 A mode bundles a permission overlay, a tool list and extra instructions:
 `default`, `plan` (read-only until you approve the plan), `accept-edits` (file
-edits without asking) and `bypass` (everything but deny rules; asks you to
-confirm). Your own modes are Markdown files with frontmatter in
+edits without asking), `bypass` (everything but deny rules; asks you to
+confirm) and `full` (full access: no prompts, any path, installs the tools and
+packages it needs for your user account without sudo, tests its own work and
+keeps going for up to 200 steps per message; asks you to confirm, like
+bypass). Your own modes are Markdown files with frontmatter in
 `.zarn/modes/` or `~/.config/zarn/modes/`:
 
 ```markdown
@@ -309,7 +318,9 @@ model: small-model
 Review the code you are pointed at and report problems with file and line.
 ```
 
-The active mode is `general.mode`; shift+tab cycles modes and `/mode` picks one.
+`max_steps: 100` raises how many model calls one message may take (32 by
+default). The active mode is `general.mode`; shift+tab cycles modes and `/mode`
+picks one.
 
 ## Models, profiles and routing
 
@@ -483,7 +494,7 @@ zarn --print "fix the lint" --allowed-tools "edit,bash(cargo clippy:*)" --max-tu
 | --- | --- |
 | `--output-format text\|json\|stream-json` | one object at the end, or one object per event per line; keys are redacted |
 | `--allowed-tools`, `--disallowed-tools` | rules to allow or deny; a bare name in `--disallowed-tools` also hides the tool |
-| `--mode`, `--permission-mode` | mode for the run; bypass needs `--permission-mode bypass` |
+| `--mode`, `--permission-mode` | mode for the run; bypass and full need `--permission-mode bypass` or `full` |
 | `--max-turns N` | stop after N model calls |
 | `--add-dir DIR` | another directory the file tools may touch (repeatable) |
 | `--system-prompt-file FILE`, `--append-system-prompt TEXT` | replace zarn's base instructions, or add to the end |

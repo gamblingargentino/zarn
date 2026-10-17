@@ -347,10 +347,12 @@ impl Runtime {
     }
 
     pub fn agent_config(&self) -> AgentConfig {
+        let defaults = AgentConfig::default();
         AgentConfig {
             model: self.model.clone(),
             parallel: self.parallel,
-            ..AgentConfig::default()
+            max_iterations: self.mode.max_iterations.unwrap_or(defaults.max_iterations),
+            ..defaults
         }
     }
 }

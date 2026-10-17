@@ -357,6 +357,34 @@ pub fn skills_list() -> Result<()> {
     Ok(())
 }
 
+pub async fn skills_install(source: &str, project: bool) -> Result<()> {
+    let place = zarn_config::skills::Place::from_flag(project);
+    let done = zarn_config::skills::install(&place.root()?, source).await?;
+    println!("{}", done.summary(place));
+    for (name, dir) in &done.added {
+        println!("  {name}: {}", dir.display());
+    }
+    Ok(())
+}
+
+pub fn skills_remove(name: &str) -> Result<()> {
+    let dir = zarn_config::skills::remove(name)?;
+    println!("removed {name} ({})", dir.display());
+    Ok(())
+}
+
+pub fn skills_show(name: &str) -> Result<()> {
+    println!("{}", zarn_config::skills::show(name)?);
+    Ok(())
+}
+
+pub fn skills_new(name: &str, description: &str, project: bool) -> Result<()> {
+    let place = zarn_config::skills::Place::from_flag(project);
+    let path = zarn_config::skills::scaffold(&place.root()?, name, description)?;
+    println!("created {}; fill in the steps, or run /skills create {name} in zarn to have the model write it", path.display());
+    Ok(())
+}
+
 pub fn skills_toggle(name: &str, enabled: bool) -> Result<()> {
     if !context::discover_skills().iter().any(|s| s.name == name) {
         bail!("no skill named {name}");

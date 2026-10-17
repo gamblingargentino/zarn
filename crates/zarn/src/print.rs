@@ -76,10 +76,12 @@ pub fn mode(cfg: &Config, args: &Args) -> Result<(modes::ModeDef, zarn_tools::pe
         Some(permission) => find(permission)?,
         None => mode.clone(),
     };
-    if policy.allow_all && args.permission_mode.as_deref() != Some("bypass") {
+    let confirmed = args.permission_mode.as_deref().is_some_and(modes::needs_confirmation);
+    if policy.allow_all && !confirmed {
         bail!(
-            "--print will not run in bypass mode unless you pass --permission-mode bypass. {}",
-            modes::BYPASS_RISK
+            "--print will not run in {0} mode unless you pass --permission-mode {0}. {1}",
+            if mode.name == "full" { "full" } else { "bypass" },
+            modes::risk(&mode.name)
         );
     }
     Ok((mode, modes::overlay(&policy)))

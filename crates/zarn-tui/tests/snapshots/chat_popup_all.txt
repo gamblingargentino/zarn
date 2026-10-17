@@ -1,12 +1,12 @@
 ╭──────────────────────────────────────────────────────────────────────╮
-│› /help          list the commands                                    │
-│  /clear         drop the conversation and start over                 │
-│  /compact       summarize the conversation to free context           │
-│  /attach-output add the last !command output to your next message    │
-│  /rewind        undo the file changes and messages of recent turns (e│
-│  /cost          show token usage and cost for this session           │
-│  /context       show what fills the context window                   │
-│  /limits        show or set the spend caps                           │
+│› /help            list the commands                                  │
+│  /clear           drop the conversation and start over               │
+│  /compact         summarize the conversation to free context         │
+│  /attach-output   add the last !command output to your next message  │
+│  /rewind          undo the file changes and messages of recent turns │
+│  /cost            show token usage and cost for this session         │
+│  /context         show what fills the context window                 │
+│  /limits          show or set the spend caps                         │
 ╰──────────────────────────────────────────────────────────────────────╯
 default mode  ·  m  ·  0 in / 0 out  ·  no rate configured
 ╭────────────────────────────────────────────────────────────────────────────────────────╮

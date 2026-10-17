@@ -19,6 +19,7 @@ pub mod refs;
 pub mod runtime;
 pub mod schedule;
 pub mod secrets;
+pub mod skills;
 pub mod spend;
 pub mod titles;
 pub mod webkeys;

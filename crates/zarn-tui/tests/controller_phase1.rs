@@ -90,7 +90,7 @@ async fn mode_with_no_argument_opens_a_picker() {
     match &c.app().overlay {
         Some(Overlay::Pick(picker, _)) => {
             let values: Vec<&str> = picker.choices.iter().map(|c| c.value.as_str()).collect();
-            assert_eq!(values, vec!["default", "plan", "accept-edits", "bypass"]);
+            assert_eq!(values, vec!["default", "plan", "accept-edits", "bypass", "full"]);
         }
         _ => panic!("expected the mode picker"),
     }

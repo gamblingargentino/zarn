@@ -1740,7 +1740,7 @@ impl Panel {
                 self.saved(format!("role {role} now uses {provider} · {value}"), result)
             }
             PickFor::ActiveMode => {
-                if value != "bypass" {
+                if !zarn_config::modes::needs_confirmation(&value) {
                     let result = ops::set_general(&mut self.layers, GeneralField::Mode, |g| {
                         g.mode = Some(value.clone())
                     });

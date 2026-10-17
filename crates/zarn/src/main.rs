@@ -108,6 +108,12 @@ async fn run_command(command: &Command) -> Result<()> {
             None | Some(SkillsAction::List) => commands::skills_list(),
             Some(SkillsAction::Enable { name }) => commands::skills_toggle(name, true),
             Some(SkillsAction::Disable { name }) => commands::skills_toggle(name, false),
+            Some(SkillsAction::Install { source, project }) => commands::skills_install(source, *project).await,
+            Some(SkillsAction::Remove { name }) => commands::skills_remove(name),
+            Some(SkillsAction::Show { name }) => commands::skills_show(name),
+            Some(SkillsAction::New { name, description, project }) => {
+                commands::skills_new(name, &description.join(" "), *project)
+            }
         },
         Command::Mcp { action } => match action {
             None => commands::mcp_list(false).await,

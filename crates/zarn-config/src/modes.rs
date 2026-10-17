@@ -5,10 +5,26 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use zarn_tools::permissions::{Overlay, Policy};
 
-pub const BUILTIN_NAMES: [&str; 4] = ["default", "plan", "accept-edits", "bypass"];
-pub const CYCLE_SKIPS: [&str; 1] = ["bypass"];
+pub const BUILTIN_NAMES: [&str; 5] = ["default", "plan", "accept-edits", "bypass", "full"];
+pub const CYCLE_SKIPS: [&str; 2] = ["bypass", "full"];
+pub const FULL_ITERATIONS: usize = 200;
 pub const PLAN_PROMPT: &str = "You are in plan mode. Investigate with read-only tools only, then present a concrete, step-by-step plan by calling exit_plan. Do not edit files or run commands until the user approves the plan.";
 pub const BYPASS_RISK: &str = "bypass mode runs every tool, including shell commands and file writes, without asking. Only rules you set to deny still apply.";
+pub const FULL_RISK: &str = "full access mode runs every tool on any path without asking, installs the tools and packages it needs for your user account, and keeps going for up to 200 steps per message. Only rules you set to deny still apply.";
+pub const FULL_PROMPT: &str = "You are in full access mode. Every tool runs without asking, on any path this user can reach, not only the working directory. Work on your own until the task is finished and verified:
+- If a tool, compiler, runtime, library or package you need is missing, install it for the current user: the language's package manager (pip or uv in a virtual environment or with --user, npm or pnpm, cargo, go install, gem --user-install), or a package manager that needs no administrator rights (brew, scoop, winget for the user). Use non-interactive flags such as -y and --yes. Do not use sudo or other privilege escalation; when something can only be installed system-wide, say exactly what to install and how, then carry on with what you can do.
+- Commands get no input, so never run anything that waits for a keypress, a password or an editor.
+- Give long installs and builds a larger timeout (for example 900 seconds), and start servers, watchers and other long-running processes with background set to true.
+- Check your work by building, running and testing it; when something fails, read the error, fix it and try again before you report.
+- Do not stop to ask before routine steps. Ask only when the request is genuinely ambiguous, or before destroying data the user did not ask you to touch, such as deleting files outside the project, force-pushing, or dropping a database.";
+
+pub fn needs_confirmation(name: &str) -> bool {
+    CYCLE_SKIPS.contains(&name)
+}
+
+pub fn risk(name: &str) -> &'static str {
+    if name == "full" { FULL_RISK } else { BYPASS_RISK }
+}
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ModeDef {
@@ -21,6 +37,7 @@ pub struct ModeDef {
     pub prompt: String,
     pub allow_all: bool,
     pub safe_only: bool,
+    pub max_iterations: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -118,6 +135,12 @@ pub fn builtin(name: &str) -> Option<ModeDef> {
             allow_all: true,
             ..def("every tool runs without asking")
         }),
+        "full" => Some(ModeDef {
+            allow_all: true,
+            prompt: FULL_PROMPT.to_string(),
+            max_iterations: Some(FULL_ITERATIONS),
+            ..def("full access: no prompts, any path, installs what it needs and works until the task is done")
+        }),
         _ => None,
     }
 }
@@ -194,6 +217,12 @@ pub fn parse(source: &str) -> Result<ModeDef, String> {
             "tools" => def.tools = list(value),
             "profile" => def.profile = Some(value.to_string()).filter(|v| !v.is_empty()),
             "model" => def.model = Some(value.to_string()).filter(|v| !v.is_empty()),
+            "max_steps" => {
+                let steps: usize = value
+                    .parse()
+                    .map_err(|_| format!("max_steps '{value}' is not a whole number"))?;
+                def.max_iterations = Some(steps.max(1));
+            }
             "permissions" => {
                 for entry in list(value) {
                     let Some((tool, policy)) = entry.split_once('=') else {
@@ -253,6 +282,9 @@ pub fn render(def: &ModeDef) -> String {
     }
     if let Some(model) = &def.model {
         out.push_str(&format!("model: {model}\n"));
+    }
+    if let Some(steps) = def.max_iterations {
+        out.push_str(&format!("max_steps: {steps}\n"));
     }
     out.push_str("---\n\n");
     out.push_str(def.prompt.trim());
@@ -458,7 +490,7 @@ mod tests {
         let loaded = load_from(Some(user.path()), project.path());
         assert_eq!(
             loaded.names(),
-            vec!["default", "plan", "accept-edits", "bypass", "docs", "review"]
+            vec!["default", "plan", "accept-edits", "bypass", "full", "docs", "review"]
         );
         let review = loaded.find("review").unwrap();
         assert_eq!(review.def.description, "project review");

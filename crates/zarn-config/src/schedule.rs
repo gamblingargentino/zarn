@@ -77,8 +77,8 @@ impl Schedules {
         if prompt.trim().is_empty() {
             bail!("a scheduled prompt cannot be empty");
         }
-        if mode.as_deref() == Some("bypass") {
-            bail!("scheduled runs are headless and cannot use bypass mode");
+        if let Some(mode) = mode.as_deref().filter(|m| crate::modes::needs_confirmation(m)) {
+            bail!("scheduled runs are headless and cannot use {mode} mode");
         }
         let mut all = self.list();
         let next = all
