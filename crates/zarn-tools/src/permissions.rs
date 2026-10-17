@@ -274,6 +274,7 @@ pub struct Permissions {
     session_rules: Mutex<Vec<Rule>>,
     turn_rules: Mutex<Vec<Rule>>,
     boundary: RwLock<Option<Vec<PathBuf>>>,
+    granted: RwLock<Vec<PathBuf>>,
     cwd: RwLock<PathBuf>,
     safe: RwLock<Option<Vec<String>>>,
     configured: RwLock<HashMap<String, Policy>>,
@@ -295,6 +296,7 @@ impl Permissions {
             session_rules: Mutex::new(Vec::new()),
             turn_rules: Mutex::new(Vec::new()),
             boundary: RwLock::new(None),
+            granted: RwLock::new(Vec::new()),
             cwd: RwLock::new(PathBuf::from(".")),
             safe: RwLock::new(Some(crate::safe_shell::defaults())),
             configured: RwLock::new(HashMap::new()),
@@ -428,8 +430,41 @@ impl Permissions {
         let cwd = self.cwd();
         let absolute = if Path::new(path).is_absolute() { PathBuf::from(path) } else { cwd.join(path) };
         let text = absolute.to_string_lossy().to_string();
-        let inside = roots.iter().any(|root| relative(&text, root).is_some());
+        let granted = self.granted.read().map(|g| g.clone()).unwrap_or_default();
+        let inside = roots.iter().chain(granted.iter()).any(|root| relative(&text, root).is_some());
         (!inside).then(|| path.to_string())
+    }
+
+    pub fn grant_dir(&self, dir: PathBuf) {
+        let Ok(mut granted) = self.granted.write() else {
+            return;
+        };
+        if let Ok(real) = dir.canonicalize()
+            && !granted.contains(&real)
+        {
+            granted.push(real);
+        }
+        if !granted.contains(&dir) {
+            granted.push(dir);
+        }
+    }
+
+    pub fn granted(&self) -> Vec<PathBuf> {
+        self.granted.read().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    fn grant_outside(&self, name: &str, args: &Value) {
+        let Some(path) = arg_path(args) else {
+            return;
+        };
+        let cwd = self.cwd();
+        let absolute = if Path::new(path).is_absolute() { PathBuf::from(path) } else { cwd.join(path) };
+        let folder = if FILE_TOOLS.contains(&name) && !absolute.is_dir() {
+            absolute.parent().map(Path::to_path_buf).unwrap_or(absolute)
+        } else {
+            absolute
+        };
+        self.grant_dir(folder);
     }
 
     pub fn set_turn_rules(&self, rules: Vec<Rule>) {
@@ -492,7 +527,7 @@ impl Permissions {
         if !overlay.allow_all
             && let Some(path) = self.outside(name, args)
         {
-            return (Policy::Ask, format!("{path} is outside the working directory; allow it with --add-dir"));
+            return (Policy::Ask, format!("{path} is outside the working directory; always allows its folder for this session, /add-dir adds one up front"));
         }
         if let Some(rule) = self.rule_hit(Policy::Ask, name, args)
             && !overlay.allow_all
@@ -593,6 +628,15 @@ impl ToolGate for Permissions {
             }
             Policy::Ask => match self.prompt.ask(name, risk, args).await {
                 Answer::Once => GateDecision::Allow,
+                Answer::Always if why.contains("outside the working directory") => {
+                    self.grant_outside(name, args);
+                    self.allow_for_session(name);
+                    GateDecision::Allow
+                }
+                Answer::Pattern(_) if why.contains("outside the working directory") => {
+                    self.grant_outside(name, args);
+                    GateDecision::Allow
+                }
                 Answer::Always => {
                     self.allow_for_session(name);
                     GateDecision::Allow
@@ -623,6 +667,39 @@ mod tests {
         async fn ask(&self, _tool: &str, _risk: Risk, _args: &Value) -> Answer {
             Answer::Always
         }
+    }
+
+    struct CountingYes(std::sync::atomic::AtomicUsize);
+
+    #[async_trait]
+    impl PermissionPrompt for CountingYes {
+        async fn ask(&self, _tool: &str, _risk: Risk, _args: &Value) -> Answer {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Answer::Always
+        }
+    }
+
+    #[tokio::test]
+    async fn always_for_an_outside_path_allows_its_folder_for_the_session() {
+        let project = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let prompt = Arc::new(CountingYes(Default::default()));
+        let perms = Permissions::new(prompt.clone());
+        perms.set_cwd(project.path().to_path_buf());
+        perms.set_boundary(Some(Vec::new()));
+        let asked = || prompt.0.load(std::sync::atomic::Ordering::SeqCst);
+        let read = |path: std::path::PathBuf| serde_json::json!({ "path": path.display().to_string() });
+
+        assert_eq!(perms.check("read", Risk::Safe, &read(project.path().join("in.txt"))).await, GateDecision::Allow);
+        assert_eq!(asked(), 0, "inside the project nothing is asked");
+        assert_eq!(perms.check("read", Risk::Safe, &read(elsewhere.path().join("a.txt"))).await, GateDecision::Allow);
+        assert_eq!(asked(), 1);
+        assert_eq!(perms.check("read", Risk::Safe, &read(elsewhere.path().join("deep/b.txt"))).await, GateDecision::Allow);
+        assert_eq!(asked(), 1, "the approved folder is not asked about again");
+        assert_eq!(perms.check("read", Risk::Safe, &read(other.path().join("c.txt"))).await, GateDecision::Allow);
+        assert_eq!(asked(), 2, "a different folder still asks");
+        assert!(perms.granted().iter().any(|g| g.starts_with(elsewhere.path()) || elsewhere.path().canonicalize().is_ok_and(|r| g == &r)));
     }
 
     #[test]

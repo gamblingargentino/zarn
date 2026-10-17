@@ -3454,7 +3454,13 @@ impl Controller {
 
     fn add_dir(&mut self, path: &str) {
         if path.is_empty() {
-            let dirs: Vec<String> = self.options.add_dirs.iter().map(|d| d.display().to_string()).collect();
+            let mut dirs: Vec<String> = self.options.add_dirs.iter().map(|d| d.display().to_string()).collect();
+            for granted in self.gate.granted() {
+                let shown = granted.display().to_string();
+                if !dirs.contains(&shown) && granted.is_absolute() && granted.canonicalize().ok().as_ref() == Some(&granted) {
+                    dirs.push(format!("{shown} (approved this session)"));
+                }
+            }
             return self.app.notice(if dirs.is_empty() {
                 "usage: /add-dir <path>; file tools then work there without asking about the path".to_string()
             } else {
