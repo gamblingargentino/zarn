@@ -19,6 +19,20 @@ scripts/release.ps1         # Windows PowerShell
 
 The result is in `target/dist/release/`.
 
+For a Windows installer (`zarn-setup-<version>.exe`, with the zarn icon, an
+optional PATH entry, Start Menu and desktop shortcuts, and an uninstaller),
+install [Inno Setup 6](https://jrsoftware.org/isdl.php) once
+(`winget install JRSoftware.InnoSetup`), then run from PowerShell:
+
+```powershell
+scripts\installer.ps1
+```
+
+It builds the release binary with the icon embedded in `zarn.exe`, then writes
+the installer to `target\dist\installer\`. The icon lives in `assets/icon/`;
+`python3 assets/icon/make_icon.py` redraws it. The embedding needs the MSVC
+Rust toolchain (the default on Windows).
+
 ## First run
 
 zarn ships with no provider and no key. The first time you run `zarn` it opens
