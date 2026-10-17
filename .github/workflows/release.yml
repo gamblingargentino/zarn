@@ -96,5 +96,6 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/* --clobber
           else
-            gh release create "$TAG" dist/* --title "zarn ${TAG#v}" --generate-notes
+            gh release create "$TAG" dist/* --title "zarn ${TAG#v}" --generate-notes \
+              --notes "**Windows:** download and run \`zarn-setup-${TAG#v}.exe\`. macOS and Linux: download the \`zarn-<target>\` binary. Update later with \`zarn update\`."
           fi

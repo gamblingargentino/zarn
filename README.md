@@ -4,20 +4,25 @@ An agent CLI for the terminal. Bring your own model provider and API key.
 
 ## Install
 
+**Windows:** download `zarn-setup-<version>.exe` from the
+[latest release](https://github.com/gamblingargentino/zarn/releases/latest)
+and run it. It installs zarn with its icon, adds it to your PATH (optional),
+creates Start Menu and desktop shortcuts, and registers an uninstaller. No admin
+rights are needed. Then open a new terminal and run `zarn`.
+
+**macOS and Linux:** download `zarn-<target>` from the same release, make it
+executable and put it on your PATH:
+
+```sh
+chmod +x zarn-x86_64-unknown-linux-gnu
+mv zarn-x86_64-unknown-linux-gnu ~/.local/bin/zarn
+```
+
+**From source:**
+
 ```sh
 cargo install --path crates/zarn
 ```
-
-For a binary to hand to other people, build it with the release script. It
-remaps the build machine's paths (home directory, cargo registry, checkout)
-out of the binary:
-
-```sh
-scripts/release.sh          # macOS, Linux, Git Bash
-scripts/release.ps1         # Windows PowerShell
-```
-
-The result is in `target/dist/release/`.
 
 ### Updates
 
@@ -29,20 +34,23 @@ when it starts and tells you in the chat; turn that off with
 `general.update_check = false` or `ZARN_NO_UPDATE_CHECK=1`. A private fork can
 set `ZARN_UPDATE_REPO=owner/repo` and `GITHUB_TOKEN`.
 
-To publish a release, bump `version` in `[workspace.package]` in `Cargo.toml`,
-commit, then tag and push it:
+### Publishing a release
+
+Bump `version` in `[workspace.package]` in `Cargo.toml`, commit, then tag and
+push the tag (run the two commands separately in Windows PowerShell):
 
 ```sh
-git tag v0.2.0 && git push origin v0.2.0
+git tag -a v0.2.0 -m "zarn 0.2.0"
+git push origin v0.2.0
 ```
 
-The `release` workflow builds Windows, Linux and macOS binaries plus the
-Windows installer and publishes them with a `SHA256SUMS` file; that release
-is what `zarn update` installs.
+The `release` workflow builds the Windows installer, the Windows, Linux and
+macOS binaries, and a `SHA256SUMS` file, and attaches them to the release.
+`zarn update` installs from that release.
 
-For a Windows installer (`zarn-setup-<version>.exe`, with the zarn icon, an
-optional PATH entry, Start Menu and desktop shortcuts, and an uninstaller),
-install [Inno Setup 6](https://jrsoftware.org/isdl.php) once
+### Building the installer yourself
+
+Install [Inno Setup 6](https://jrsoftware.org/isdl.php) once
 (`winget install JRSoftware.InnoSetup`), then run from PowerShell:
 
 ```powershell
@@ -50,9 +58,13 @@ scripts\installer.ps1
 ```
 
 It builds the release binary with the icon embedded in `zarn.exe`, then writes
-the installer to `target\dist\installer\`. The icon lives in `assets/icon/`;
-`python3 assets/icon/make_icon.py` redraws it. The embedding needs the MSVC
-Rust toolchain (the default on Windows).
+`zarn-setup-<version>.exe` to `target\dist\installer\`. The icon lives in
+`assets/icon/`; `python3 assets/icon/make_icon.py` redraws it. The embedding
+needs the MSVC Rust toolchain (the default on Windows).
+
+To build binaries without the installer, `scripts/release.sh` (macOS, Linux,
+Git Bash) or `scripts/release.ps1` (PowerShell) writes them to
+`target/dist/release/` with the build machine's paths remapped out.
 
 ## First run
 
