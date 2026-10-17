@@ -20,6 +20,7 @@ pub mod runtime;
 pub mod schedule;
 pub mod secrets;
 pub mod skills;
+pub mod styles;
 pub mod spend;
 pub mod titles;
 pub mod update;
@@ -84,6 +85,8 @@ pub struct General {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub update_check: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_style: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_parallel_agents: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lazy_tools_threshold: Option<u32>,
@@ -108,6 +111,7 @@ impl General {
         self.status_line = self.status_line.take().or(other.status_line);
         self.mouse = self.mouse.or(other.mouse);
         self.update_check = self.update_check.or(other.update_check);
+        self.output_style = self.output_style.take().or(other.output_style);
         self.max_parallel_agents = self.max_parallel_agents.or(other.max_parallel_agents);
         self.lazy_tools_threshold = self.lazy_tools_threshold.or(other.lazy_tools_threshold);
     }

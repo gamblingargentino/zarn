@@ -184,6 +184,7 @@ impl Layers {
             GeneralField::Notifications => g.notifications.is_some(),
             GeneralField::StatusLine => g.status_line.is_some(),
             GeneralField::Mouse => g.mouse.is_some(),
+            GeneralField::OutputStyle => g.output_style.is_some(),
             }
         })
     }
@@ -217,6 +218,7 @@ pub enum GeneralField {
     Notifications,
     StatusLine,
     Mouse,
+    OutputStyle,
 }
 
 #[cfg(test)]

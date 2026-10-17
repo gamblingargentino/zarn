@@ -269,11 +269,12 @@ pub struct SystemParts {
     pub memory: String,
     pub skills: String,
     pub mode: String,
+    pub style: String,
 }
 
 impl SystemParts {
     pub fn join(&self) -> String {
-        [&self.base, &self.memory, &self.skills, &self.mode]
+        [&self.base, &self.memory, &self.skills, &self.mode, &self.style]
             .iter()
             .filter(|p| !p.is_empty())
             .map(|p| p.as_str())
@@ -299,6 +300,7 @@ pub fn system_parts_in(cwd: &Path, user_dir: Option<&Path>, skills: &[Skill], bu
         memory,
         skills: skill::index(skills),
         mode: String::new(),
+        style: String::new(),
     }
 }
 
@@ -331,7 +333,7 @@ pub fn breakdown(
         .cloned()
         .collect();
     vec![
-        ("system prompt", text(&parts.base) + text(&parts.mode)),
+        ("system prompt", text(&parts.base) + text(&parts.mode) + text(&parts.style)),
         ("memory", text(&parts.memory)),
         ("skills index", text(&parts.skills)),
         ("tools", if tools.is_empty() { 0 } else { text(&tool_text) }),
@@ -471,6 +473,7 @@ mod tests {
             memory: "m".repeat(40),
             skills: String::new(),
             mode: String::new(),
+            style: String::new(),
         };
         let count = |msgs: &[zarn_core::types::Message]| -> u32 {
             msgs.iter().map(|m| m.text().len() as u32 / 4).sum()

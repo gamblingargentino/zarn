@@ -422,6 +422,7 @@ pub fn assemble(
     let budget = cfg.general.context_budget.unwrap_or(DEFAULT_BUDGET);
     let mut parts = context::system_parts(cwd, &skills, budget);
     parts.mode = modes::prompt_section(&mode);
+    parts.style = crate::styles::section(&crate::styles::load(), cfg.general.output_style.as_deref());
     let system = parts.join();
 
     let options = cfg.general.tool_options();

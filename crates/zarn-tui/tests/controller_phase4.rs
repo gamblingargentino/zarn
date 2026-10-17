@@ -220,3 +220,32 @@ async fn diff_shows_uncommitted_changes_without_the_model() {
     turn(&mut c, "look at this").await;
     assert!(text_of(&chat_bodies(&mock).await[0]).contains("+after"));
 }
+
+#[tokio::test]
+async fn style_changes_the_system_prompt_and_default_removes_it() {
+    let mock = echo_server("ok").await;
+    let env = Env::new(&provider_config(&mock.uri(), "")).await;
+    let styles = env.project().join(".zarn").join("styles");
+    std::fs::create_dir_all(&styles).unwrap();
+    std::fs::write(styles.join("haiku.md"), "---\ndescription: answers in haiku\n---\nAnswer every question as a haiku.").unwrap();
+    let mut c = env.controller();
+    let system = |body: &Value| body["messages"][0]["content"].as_str().unwrap_or_default().to_string();
+
+    c.type_line("/style explanatory");
+    assert!(notices(&c).last().unwrap().contains("output style is now explanatory"));
+    turn(&mut c, "first").await;
+    assert!(system(&chat_bodies(&mock).await[0]).contains("Output style: explanatory."));
+
+    c.type_line("/style haiku");
+    turn(&mut c, "second").await;
+    let second = system(&chat_bodies(&mock).await[1]);
+    assert!(second.contains("Answer every question as a haiku.") && !second.contains("Output style: explanatory."));
+
+    c.type_line("/style nope");
+    assert!(notices(&c).last().unwrap().contains("no style named 'nope'"));
+
+    c.type_line("/style default");
+    turn(&mut c, "third").await;
+    let third = system(&chat_bodies(&mock).await[2]);
+    assert!(!third.contains("haiku") && !third.contains("Output style"), "{third}");
+}

@@ -109,6 +109,7 @@ Everything after that is done from inside zarn, with no hand-edited files:
 | `/skills list\|show\|new\|create\|install\|remove\|enable\|disable` | manage skills; `create` has the model write one with you, `install` takes a git URL, GitHub folder link, folder or `SKILL.md` link (`--project` for this project) |
 | `/commands [list\|new <name>]` | list or scaffold your own slash commands |
 | `/diff [path]` | show the uncommitted changes, untracked files included, colored and folded; nothing is sent to the model (`/attach-output` adds it to your next message) |
+| `/style [name]` | how replies are written: `default`, `explanatory`, `learning`, `concise` or your own |
 | `/review`, `/security-review`, `/test`, `/explain <code>` | review the uncommitted changes, look for security problems, run and fix the tests, explain part of the code |
 | `/memory [add <note>]`, `/add-dir <path>`, `/todos` | ZARN.md memory files, another directory for this session, the model's todo list |
 | `/mcp`, `/agents`, `/permissions`, `/hooks`, `/plugins` | open the matching panel tab or summary |
@@ -329,6 +330,7 @@ What the less obvious keys do:
 | `general.theme` | `dark`, `light`, `colorblind` or `auto` (reads `COLORFGBG`, falls back to dark) |
 | `general.status_line` | template with `{model}`, `{mode}`, `{profile}`, `{context}`, `{cost}`, `{cwd}`, `{branch}`; `{{` and `}}` are literal braces |
 | `general.notifications` | bell and window title after turns over 10 seconds and on permission prompts while the terminal may be unfocused; never written when stdout is not a terminal |
+| `general.output_style` | the output style added to the system prompt (`explanatory`, `learning`, `concise` or a file in `styles/`); `/style` sets it |
 | `general.update_check` | on by default: look for a new zarn release at most once a day at startup and say so in the chat; `zarn update` or `/update` installs it |
 | `general.mouse` | on by default: the wheel scrolls the conversation and menus take clicks; native text selection needs shift (option in macOS Terminal). Turn it off to select without shift; the wheel then sends arrow keys in most terminals (see `/doctor`) |
 | `general.context_budget` | token budget for all `ZARN.md` text, including nested files and imports |
@@ -431,6 +433,31 @@ conversation to before any earlier turn.
 - ctrl+o opens a transcript with every tool output in full; ctrl+s searches
   the scrollback, `n` and `N` move between hits.
 - The spinner shows elapsed time and an estimate of tokens streamed.
+
+## Output styles
+
+A style changes how zarn writes, not what it may do; it works with any mode.
+`/style` opens a picker, `/style <name>` switches, and the choice is saved as
+`general.output_style`.
+
+| Style | What it does |
+|---|---|
+| `default` | zarn's normal replies |
+| `explanatory` | adds short "Insight" notes on why it chose an approach and the patterns in your code |
+| `learning` | does the routine work but leaves small, meaningful pieces for you to write, marked `TODO(human)` |
+| `concise` | short answers with no preamble or recap |
+
+Your own styles are Markdown files in `.zarn/styles/<name>.md` (this project)
+or `~/.config/zarn/styles/<name>.md` (everywhere). The file name is the style's
+name and the body is added to the system prompt; an optional frontmatter
+`description:` shows in the picker:
+
+```markdown
+---
+description: answers for a reviewer in a hurry
+---
+Lead with the verdict in one sentence, then the evidence as a short list.
+```
 
 ## Agents
 

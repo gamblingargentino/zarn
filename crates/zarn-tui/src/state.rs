@@ -171,6 +171,7 @@ impl Status {
 pub enum ChatPick {
     Model,
     Theme,
+    Style,
     SwitchProvider,
     Resume,
     Login,

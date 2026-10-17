@@ -901,6 +901,10 @@ impl Controller {
             args.insert(key.into(), skill_names.clone());
         }
         args.insert(
+            "style".into(),
+            zarn_config::styles::load().into_iter().map(|s| (s.name, s.description)).collect(),
+        );
+        args.insert(
             "theme".into(),
             brand::ACCENTS.iter().map(|(n, _)| (n.to_string(), "accent color".to_string())).collect(),
         );
@@ -2913,6 +2917,7 @@ impl Controller {
         match purpose {
             ChatPick::Model => self.set_model(&value),
             ChatPick::Theme => self.set_theme(&value),
+            ChatPick::Style => self.set_style(&value),
             ChatPick::SwitchProvider => self.switch_provider(&value),
             ChatPick::Resume => self.resume(Path::new(&value)),
             ChatPick::Login if value == "web" => {
@@ -3103,6 +3108,29 @@ impl Controller {
                 self.options.model = None;
                 self.rebuild();
                 self.app.notice(format!("model for profile {profile} is now {model}"));
+            }
+            Err(err) => self.app.notice(format!("{err:#}")),
+        }
+    }
+
+    fn set_style(&mut self, name: &str) {
+        let styles = zarn_config::styles::load();
+        let Some(style) = zarn_config::styles::find(&styles, name) else {
+            self.app.notice(format!(
+                "no style named '{name}'; pick one of {}, or add .zarn/styles/{name}.md",
+                styles.iter().map(|s| s.name.as_str()).collect::<Vec<_>>().join(", ")
+            ));
+            return;
+        };
+        let chosen = (style.name != zarn_config::styles::DEFAULT).then(|| style.name.clone());
+        let result = match self.layers() {
+            Some(layers) => ops::set_general(layers, GeneralField::OutputStyle, |g| g.output_style = chosen),
+            None => return,
+        };
+        match result {
+            Ok(()) => {
+                self.rebuild();
+                self.app.notice(format!("output style is now {} ({})", style.name, style.description));
             }
             Err(err) => self.app.notice(format!("{err:#}")),
         }
@@ -3900,6 +3928,18 @@ impl Controller {
                         .collect();
                     let picker = Picker::new("Mode", choices).select_value(&self.mode);
                     self.app.overlay = Some(Overlay::Pick(picker, ChatPick::Mode));
+                }
+            },
+            "style" => match first {
+                Some(name) => self.set_style(name),
+                None => {
+                    let current = self.cfg().general.output_style.clone().unwrap_or_else(|| "default".into());
+                    let choices = zarn_config::styles::load()
+                        .into_iter()
+                        .map(|s| Choice::new(s.name.clone(), s.name).with_detail(s.description))
+                        .collect();
+                    let picker = Picker::new("Output style", choices).select_value(&current);
+                    self.app.overlay = Some(Overlay::Pick(picker, ChatPick::Style));
                 }
             },
             "theme" => match first {

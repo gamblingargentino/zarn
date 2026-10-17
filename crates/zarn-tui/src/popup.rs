@@ -70,6 +70,7 @@ pub const BUILTINS: &[(&str, &str, &str)] = &[
     ("update", "[check]", "install the latest zarn release, or just check for one"),
     ("status", "", "show profile, model, provider, cwd and session"),
     ("theme", "[dark|light|colorblind|auto|color]", "pick the theme or the accent color"),
+    ("style", "[name]", "how replies are written: default, explanatory, learning, concise or your own"),
     ("quit", "", "exit zarn"),
 ];
 
