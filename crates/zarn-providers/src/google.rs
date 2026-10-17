@@ -360,6 +360,10 @@ impl UsageMetadata {
     }
 }
 
+pub const MALFORMED_CALL: &str =
+    "Gemini produced a malformed tool call and stopped; ask again, or try another Gemini model";
+pub const UNOFFERED_CALL: &str = "Gemini called a tool that was not offered and stopped; ask again";
+
 enum Finish {
     Stop(StopReason),
     Failed(&'static str),
@@ -371,12 +375,8 @@ fn finish(reason: &str) -> Finish {
         "SAFETY" | "RECITATION" | "BLOCKLIST" | "PROHIBITED_CONTENT" | "SPII" | "IMAGE_SAFETY" => {
             Finish::Stop(StopReason::Refusal)
         }
-        "MALFORMED_FUNCTION_CALL" => Finish::Failed(
-            "Gemini produced a malformed tool call and stopped; ask again, or try another Gemini model",
-        ),
-        "UNEXPECTED_TOOL_CALL" => Finish::Failed(
-            "Gemini called a tool that was not offered and stopped; ask again",
-        ),
+        "MALFORMED_FUNCTION_CALL" => Finish::Failed(MALFORMED_CALL),
+        "UNEXPECTED_TOOL_CALL" => Finish::Failed(UNOFFERED_CALL),
         _ => Finish::Stop(StopReason::EndTurn),
     }
 }

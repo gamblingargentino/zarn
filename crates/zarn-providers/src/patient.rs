@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use futures::StreamExt;
 use futures::stream::BoxStream;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -11,6 +12,11 @@ const BUSY_WAITS: [Duration; 2] = [Duration::from_secs(2), Duration::from_secs(5
 
 pub fn busy(message: &str) -> bool {
     ["(HTTP 502)", "(HTTP 503)", "(HTTP 529)"].iter().any(|code| message.ends_with(code))
+}
+
+pub fn glitch(event: &Event) -> bool {
+    matches!(event, Event::Error(ProviderError::Other(m))
+        if m == crate::google::MALFORMED_CALL || m == crate::google::UNOFFERED_CALL)
 }
 
 pub type WaitSink = Arc<dyn Fn(String) + Send + Sync>;
@@ -119,8 +125,27 @@ fn explain(message: String, wait: Option<Duration>, max_wait: Duration) -> Provi
 impl Provider for Patient {
     async fn stream(&self, req: Request) -> Result<BoxStream<'static, Event>, ProviderError> {
         let mut attempt = 1;
+        let mut spent = Vec::new();
         loop {
             match self.inner.stream(req.clone()).await {
+                Ok(mut stream) => {
+                    let first = loop {
+                        match stream.next().await {
+                            Some(usage @ Event::Usage { .. }) => spent.push(usage),
+                            other => break other,
+                        }
+                    };
+                    match first {
+                        Some(event) if glitch(&event) && attempt < ATTEMPTS => {
+                            tell("the model sent a broken tool call; asking again".into());
+                            attempt += 1;
+                        }
+                        first => {
+                            let head = futures::stream::iter(spent.into_iter().chain(first));
+                            return Ok(head.chain(stream).boxed());
+                        }
+                    }
+                }
                 Err(ProviderError::RateLimit(message)) => {
                     let asked = retry_after(&message);
                     let wait = asked.filter(|w| *w <= self.max_wait && !no_quota(&message));
@@ -142,7 +167,7 @@ impl Provider for Patient {
                     tokio::time::sleep(wait.min(self.max_wait)).await;
                     attempt += 1;
                 }
-                other => return other,
+                Err(other) => return Err(other),
             }
         }
     }
@@ -159,7 +184,6 @@ impl Provider for Patient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use futures::StreamExt;
 
     #[test]
     fn reads_the_wait_from_each_providers_wording() {
@@ -260,5 +284,73 @@ mod tests {
         let provider = Patient::with_limit(inner.clone(), Duration::from_secs(5));
         assert!(provider.stream(Request::new("m", vec![])).await.is_err());
         assert_eq!(*inner.calls.lock().unwrap(), 3);
+    }
+
+    struct Glitchy {
+        broken: Mutex<usize>,
+        calls: Mutex<usize>,
+        speak_first: bool,
+    }
+
+    #[async_trait]
+    impl Provider for Glitchy {
+        async fn stream(&self, _req: Request) -> Result<BoxStream<'static, Event>, ProviderError> {
+            *self.calls.lock().unwrap() += 1;
+            let mut broken = self.broken.lock().unwrap();
+            let mut events = vec![Event::Usage { input: 10, output: 1, cached: 0 }];
+            if *broken > 0 {
+                *broken -= 1;
+                if self.speak_first {
+                    events.push(Event::TextDelta("partial".into()));
+                }
+                events.push(Event::Error(ProviderError::Other(crate::google::MALFORMED_CALL.into())));
+            } else {
+                events.push(Event::TextDelta("ok".into()));
+                events.push(Event::Done(zarn_core::types::StopReason::EndTurn));
+            }
+            Ok(futures::stream::iter(events).boxed())
+        }
+
+        fn caps(&self) -> Caps {
+            Caps::default()
+        }
+
+        fn count_tokens(&self, _msgs: &[Message]) -> Result<u32, ProviderError> {
+            Ok(0)
+        }
+    }
+
+    fn glitchy(broken: usize, speak_first: bool) -> Arc<Glitchy> {
+        Arc::new(Glitchy { broken: Mutex::new(broken), calls: Mutex::new(0), speak_first })
+    }
+
+    #[tokio::test]
+    async fn a_broken_tool_call_is_asked_again_and_its_usage_kept() {
+        let inner = glitchy(2, false);
+        let provider = Patient::wrap(inner.clone());
+        let events: Vec<Event> = provider.stream(Request::new("m", vec![])).await.unwrap().collect().await;
+        assert_eq!(*inner.calls.lock().unwrap(), 3);
+        assert_eq!(events.iter().filter(|e| matches!(e, Event::Usage { .. })).count(), 3);
+        assert!(events.contains(&Event::TextDelta("ok".into())));
+        assert!(!events.iter().any(glitch));
+    }
+
+    #[tokio::test]
+    async fn a_broken_tool_call_that_keeps_coming_is_reported() {
+        let inner = glitchy(5, false);
+        let provider = Patient::wrap(inner.clone());
+        let events: Vec<Event> = provider.stream(Request::new("m", vec![])).await.unwrap().collect().await;
+        assert_eq!(*inner.calls.lock().unwrap(), 3);
+        assert!(events.last().is_some_and(glitch));
+    }
+
+    #[tokio::test]
+    async fn a_broken_tool_call_after_text_is_not_repeated() {
+        let inner = glitchy(1, true);
+        let provider = Patient::wrap(inner.clone());
+        let events: Vec<Event> = provider.stream(Request::new("m", vec![])).await.unwrap().collect().await;
+        assert_eq!(*inner.calls.lock().unwrap(), 1);
+        assert_eq!(events[1], Event::TextDelta("partial".into()));
+        assert!(events.last().is_some_and(glitch));
     }
 }
