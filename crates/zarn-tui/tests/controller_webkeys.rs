@@ -118,7 +118,7 @@ async fn login_auto_recognises_the_key_checks_it_and_loads_the_models() {
     c.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
     wait_for(&mut c, Duration::from_secs(10), |c| notices(c).iter().any(|n| n.contains("models found"))).await;
     let said = notices(&c);
-    assert!(said.iter().any(|n| n.contains("claude: key saved to the") && n.contains("3 models found")), "{said:?}");
+    assert!(said.iter().any(|n| n.contains("claude: key saved to the") && n.contains("2 models found")), "{said:?}");
     assert!(env.store.has("claude", None).is_some());
     assert!(!screen(&c, 100, 30).join("\n").contains("sk-ant-test-key-not-real"));
     c.app_mut().set_input("/login ");

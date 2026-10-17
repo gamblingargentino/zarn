@@ -614,7 +614,7 @@ async fn custom(state: &State, name: &str, base_url: &str, model: &str, key: &st
     let mut message = format!("{name} added");
     if !models.is_empty() {
         ops::cache_models(&state.cache, name, &draft.spec(), &models);
-        message.push_str(&format!(" · {} models found", models.len()));
+        message.push_str(&format!(" · {} models found", ops::chat_models(&models).len()));
     }
     if let Some(model) = &draft.model {
         message.push_str(&format!(" · using {model}"));
@@ -659,7 +659,7 @@ async fn refresh_models(state: &State, provider: &str) {
     match tokio::time::timeout(ops::TEST_TIMEOUT, zarn_providers::discovery::models(provider, &spec)).await {
         Ok(Ok(found)) => {
             ops::cache_models(&state.cache, provider, &spec, &found);
-            state.flash(format!("{provider}: {} models found", found.len()), false);
+            state.flash(format!("{provider}: {} models found", ops::chat_models(&found).len()), false);
             state.changed(Change::Updated(provider.to_string()));
         }
         Ok(Err(err)) => state.flash(format!("{provider}: could not list models: {}", redact(&err)), true),

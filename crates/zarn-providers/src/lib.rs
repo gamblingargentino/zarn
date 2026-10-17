@@ -4,6 +4,7 @@ pub mod fallback;
 pub mod google;
 pub mod openai;
 pub mod ollama;
+pub mod patient;
 pub mod pinned;
 pub mod exec;
 
@@ -15,6 +16,7 @@ pub use fallback::{FallbackProvider, Switch, SwitchSink};
 pub use google::GoogleProvider;
 pub use openai::OpenAiCompatProvider;
 pub use ollama::OllamaProvider;
+pub use patient::Patient;
 pub use pinned::PinnedModel;
 pub use exec::ExecProvider;
 
@@ -117,7 +119,7 @@ impl ProviderSpec {
 }
 
 pub fn build(spec: &ProviderSpec) -> Result<Arc<dyn Provider>, ProviderError> {
-    Ok(PromptedProvider::wrap(build_raw(spec)?))
+    Ok(Patient::wrap(PromptedProvider::wrap(build_raw(spec)?)))
 }
 
 fn build_raw(spec: &ProviderSpec) -> Result<Arc<dyn Provider>, ProviderError> {

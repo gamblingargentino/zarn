@@ -320,6 +320,15 @@ use a cheaper or stronger model. `/models` and `zarn models` list each
 provider's models, rate limits and credit balance where the provider exposes
 them; results are cached for `discovery_cache_minutes`.
 
+When a provider says to retry within about a minute (a free tier's
+requests-per-minute limit) or answers that it is busy (HTTP 502, 503 or 529),
+zarn waits, says so, and tries again up to twice. A daily quota that is used up,
+or a model the key has no quota for, is reported with the time it resets and a
+pointer to `/model`. When you connect a key, zarn sends one short test request
+to the model it picked; if that model cannot be used with the key (retired for
+new users, no quota), it tries the next suggested models and keeps the first
+that answers.
+
 ## Permissions
 
 Every tool call goes through one policy: deny rules, then ask rules, then

@@ -109,7 +109,7 @@ enum UiEvent {
         name: String,
         result: Result<String, String>,
     },
-    OnboardTest(Result<String, String>),
+    OnboardTest(Result<(String, String), String>),
     Models {
         target: ModelTarget,
         models: Vec<(String, Option<u32>)>,
@@ -723,6 +723,7 @@ impl Controller {
         let notify: runtime::Notify = Arc::new(move |text: String| {
             let _ = tx.try_send(UiEvent::Notice(zarn_config::auth::redact(&text)));
         });
+        zarn_providers::patient::on_wait(Some(notify.clone()));
         let assembly = runtime::Assembly {
             store: self.store.clone(),
             notify: Some(notify),
@@ -897,12 +898,12 @@ impl Controller {
         if let Some(provider) = cfg.profiles.get(&profile).and_then(|p| p.provider.clone())
             && let Some(spec) = cfg.providers.get(&provider)
         {
-            let mut models: Vec<(String, String)> = zarn_config::catalog::suggested_models(&spec.kind)
+            let mut models: Vec<(String, String)> = zarn_config::catalog::suggested_for(spec)
                 .iter()
                 .map(|m| (m.to_string(), format!("suggested for {provider}")))
                 .collect();
             for model in zarn_config::quota::cached_models(&zarn_config::quota::cache_dir(), &provider) {
-                if !models.iter().any(|(id, _)| *id == model.id) {
+                if ops::is_chat_model(&model.id) && !models.iter().any(|(id, _)| *id == model.id) {
                     models.push((model.id, zarn_config::quota::context_label(model.context_window)));
                 }
             }
@@ -2816,9 +2817,10 @@ impl Controller {
                 };
                 let spec = flow.spec();
                 let model = flow.model.clone();
+                let listed = flow.listed.clone();
                 let tx = self.ui_tx.clone();
                 tokio::spawn(async move {
-                    let result = ops::test_provider(&spec, &model).await;
+                    let result = ops::first_working(&spec, &model, &listed).await;
                     drop(spec);
                     let _ = tx.send(UiEvent::OnboardTest(result)).await;
                 });
@@ -2995,8 +2997,8 @@ impl Controller {
             let cache = zarn_config::quota::cache_dir();
             let result = match ops::check_key(&provider, &spec, None).await {
                 Ok(models) => match ops::adopt_models(&mut layers, &cache, &provider, &spec, &models) {
-                    Ok(Some(model)) => Ok(format!("{provider}: {} models found · using {model} · /model to pick another", models.len())),
-                    Ok(None) => Ok(format!("{provider}: {} models found · /model to pick one", models.len())),
+                    Ok(Some(model)) => Ok(format!("{provider}: {} models found · using {model} · /model to pick another", ops::chat_models(&models).len())),
+                    Ok(None) => Ok(format!("{provider}: {} models found · /model to pick one", ops::chat_models(&models).len())),
                     Err(err) => Err(format!("{err:#}")),
                 },
                 Err(err) => Err(format!("{provider}: could not load its models: {err} · set one with /model <name>")),
@@ -3152,8 +3154,8 @@ impl Controller {
         let current = cfg.profiles.get(&profile).cloned().unwrap_or_default();
         let provider = current.provider.clone().unwrap_or_default();
         let spec = ops::spec_with_key(&cfg, &self.store, &provider).ok();
-        let kind = spec.as_ref().map(|s| s.kind.clone()).unwrap_or_default();
-        let mut choices: Vec<Choice> = catalog::suggested_models(&kind)
+        let suggested = spec.as_ref().map(catalog::suggested_for).unwrap_or(&[]);
+        let mut choices: Vec<Choice> = suggested
             .iter()
             .map(|m| Choice::plain(*m))
             .collect();
@@ -3164,6 +3166,7 @@ impl Controller {
         }
         let cached = zarn_config::quota::cached_models(&zarn_config::quota::cache_dir(), &provider)
             .into_iter()
+            .filter(|m| ops::is_chat_model(&m.id))
             .map(|m| (m.id, m.context_window))
             .collect();
         let choices = settings::merge_models(choices, cached);

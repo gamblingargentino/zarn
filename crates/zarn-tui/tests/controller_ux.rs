@@ -175,7 +175,7 @@ async fn switching_provider_picks_one_of_its_models_and_model_names_are_checked(
     c.type_line("/provider switch other");
     wait_for(&mut c, Duration::from_secs(10), |c| notices(c).iter().any(|n| n.contains("models found"))).await;
     assert!(
-        notices(&c).iter().any(|n| n.contains("other: 3 models found · using vendor/model-a")),
+        notices(&c).iter().any(|n| n.contains("other: 2 models found · using vendor/model-a")),
         "{:?}",
         notices(&c)
     );

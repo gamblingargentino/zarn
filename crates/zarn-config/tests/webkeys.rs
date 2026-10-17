@@ -221,7 +221,7 @@ async fn a_key_is_checked_saved_and_its_models_loaded_and_it_is_never_shown_back
     assert_eq!(saved.status(), 303);
     let home = page.home().await;
     assert!(home.contains("mock: key saved to the"), "{home}");
-    assert!(home.contains("3 models found") && home.contains("using m"), "{home}");
+    assert!(home.contains("2 models found") && home.contains("using m"), "{home}");
     assert!(home.contains("<option value=\"m-large\">m-large</option>"), "{home}");
     assert!(!home.contains("<option value=\"text-embedding-3\""), "embedding models are not offered for chat");
     assert!(!home.contains(GOOD), "the key never comes back to the browser");
@@ -272,7 +272,7 @@ async fn a_key_is_matched_to_its_provider_and_an_ambiguous_one_goes_nowhere() {
     assert_eq!(page.mock.received_requests().await.unwrap().len(), before, "an unrecognised key is sent nowhere");
 
     page.post("/models", &[("provider", "mock")]).await;
-    assert!(page.home().await.contains("mock: 3 models found"));
+    assert!(page.home().await.contains("mock: 2 models found"));
     let home = page.home().await;
     assert!(home.contains("Detect from the key") && home.contains("OpenRouter") && home.contains("Groq") && home.contains("xAI"));
 }
@@ -292,7 +292,7 @@ async fn a_new_catalog_provider_and_a_custom_endpoint_are_added_to_the_config() 
     )
     .await;
     let home = page.home().await;
-    assert!(home.contains("selfhosted added · 3 models found · using m"), "{home}");
+    assert!(home.contains("selfhosted added · 2 models found · using m"), "{home}");
     let cfg = Layers::load_from(page.project.clone(), Some(page.user.clone())).unwrap().merged();
     assert_eq!(cfg.providers.get("selfhosted").and_then(|p| p.base_url.clone()), Some(page.mock.uri()));
 

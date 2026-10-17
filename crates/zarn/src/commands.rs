@@ -132,7 +132,8 @@ pub async fn login(provider: Option<&str>) -> Result<()> {
     match ops::check_key(&provider, &spec, ops::model_for(&cfg, &provider).as_deref()).await {
         Ok(models) => {
             let model = ops::adopt_models(&mut layers, &cache, &provider, &spec, &models)?;
-            let mut line = format!("check: OK · {} models", models.len());
+            let model = ops::confirm_model(&mut layers, &provider, &spec, &models, model).await?;
+            let mut line = format!("check: OK · {} models", ops::chat_models(&models).len());
             if let Some(model) = model {
                 line.push_str(&format!(" · using {model}"));
             }

@@ -52,6 +52,7 @@ pub struct Onboarding {
     pub base_url: Option<String>,
     pub model: String,
     pub message: Option<String>,
+    pub listed: Vec<String>,
     key: Option<Secret>,
     layers: Layers,
     store: Arc<KeyStore>,
@@ -72,6 +73,7 @@ impl Onboarding {
             base_url: None,
             model: String::new(),
             message: None,
+            listed: Vec::new(),
             key: None,
             layers,
             store,
@@ -161,8 +163,10 @@ impl Onboarding {
         if let Step::Model(picker) = &mut self.step {
             let mut choices = picker.choices.clone();
             let mut found = 0;
+            self.listed.clear();
             for model in models.into_iter().filter(|m| ops::is_chat_model(m)) {
                 found += 1;
+                self.listed.push(model.clone());
                 if !choices.iter().any(|c| c.value == model) {
                     choices.push(Choice::plain(model));
                 }
@@ -175,16 +179,19 @@ impl Onboarding {
         }
     }
 
-    pub fn test_result(&mut self, result: Result<String, String>) {
+    pub fn test_result(&mut self, result: Result<(String, String), String>) {
         match result {
             Err(err) => self.step = Step::Failed(err),
-            Ok(ok) => match self.save() {
-                Ok(where_) => {
-                    self.key = None;
-                    self.step = Step::Saved(format!("{ok}. {where_}"));
+            Ok((model, ok)) => {
+                self.model = model;
+                match self.save() {
+                    Ok(where_) => {
+                        self.key = None;
+                        self.step = Step::Saved(format!("{ok}. {where_}"));
+                    }
+                    Err(err) => self.step = Step::Failed(format!("the test passed but saving failed: {err:#}")),
                 }
-                Err(err) => self.step = Step::Failed(format!("the test passed but saving failed: {err:#}")),
-            },
+            }
         }
     }
 

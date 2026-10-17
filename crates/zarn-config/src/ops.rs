@@ -331,7 +331,8 @@ pub async fn list_models(spec: &ProviderSpec) -> Vec<String> {
 
 const NOT_CHAT: &[&str] = &[
     "embed", "whisper", "tts", "dall-e", "image", "moderation", "audio", "rerank", "guard", "transcribe",
-    "speech", "realtime", "search-preview", "omni-moderation", "babbage", "davinci",
+    "speech", "realtime", "search-preview", "omni-moderation", "babbage", "davinci", "lyria", "veo-", "imagen",
+    "nano-banana", "robotics", "computer-use", "deep-research",
 ];
 
 pub fn is_chat_model(id: &str) -> bool {
@@ -352,6 +353,62 @@ pub fn pick_model(spec: &ProviderSpec, found: &[ModelInfo]) -> Option<String> {
         .first()
         .map(|m| m.id.clone())
         .or_else(|| suggested.first().map(|m| m.to_string()))
+}
+
+fn first_clause(err: &str) -> String {
+    let clause = err.split(['.', ';', '\n']).next().unwrap_or(err).trim();
+    clause.chars().take(120).collect()
+}
+
+pub async fn first_working(spec: &ProviderSpec, first: &str, models: &[String]) -> Result<(String, String), String> {
+    let first_error = match test_provider(spec, first).await {
+        Ok(text) => return Ok((first.to_string(), text)),
+        Err(err) => err,
+    };
+    if rejected(&first_error) || first_error.contains("authentication failed") {
+        return Err(first_error);
+    }
+    let mut candidates: Vec<String> = catalog::suggested_for(spec)
+        .iter()
+        .filter(|m| models.iter().any(|f| f == *m))
+        .map(|m| m.to_string())
+        .collect();
+    for model in models.iter().filter(|m| is_chat_model(m)) {
+        if !candidates.contains(model) {
+            candidates.push(model.clone());
+        }
+    }
+    for candidate in candidates.into_iter().filter(|m| m != first).take(3) {
+        if let Ok(text) = test_provider(spec, &candidate).await {
+            let note = format!("{first} could not be used ({}), so zarn picked {candidate}. {text}", first_clause(&first_error));
+            return Ok((candidate, note));
+        }
+    }
+    Err(first_error)
+}
+
+pub async fn confirm_model(
+    layers: &mut Layers,
+    provider: &str,
+    spec: &ProviderSpec,
+    models: &[ModelInfo],
+    model: Option<String>,
+) -> Result<Option<String>> {
+    let Some(first) = model else {
+        return Ok(None);
+    };
+    let ids: Vec<String> = models.iter().map(|m| m.id.clone()).collect();
+    match first_working(spec, &first, &ids).await {
+        Ok((working, _)) if working != first => {
+            let cfg = layers.merged();
+            let profile = cfg.default_profile();
+            if cfg.profiles.get(&profile).and_then(|p| p.provider.as_deref()) == Some(provider) {
+                set_profile_model(layers, &profile, &working)?;
+            }
+            Ok(Some(working))
+        }
+        _ => Ok(Some(first)),
+    }
 }
 
 fn rejected(err: &str) -> bool {
@@ -427,7 +484,7 @@ impl Connected {
     pub fn summary(&self) -> String {
         let mut parts = vec![format!("{}: key saved to the {}", self.provider, self.place)];
         if self.checked {
-            parts.push(match self.models.len() {
+            parts.push(match chat_models(&self.models).len() {
                 0 => "the key works".to_string(),
                 1 => "1 model found".to_string(),
                 n => format!("{n} models found"),
@@ -478,6 +535,11 @@ pub async fn connect(
     };
     let source = login(layers, store, &provider, key)?;
     let model = adopt_models(layers, cache, &provider, &spec, &models)?;
+    let model = if check {
+        confirm_model(layers, &provider, &probe, &models, model).await?
+    } else {
+        model
+    };
     Ok(Connected {
         provider,
         place: source.describe(store),
@@ -572,7 +634,8 @@ pub async fn model_choices(name: &str, spec: &ProviderSpec) -> Vec<(String, Opti
     {
         found = listed.into_iter().map(|m| (m.id, m.context_window)).collect();
     }
-    for model in catalog::suggested_models(&spec.kind).iter().rev() {
+    found.retain(|(id, _)| is_chat_model(id));
+    for model in catalog::suggested_for(spec).iter().rev() {
         if !found.iter().any(|(id, _)| id == model) {
             found.insert(0, (model.to_string(), None));
         }

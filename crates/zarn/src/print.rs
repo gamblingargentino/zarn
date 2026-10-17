@@ -87,6 +87,7 @@ pub fn mode(cfg: &Config, args: &Args) -> Result<(modes::ModeDef, zarn_tools::pe
 
 pub async fn run(args: &Args, prompt: String) -> Result<()> {
     let prompt = read_prompt(prompt)?;
+    zarn_providers::patient::on_wait(Some(Arc::new(|text: String| eprintln!("{text}"))));
     let mut cfg = Config::load()?;
     if !cfg.has_provider() {
         bail!(

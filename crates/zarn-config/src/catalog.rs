@@ -91,7 +91,7 @@ pub const KINDS: &[Kind] = &[
         asks_base_url: false,
         needs_key: true,
         env_hint: Some("GEMINI_API_KEY"),
-        models: &["gemini-2.5-pro", "gemini-2.5-flash"],
+        models: &["gemini-2.5-flash", "gemini-flash-latest", "gemini-flash-lite-latest", "gemini-pro-latest"],
         key_prefixes: &["AIza", "AQ."],
         key_page: Some("https://aistudio.google.com/apikey"),
     },
