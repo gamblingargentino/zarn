@@ -3760,9 +3760,11 @@ impl Controller {
         let resting: Vec<(String, std::time::Duration)> = rt.chain.as_ref().map(|c| c.resting()).unwrap_or_default();
         let mut lines = vec![format!("model chain for profile {profile} (tried in order; a model that keeps failing sits out a while):")];
         for (i, label) in rt.plan.chain_labels().iter().enumerate() {
+            let auto = rt.plan.auto_from.is_some_and(|from| i >= from);
             let note = match resting.iter().find(|(n, _)| n == label) {
                 Some((_, left)) => format!("  (resting, {} min left)", left.as_secs().div_ceil(60)),
                 None if i == 0 => "  (main model)".to_string(),
+                None if auto => "  (automatic)".to_string(),
                 None => String::new(),
             };
             lines.push(format!("  {}. {label}{note}", i + 1));
@@ -3772,6 +3774,9 @@ impl Controller {
         }
         if rt.plan.names.len() < 2 {
             lines.push("only the main model is in the chain, so a failure ends the turn".into());
+        }
+        if rt.plan.auto_from.is_some() {
+            lines.push("automatic entries come from general.auto_switch (provider by default, all, or off); any /chain edit replaces them".into());
         }
         lines.push("/chain add provider:model adds one, /chain remove <n>, /chain set a b c, /chain clear; /rank finds good ones".into());
         self.app.notice(lines.join("\n"));

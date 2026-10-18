@@ -90,6 +90,8 @@ pub struct General {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_style: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_switch: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_parallel_agents: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lazy_tools_threshold: Option<u32>,
@@ -115,6 +117,7 @@ impl General {
         self.mouse = self.mouse.or(other.mouse);
         self.update_check = self.update_check.or(other.update_check);
         self.output_style = self.output_style.take().or(other.output_style);
+        self.auto_switch = self.auto_switch.take().or(other.auto_switch);
         self.max_parallel_agents = self.max_parallel_agents.or(other.max_parallel_agents);
         self.lazy_tools_threshold = self.lazy_tools_threshold.or(other.lazy_tools_threshold);
     }
@@ -133,6 +136,14 @@ impl General {
 
     pub fn mouse(&self) -> bool {
         self.mouse.unwrap_or(true)
+    }
+
+    pub fn auto_switch(&self) -> &str {
+        match self.auto_switch.as_deref().map(str::trim) {
+            Some("off") | Some("false") | Some("no") => "off",
+            Some("all") | Some("any") => "all",
+            _ => "provider",
+        }
     }
 
     pub fn update_check(&self) -> bool {

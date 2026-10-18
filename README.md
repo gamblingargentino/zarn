@@ -237,6 +237,9 @@ auto_allow_read_only = true
 sandbox = false
 max_parallel_agents = 4
 lazy_tools_threshold = 40
+update_check = true
+output_style = "default"
+auto_switch = "provider"
 
 [providers.anthropic]
 kind = "anthropic"
@@ -335,6 +338,7 @@ What the less obvious keys do:
 | `general.status_line` | template with `{model}`, `{mode}`, `{profile}`, `{context}`, `{cost}`, `{cwd}`, `{branch}`; `{{` and `}}` are literal braces |
 | `general.notifications` | bell and window title after turns over 10 seconds and on permission prompts while the terminal may be unfocused; never written when stdout is not a terminal |
 | `general.output_style` | the output style added to the system prompt (`explanatory`, `learning`, `concise` or a file in `styles/`); `/style` sets it |
+| `general.auto_switch` | when a profile has no `chain` or `fallback`: `provider` (default) falls back to two other suggested models of the same provider and key, `all` also to one model of every other provider with a key, `off` never switches |
 | `general.update_check` | on by default: look for a new zarn release at most once a day at startup and say so in the chat; `zarn update` or `/update` installs it |
 | `general.mouse` | on by default: the wheel scrolls the conversation and menus take clicks; native text selection needs shift (option in macOS Terminal). Turn it off to select without shift; the wheel then sends arrow keys in most terminals (see `/doctor`) |
 | `general.context_budget` | token budget for all `ZARN.md` text, including nested files and imports |
@@ -409,7 +413,10 @@ or a missing model), so later turns go straight to the next one; after its
 rest it is tried first again and zarn says when it is back. A model whose
 context window is too small for the conversation is skipped while a bigger one
 is in the chain. Older `fallback = ["provider"]` entries still work and now
-use that provider's own model.
+use that provider's own model. A profile with neither gets an automatic chain
+from `general.auto_switch`: by default two other suggested models of the same
+provider, so the same key and bill; `all` adds every provider you have a key
+for, and `off` turns it off.
 
 | Command | What it does |
 |---|---|

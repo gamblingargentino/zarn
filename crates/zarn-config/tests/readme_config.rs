@@ -18,7 +18,7 @@ fn the_readme_config_example_parses_validates_and_covers_every_general_key() {
     for key in [
         "default_profile", "accent", "theme", "banner", "show_cost", "status_line", "notifications", "mouse", "vim",
         "mode", "auto_compact", "context_budget", "discovery_cache_minutes", "read_only_commands", "auto_allow_read_only",
-        "sandbox", "max_parallel_agents", "lazy_tools_threshold",
+        "sandbox", "max_parallel_agents", "lazy_tools_threshold", "update_check", "output_style", "auto_switch",
     ] {
         assert!(defaults.contains(&format!("{key} =")), "the example sets general.{key}");
     }

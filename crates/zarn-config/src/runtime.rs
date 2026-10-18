@@ -26,6 +26,7 @@ pub struct Plan {
     pub specs: Vec<ProviderSpec>,
     pub models: Vec<Option<String>>,
     pub skipped: Vec<String>,
+    pub auto_from: Option<usize>,
 }
 
 impl Plan {
@@ -111,13 +112,42 @@ pub fn plan(
         let pinned = crate::ops::model_for(cfg, &name).filter(|m| *m != model);
         candidates.push((name.clone(), resolved, pinned, name));
     }
+    let explicit = candidates.len();
+    if spec.chain.is_none() && spec.fallback.is_none() && cfg.general.auto_switch() != "off" {
+        let mut extra = Vec::new();
+        if let Some(own) = cfg.providers.get(&primary) {
+            for alt in catalog::suggested_for(own).iter().filter(|m| **m != model).take(2) {
+                extra.push((primary.clone(), alt.to_string()));
+            }
+        }
+        if cfg.general.auto_switch() == "all" {
+            let mut others: Vec<&String> = cfg.providers.keys().filter(|n| **n != primary).collect();
+            others.sort();
+            for other in others {
+                if let Some(alt) = cfg.providers.get(other).and_then(|s| catalog::suggested_for(s).first().map(|m| m.to_string())) {
+                    extra.push((other.clone(), alt));
+                }
+            }
+        }
+        for (provider, alt) in extra {
+            let Some(mut resolved) = cfg.providers.get(&provider).cloned() else {
+                continue;
+            };
+            resolved.api_key = cfg.resolve_key(store, &provider).map(|(key, _)| key);
+            if catalog::needs_key(&resolved) && resolved.api_key.is_none() {
+                continue;
+            }
+            candidates.push((format!("{provider}:{alt}"), resolved, Some(alt), provider));
+        }
+    }
 
     let mut specs = Vec::new();
     let mut kept = Vec::new();
     let mut models = Vec::new();
     let mut skipped = Vec::new();
     let mut seen = HashSet::new();
-    for (label, resolved, pinned, provider) in candidates {
+    let mut auto_from = None;
+    for (at, (label, resolved, pinned, provider)) in candidates.into_iter().enumerate() {
         let key = (provider.clone(), pinned.clone().unwrap_or_else(|| model.clone()));
         if !seen.insert(key) {
             continue;
@@ -135,6 +165,9 @@ pub fn plan(
             skipped.push(label);
             continue;
         }
+        if at >= explicit && auto_from.is_none() {
+            auto_from = Some(kept.len());
+        }
         kept.push(label);
         specs.push(resolved);
         models.push(pinned);
@@ -148,6 +181,7 @@ pub fn plan(
         specs,
         models,
         skipped,
+        auto_from,
     })
 }
 

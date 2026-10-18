@@ -105,3 +105,40 @@ async fn a_model_that_answers_is_kept_with_a_single_test_request() {
         .count();
     assert_eq!(chats, 1);
 }
+
+#[test]
+fn a_profile_without_a_chain_gets_automatic_fallbacks_from_the_same_provider() {
+    let store = zarn_config::auth::KeyStore::new(
+        std::sync::Arc::new(zarn_config::auth::MemoryBackend::new()),
+        tempfile::tempdir().unwrap().path().join("auth.json"),
+    );
+    store.save("google", "test-key-not-real-auto-0001").unwrap();
+    let parse = |extra: &str| -> zarn_config::Config {
+        toml::from_str(&format!(
+            "[general]\n{extra}\n[providers.google]\nkind = \"google\"\n\n[providers.deepseek]\nkind = \"deepseek\"\n\n[profiles.default]\nprovider = \"google\"\nmodel = \"gemini-2.5-flash\"\n"
+        ))
+        .unwrap()
+    };
+    let plan = zarn_config::runtime::plan(&parse(""), &store, "default", None).unwrap();
+    let labels = plan.chain_labels();
+    assert_eq!(labels[0], "google:gemini-2.5-flash");
+    assert_eq!(labels.len(), 3, "{labels:?}");
+    assert!(labels[1..].iter().all(|l| l.starts_with("google:") && l != "google:gemini-2.5-flash"), "{labels:?}");
+    assert_eq!(plan.auto_from, Some(1));
+
+    let off = zarn_config::runtime::plan(&parse("auto_switch = \"off\""), &store, "default", None).unwrap();
+    assert_eq!(off.chain_labels(), ["google:gemini-2.5-flash"]);
+    assert_eq!(off.auto_from, None);
+
+    let all = zarn_config::runtime::plan(&parse("auto_switch = \"all\""), &store, "default", None).unwrap();
+    assert!(!all.chain_labels().iter().any(|l| l.starts_with("deepseek:")), "a provider without a key is never used");
+    store.save("deepseek", "test-key-not-real-auto-0002").unwrap();
+    let all = zarn_config::runtime::plan(&parse("auto_switch = \"all\""), &store, "default", None).unwrap();
+    assert!(all.chain_labels().iter().any(|l| l.starts_with("deepseek:")), "{:?}", all.chain_labels());
+
+    let mut chained = parse("");
+    chained.profiles.get_mut("default").unwrap().chain = Some(vec!["google:gemini-flash-lite-latest".into()]);
+    let explicit = zarn_config::runtime::plan(&chained, &store, "default", None).unwrap();
+    assert_eq!(explicit.chain_labels(), ["google:gemini-2.5-flash", "google:gemini-flash-lite-latest"]);
+    assert_eq!(explicit.auto_from, None, "a chain you set replaces the automatic one");
+}
