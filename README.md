@@ -401,7 +401,9 @@ A chain lists the models to fall back to, in order, as `provider:model`
 (`chain` under a profile, or `/chain`). When the model in use fails with a
 rate limit, an outage, a dropped connection, no credit, a conversation too
 long for it, or a model the provider no longer offers, the same turn goes to
-the next model in the chain and zarn says which one answered. A model that
+the next model in the chain and zarn says which one answered. While another model
+is waiting in the chain, zarn does not sit through a rate limit longer than 5
+seconds; it hands the turn over at once. A model that
 fails twice in a row sits out for 5 minutes (30 for a rejected key, no credit
 or a missing model), so later turns go straight to the next one; after its
 rest it is tried first again and zarn says when it is back. A model whose

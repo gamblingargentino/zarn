@@ -65,15 +65,20 @@ pub fn guarded_chain(specs: &[zarn_providers::ProviderSpec]) -> Result<Arc<dyn P
 
 pub type Chain = Arc<zarn_providers::FallbackProvider>;
 
+pub const CHAIN_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+
 pub fn guarded_pinned(
     entries: &[(String, String, zarn_providers::ProviderSpec, Option<String>)],
     sink: Option<zarn_providers::SwitchSink>,
     rests: Option<zarn_providers::fallback::Rests>,
 ) -> Result<(Arc<dyn Provider>, Option<Chain>), ProviderError> {
+    let last = entries.len().saturating_sub(1);
     let providers = entries
         .iter()
-        .map(|(label, name, spec, model)| {
-            zarn_providers::build(spec)
+        .enumerate()
+        .map(|(i, (label, name, spec, model))| {
+            let wait = if i < last { CHAIN_WAIT } else { zarn_providers::patient::MAX_WAIT };
+            zarn_providers::build_with_wait(spec, wait)
                 .map(RedactingProvider::wrap)
                 .map(|p| crate::health::Measured::wrap(name.clone(), p))
                 .map(|p| match model {

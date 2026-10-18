@@ -112,6 +112,22 @@ fn lasting(err: &ProviderError) -> bool {
         || missing_model(&text)
 }
 
+fn every_failed(err: ProviderError, failed: &[(String, String)]) -> ProviderError {
+    let before = failed
+        .iter()
+        .map(|(name, why)| format!("{name} {why}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let wrap = |text: String| format!("every model in the chain failed ({before}); the last one said: {text}");
+    match err {
+        ProviderError::RateLimit(t) => ProviderError::RateLimit(wrap(t)),
+        ProviderError::Auth(t) => ProviderError::Auth(wrap(t)),
+        ProviderError::Network(t) => ProviderError::Network(wrap(t)),
+        ProviderError::BadRequest(t) => ProviderError::BadRequest(wrap(t)),
+        ProviderError::Other(t) => ProviderError::Other(wrap(t)),
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 struct Health {
     strikes: u32,
@@ -328,10 +344,10 @@ impl Provider for FallbackProvider {
                 Err(err) if switchable(&err) => {
                     tracing::debug!(index, error = %err, "model failed, trying the next one");
                     resting.extend(self.strike(index, &err));
-                    failed.push((self.names[index].clone(), reason(&err).to_string()));
                     if is_last {
-                        return Err(err);
+                        return Err(if failed.is_empty() { err } else { every_failed(err, &failed) });
                     }
+                    failed.push((self.names[index].clone(), reason(&err).to_string()));
                     seen = Some(err);
                 }
                 Err(err) => return Err(err),
@@ -672,6 +688,20 @@ mod tests {
         let tiny = Sized::new(8_000, 20_000, None, "tiny");
         let only = FallbackProvider::named(vec![("tiny".into(), tiny.clone() as Arc<dyn Provider>), ("tiny2".into(), Sized::new(8_000, 20_000, None, "tiny2") as Arc<dyn Provider>)]);
         assert_eq!(answer(&only).await, "tiny", "when nothing fits, the chain still tries in order");
+    }
+
+    #[tokio::test]
+    async fn when_every_model_fails_the_error_names_each_one() {
+        let chain = FallbackProvider::named(vec![
+            ("a:x".into(), Fixed::failing(ProviderError::BadRequest("No endpoints found (HTTP 404)".into()))),
+            ("b:y".into(), Fixed::failing(ProviderError::Other("insufficient credits (HTTP 402)".into()))),
+        ]);
+        let err = chain.stream(req()).await.err().unwrap();
+        assert!(matches!(err, ProviderError::Other(_)));
+        assert_eq!(
+            err.to_string(),
+            "every model in the chain failed (a:x does not offer this model); the last one said: insufficient credits (HTTP 402)"
+        );
     }
 
     #[tokio::test]

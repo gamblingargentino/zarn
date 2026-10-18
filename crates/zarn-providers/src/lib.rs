@@ -122,6 +122,10 @@ pub fn build(spec: &ProviderSpec) -> Result<Arc<dyn Provider>, ProviderError> {
     Ok(Patient::wrap(PromptedProvider::wrap(build_raw(spec)?)))
 }
 
+pub fn build_with_wait(spec: &ProviderSpec, max_wait: std::time::Duration) -> Result<Arc<dyn Provider>, ProviderError> {
+    Ok(Patient::with_limit(PromptedProvider::wrap(build_raw(spec)?), max_wait))
+}
+
 fn build_raw(spec: &ProviderSpec) -> Result<Arc<dyn Provider>, ProviderError> {
     match spec.kind.as_str() {
         "openai" | "openai-compat" => {

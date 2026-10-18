@@ -210,3 +210,20 @@ async fn model_accepts_provider_colon_model_and_switches_provider_when_needed() 
     assert_eq!(chat_bodies(&spare).await[0]["model"], "s1");
     assert_eq!(assistant(&c).last().map(String::as_str), Some("from spare"));
 }
+
+#[tokio::test]
+async fn a_long_rate_limit_hands_over_at_once_when_the_chain_has_another_model() {
+    let limited = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(429).set_body_string(r#"{"error":{"message":"Rate limit reached. Please retry in 30s."}}"#))
+        .mount(&limited)
+        .await;
+    let spare = echo_server("from the spare").await;
+    let env = Env::new(&two_providers(&limited.uri(), &spare.uri(), "chain = [\"spare:backup\"]")).await;
+    let mut c = env.controller();
+    let started = std::time::Instant::now();
+    turn(&mut c, "hello").await;
+    assert_eq!(assistant(&c).last().map(String::as_str), Some("from the spare"));
+    assert!(started.elapsed() < std::time::Duration::from_secs(8), "took {:?}", started.elapsed());
+    assert_eq!(limited.received_requests().await.unwrap().len(), 1, "no waiting on the limited model");
+}
