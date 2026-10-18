@@ -227,3 +227,19 @@ async fn a_long_rate_limit_hands_over_at_once_when_the_chain_has_another_model()
     assert!(started.elapsed() < std::time::Duration::from_secs(8), "took {:?}", started.elapsed());
     assert_eq!(limited.received_requests().await.unwrap().len(), 1, "no waiting on the limited model");
 }
+
+#[tokio::test]
+async fn a_reply_cut_off_by_the_output_limit_says_so() {
+    let cut = server(|_| {
+        (
+            "data: {\"choices\":[{\"delta\":{\"content\":\"the first half of a long answ\"}}]}\n\ndata: {\"choices\":[{\"delta\":{},\"finish_reason\":\"length\"}]}\n\ndata: [DONE]\n\n".to_string(),
+            0,
+        )
+    })
+    .await;
+    let env = Env::new(&provider_config(&cut.uri(), "")).await;
+    let mut c = env.controller();
+    turn(&mut c, "write a long answer").await;
+    let last = notices(&c).last().cloned().unwrap_or_default();
+    assert!(last.contains("reached the output limit of 16384 tokens") && last.contains("continue"), "{last}");
+}

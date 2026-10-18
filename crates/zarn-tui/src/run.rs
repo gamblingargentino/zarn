@@ -2532,6 +2532,24 @@ impl Controller {
                         self.app.pause_queue();
                         return;
                     }
+                    Ok(StopReason::MaxTokens) => {
+                        let config = self.runtime.as_ref().map(|rt| rt.agent_config()).unwrap_or_default();
+                        let cut_reply = matches!(
+                            self.messages.last(),
+                            Some(Message::Assistant { tool_calls, .. }) if tool_calls.is_empty()
+                        );
+                        self.app.notice(if cut_reply {
+                            format!(
+                                "the reply reached the output limit of {} tokens and stopped part way; say \"continue\" for the rest",
+                                config.max_tokens
+                            )
+                        } else {
+                            format!(
+                                "stopped after {} steps without finishing; say \"continue\" to let it go on",
+                                config.max_iterations
+                            )
+                        });
+                    }
                     Ok(_) => {}
                     Err(err) => self.app.notice(format!("error: {err}")),
                 }
