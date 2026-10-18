@@ -4405,7 +4405,7 @@ dependencies = [
 
 [[package]]
 name = "zarn"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -4428,7 +4428,7 @@ dependencies = [
 
 [[package]]
 name = "zarn-config"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4452,7 +4452,7 @@ dependencies = [
 
 [[package]]
 name = "zarn-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4469,7 +4469,7 @@ dependencies = [
 
 [[package]]
 name = "zarn-providers"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
@@ -4490,7 +4490,7 @@ dependencies = [
 
 [[package]]
 name = "zarn-tools"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -4515,7 +4515,7 @@ dependencies = [
 
 [[package]]
 name = "zarn-tui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",

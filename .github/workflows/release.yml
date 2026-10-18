@@ -93,9 +93,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" dist/* --clobber
-          else
-            gh release create "$TAG" dist/* --title "zarn ${TAG#v}" --generate-notes \
-              --notes "**Windows:** download and run \`zarn-setup-${TAG#v}.exe\`. macOS and Linux: download the \`zarn-<target>\` binary. Update later with \`zarn update\`."
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            gh release create "$TAG" --title "zarn ${TAG#v}" --generate-notes \
+              --notes "**Windows:** download and run \`zarn-setup-${TAG#v}.exe\`. macOS and Linux: download the \`zarn-<target>\` binary. Update later with \`zarn update\`." \
+              || gh release view "$TAG" >/dev/null
           fi
+          gh release upload "$TAG" dist/* --clobber
