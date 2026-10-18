@@ -1,0 +1,22 @@
+«DarkGray»a notice in the dim role«»
+
+«Rgb(138, 43, 226)»› «»hello
+
+Some «Cyan»code«» and bold text.
+
+«DarkGray»┌ «»grep  «Green»done«»  'x' · 1 match
+«DarkGray»│ «»a.rs:1: x
+«DarkGray»└«»
+
+«DarkGray»┌ «»bash  «Red»failed«»
+«DarkGray»│ «»$ false
+«DarkGray»│ «»exit 1
+«DarkGray»└«»
+
+
+
+
+«DarkGray»default mode  ·  m  ·  0 in / 0 out  ·  ctx 0%  ·  no rate configured«»
+«DarkGray»╭──────────────────────────────────────────────────────────────────────╮«»
+«DarkGray»│«»                                                                      «DarkGray»│«»
+«DarkGray»╰──────────────────────────────────────────────────────────────────────╯«»

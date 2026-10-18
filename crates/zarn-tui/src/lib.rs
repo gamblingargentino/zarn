@@ -1,8 +1,23 @@
 pub mod brand;
+pub mod editor;
+pub mod hits;
+pub mod export;
+pub mod keymap;
 pub mod markdown;
+pub mod mentions;
+pub mod onboarding;
+pub mod popup;
+pub mod prompt;
 pub mod render;
 pub mod run;
+pub mod settings;
 pub mod state;
+pub mod terminal;
+pub mod theme;
+pub mod notify;
+pub mod status_line;
+pub mod views;
+pub mod widgets;
 
-pub use run::{permission_channel, run};
+pub use run::{Controller, Options, permission_channel, run};
 pub use state::App;

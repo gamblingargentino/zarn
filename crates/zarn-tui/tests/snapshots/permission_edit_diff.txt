@@ -1,0 +1,26 @@
+edit lib.rs (+3 -1)
+  @@ -3,7 +3,9 @@
+   3   fn step_3() {}
+   4   fn step_4() {}
+   5   fn step_5() {}
+   6 - fn step_6() {}
+   6 + fn step_six() {
+   7 +     run();
+   8 + }
+   9   fn step_7() {}
+  10   fn step_8() {}
+  11   fn step_9() {}
+  › 1. Yes, once [y]
+    2. Yes, allow edit(lib.rs) for this session [a]
+    3. Yes, and save the rule for this project [p]
+    4. Yes, and save the rule just for me in this project [l]
+    5. Yes, and save the rule for all my projects [u]
+    6. No [n]
+  ↑↓ choose · enter confirm · or press [y] [a] [p] [l] [u] [n] · e expands the diff
+
+
+
+default mode  ·  m  ·  0 in / 0 out  ·  no rate configured
+╭────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                        │
+╰────────────────────────────────────────────────────────────────────────────────────────╯

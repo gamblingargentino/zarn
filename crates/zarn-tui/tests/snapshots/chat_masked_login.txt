@@ -1,0 +1,16 @@
+
+
+         ╭ API key for openai ──────────────────────────────────────────────────╮
+         │key ••••••••••••••••••••••••••                                        │
+         │                                                                      │
+         │Paste the key and press enter; characters are not shown. zarn checks  │
+         │it, loads the models it can use and stores it in your OS credential   │
+         │store (or an owner-only fallback file), never in a config file. esc   │
+         │cancels.                                                              │
+         ╰──────────────────────────────────────────────────────────────────────╯
+
+
+default mode  ·  m  ·  0 in / 0 out  ·  no rate configured
+╭────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                        │
+╰────────────────────────────────────────────────────────────────────────────────────────╯

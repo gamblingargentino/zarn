@@ -1,0 +1,24 @@
+╭ zarn settings · changes save as you go ──────────────────────────────────────────────────────────╮
+│Providers  Models  Skills  MCP  Agents  Modes  Quota  Permissions  Hooks  Plugins  General        │
+│                                                                                                  │
+│  accent color          violet                                                                    │
+│  banner                on                                                                        │
+│  cost display          on                                                                        │
+│  auto-compact          on  compact when the context is 80% full                                  │
+│  read-only commands    on  ls, git status and the like run without asking                        │
+│  vim input╭ Status line ─────────────────────────────────────────────────────────────╮           │
+│  bash sand│template  {model} · {mode} · {branch} · {context}                         │           │
+│  session s│                                                                          │           │
+│  daily spe│preview  gpt-x · plan · main · 42%                                        │           │
+│  ZARN.md t│                                                                          │           │
+│  theme    │{model} {mode} {profile} {context} {cost} {cwd} {branch}; empty resets    │           │
+│  notificat│                                                                          │ts         │
+│› status li╰──────────────────────────────────────────────────────────────────────────╯} {cwd} {b…│
+│  mouse                 on  wheel scrolls the conversation and menus take clicks; text selection …│
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│↑↓ move · ←→ tab · enter change · esc close                                                       │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

@@ -1,0 +1,46 @@
+┌ read  done  src/lib.rs · lines 10–12
+│ 10  fn a() {}
+│ 11  fn b() {}
+│ 12  fn c() {}
+└
+
+┌ grep  done  'TODO' · 2 matches
+│ src/a.rs:1: TODO one
+│ src/b.rs:9: TODO two
+└
+
+┌ glob  done  **/*.toml · 3 files
+│ Cargo.toml
+│ crates/a/Cargo.toml
+│ crates/b/Cargo.toml
+└
+
+┌ write  done  +12 -3 src/new.rs
+│ wrote src/new.rs
+└
+
+┌ task  running  agent reviewer · review it
+└
+
+┌ bash  running
+│ $ cargo test
+│ … 2 earlier lines
+│ test case_3 ... ok
+│ test case_4 ... ok
+│ test case_5 ... ok
+│ test case_6 ... ok
+│ test case_7 ... ok
+│ test case_8 ... ok
+└
+
+┌ mcp__docs__search  done
+│ query: tokio select
+│ 3 results
+└
+
+
+
+default mode  ·  m  ·  0 in / 0 out  ·  ctx 0%  ·  no rate configured
+╭──────────────────────────────────────────────────────────────────────────────╮
+│                                                                              │
+╰──────────────────────────────────────────────────────────────────────────────╯

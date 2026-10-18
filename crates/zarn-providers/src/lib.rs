@@ -1,49 +1,104 @@
 pub mod anthropic;
+pub mod discovery;
 pub mod fallback;
 pub mod google;
 pub mod openai;
 pub mod ollama;
+pub mod patient;
+pub mod pinned;
 pub mod exec;
 
 #[cfg(feature = "local")]
 pub mod llamacpp;
 
 pub use anthropic::AnthropicProvider;
-pub use fallback::FallbackProvider;
+pub use fallback::{FallbackProvider, Switch, SwitchSink};
 pub use google::GoogleProvider;
 pub use openai::OpenAiCompatProvider;
 pub use ollama::OllamaProvider;
+pub use patient::Patient;
+pub use pinned::PinnedModel;
 pub use exec::ExecProvider;
 
 #[cfg(feature = "local")]
 pub use llamacpp::LlamaCppProvider;
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 use zarn_core::prompted::PromptedProvider;
 use zarn_core::provider::{Caps, Provider, ProviderError, ToolSupport};
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
+pub fn error_message(body: &str) -> String {
+    let trimmed = body.trim();
+    if let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) {
+        let value = match &value {
+            serde_json::Value::Array(items) => items.first().cloned().unwrap_or(serde_json::Value::Null),
+            other => other.clone(),
+        };
+        let found = ["/error/message", "/message", "/detail", "/error/detail", "/error_message"]
+            .iter()
+            .find_map(|path| value.pointer(path).and_then(|v| v.as_str()))
+            .or_else(|| value.get("error").and_then(|v| v.as_str()));
+        if let Some(message) = found {
+            return message.trim().to_string();
+        }
+    }
+    let mut short: String = trimmed.chars().take(300).collect();
+    if trimmed.chars().count() > 300 {
+        short.push('…');
+    }
+    short
+}
+
+pub fn affordable_tokens(message: &str) -> Option<u32> {
+    let at = message.find("can only afford")? + "can only afford".len();
+    let digits: String = message[at..]
+        .trim_start()
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    digits.parse().ok()
+}
+
+#[derive(Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct ProviderSpec {
     pub kind: String,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing)]
     pub api_key: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key_env: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_key_helper: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window: Option<u32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_output: Option<u32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vision: Option<bool>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tools: Option<String>,
     #[serde(flatten)]
     #[serde(default)]
-    pub extra: HashMap<String, String>,
+    pub extra: std::collections::BTreeMap<String, String>,
+}
+
+impl std::fmt::Debug for ProviderSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderSpec")
+            .field("kind", &self.kind)
+            .field("base_url", &self.base_url)
+            .field("api_key", &self.api_key.as_ref().map(|_| "[redacted]"))
+            .field("api_key_env", &self.api_key_env)
+            .field("api_key_helper", &self.api_key_helper)
+            .field("context_window", &self.context_window)
+            .field("max_output", &self.max_output)
+            .field("vision", &self.vision)
+            .field("tools", &self.tools)
+            .field("extra", &self.extra)
+            .finish()
+    }
 }
 
 impl ProviderSpec {
@@ -64,7 +119,11 @@ impl ProviderSpec {
 }
 
 pub fn build(spec: &ProviderSpec) -> Result<Arc<dyn Provider>, ProviderError> {
-    Ok(PromptedProvider::wrap(build_raw(spec)?))
+    Ok(Patient::wrap(PromptedProvider::wrap(build_raw(spec)?)))
+}
+
+pub fn build_with_wait(spec: &ProviderSpec, max_wait: std::time::Duration) -> Result<Arc<dyn Provider>, ProviderError> {
+    Ok(Patient::with_limit(PromptedProvider::wrap(build_raw(spec)?), max_wait))
 }
 
 fn build_raw(spec: &ProviderSpec) -> Result<Arc<dyn Provider>, ProviderError> {
@@ -213,6 +272,16 @@ mod tests {
     #[test]
     fn anthropic_reports_caching_so_cost_tracking_sees_cached_tokens() {
         assert!(build(&spec("anthropic")).unwrap().caps().caching);
+    }
+
+    #[test]
+    fn debug_output_never_shows_the_key() {
+        let spec = ProviderSpec {
+            kind: "openai".into(),
+            api_key: Some("test-key-not-real-debug".into()),
+            ..ProviderSpec::default()
+        };
+        assert!(!format!("{spec:?}").contains("test-key-not-real-debug"));
     }
 
     #[test]

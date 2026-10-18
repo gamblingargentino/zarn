@@ -1,0 +1,18 @@
+write new file notes/todo.md (+3 -0)
+  1 + # Todo
+  2 +
+  3 + - ship it
+  › 1. Yes, once [y]
+    2. Yes, allow write(notes/todo.md) for this session [a]
+    3. Yes, and save the rule for this project [p]
+    4. Yes, and save the rule just for me in this project [l]
+    5. Yes, and save the rule for all my projects [u]
+    6. No [n]
+  ↑↓ choose · enter confirm · or press [y] [a] [p] [l] [u] [n] · e expands the diff
+
+
+
+default mode  ·  m  ·  0 in / 0 out  ·  no rate configured
+╭────────────────────────────────────────────────────────────────────────────────────────╮
+│                                                                                        │
+╰────────────────────────────────────────────────────────────────────────────────────────╯

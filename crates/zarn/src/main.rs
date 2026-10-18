@@ -1,322 +1,190 @@
 mod cli;
+mod commands;
+mod print;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use clap::Parser;
+use cli::{Args, Command, RunMode};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
-use zarn_config::Config;
-use zarn_core::agent::{Agent, AgentConfig, AgentEvent};
-use zarn_core::provider::Event;
+use zarn_config::auth::redact;
+use zarn_config::guard::RedactingWriter;
 use zarn_core::session;
-use zarn_core::tools::Ctx;
-use zarn_core::types::Message;
-use zarn_providers::{build_chain, ProviderSpec};
-use zarn_tools::permissions::Permissions;
-use cli::{Args, Command, ConfigAction, RunMode};
+
+struct SharedFile(Arc<std::fs::File>);
+
+impl Write for SharedFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        (&*self.0).write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        (&*self.0).flush()
+    }
+}
+
+fn log_file() -> Option<std::fs::File> {
+    let dir = session::data_root().parent()?.to_path_buf();
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(dir.join("zarn.log"))
+        .ok()
+}
+
+fn init_logging(to_file: bool) {
+    let filter = tracing_subscriber::EnvFilter::try_from_env("ZARN_LOG")
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn"));
+    let file = if to_file { log_file() } else { None };
+    let builder = tracing_subscriber::fmt().with_env_filter(filter);
+    match file {
+        Some(file) => {
+            let file = Arc::new(file);
+            builder
+                .with_ansi(false)
+                .with_writer(move || RedactingWriter::new(SharedFile(file.clone())))
+                .init()
+        }
+        None => builder
+            .with_writer(|| RedactingWriter::new(std::io::stderr()))
+            .init(),
+    }
+}
 
 #[tokio::main]
-async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_env("ZARN_LOG")
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
-        )
-        .with_writer(std::io::stderr)
-        .init();
-
-    let args = Args::parse();
-
-    match &args.command {
-        Some(Command::Config { action }) => {
-            match action {
-                ConfigAction::Init => cmd_config_init()?,
-                ConfigAction::Check => cmd_config_check()?,
-            }
-            return Ok(());
+async fn main() -> std::process::ExitCode {
+    match start().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("error: {}", redact(&format!("{err:#}")));
+            std::process::ExitCode::FAILURE
         }
-        Some(Command::Providers) => {
-            cmd_providers().await?;
-            return Ok(());
-        }
-        None => {}
     }
-
-    run_agent(&args).await
 }
 
-fn resume_messages(id: Option<&str>) -> Result<Vec<Message>> {
+async fn start() -> Result<()> {
+    if let Ok(exe) = std::env::current_exe() {
+        zarn_config::update::cleanup(&exe);
+    }
+    let args = Args::parse();
+    let interactive = args.command.is_none() && !matches!(args.run_mode(), RunMode::OneShot(_));
+    init_logging(interactive);
+
+    if let Some(command) = &args.command {
+        return run_command(command).await;
+    }
+
+    if let Some(name) = &args.worktree {
+        let root = zarn_core::worktree::repo_root(&std::env::current_dir()?)?;
+        let path = zarn_core::worktree::create(&root, name)?;
+        std::env::set_current_dir(&path).with_context(|| format!("entering {}", path.display()))?;
+        eprintln!("working in {} on branch {name}", path.display());
+    }
+
+    match args.run_mode() {
+        RunMode::OneShot(prompt) => print::run(&args, prompt).await,
+        RunMode::Interactive => tui(&args, None).await,
+        RunMode::ContinueLast => tui(&args, Some(session_path(None)?)).await,
+        RunMode::ResumeSession(id) => tui(&args, Some(session_path(Some(&id))?)).await,
+    }
+}
+
+async fn run_command(command: &Command) -> Result<()> {
+    use cli::{ConfigAction, McpAction, ProvidersAction, SkillsAction};
+    match command {
+        Command::Config { action } => match action {
+            ConfigAction::Init => commands::config_init(),
+            ConfigAction::Check => commands::config_check(),
+        },
+        Command::Login { provider } => commands::login(provider.as_deref()).await,
+        Command::Setup { port, no_browser } => commands::setup(*port, *no_browser).await,
+        Command::Update { check } => commands::update(*check).await,
+        Command::Logout { provider } => commands::logout(provider),
+        Command::Providers { action } => match action {
+            None | Some(ProvidersAction::List) => commands::providers_list().await,
+            Some(ProvidersAction::Add(add)) => commands::providers_add(add).await,
+            Some(ProvidersAction::Test { name }) => commands::providers_test(name).await,
+            Some(ProvidersAction::Remove { name }) => commands::providers_remove(name),
+        },
+        Command::Skills { action } => match action {
+            None | Some(SkillsAction::List) => commands::skills_list(),
+            Some(SkillsAction::Enable { name }) => commands::skills_toggle(name, true),
+            Some(SkillsAction::Disable { name }) => commands::skills_toggle(name, false),
+            Some(SkillsAction::Install { source, project }) => commands::skills_install(source, *project).await,
+            Some(SkillsAction::Remove { name }) => commands::skills_remove(name),
+            Some(SkillsAction::Show { name }) => commands::skills_show(name),
+            Some(SkillsAction::New { name, description, project }) => {
+                commands::skills_new(name, &description.join(" "), *project)
+            }
+        },
+        Command::Mcp { action } => match action {
+            None => commands::mcp_list(false).await,
+            Some(McpAction::List { offline }) => commands::mcp_list(*offline).await,
+            Some(McpAction::Add {
+                name,
+                project,
+                target,
+            }) => commands::mcp_add(name, *project, target),
+            Some(McpAction::Remove { name }) => commands::mcp_remove(name),
+        },
+        Command::Hooks { .. } => commands::hooks_list(),
+        Command::Schedule { action } => match action {
+            None | Some(cli::ScheduleAction::List) => commands::schedule_list(),
+            Some(cli::ScheduleAction::Add { prompt, when, mode }) => commands::schedule_add(prompt, when.clone(), mode.clone()),
+            Some(cli::ScheduleAction::Remove { id }) => commands::schedule_remove(id),
+        },
+        Command::RunScheduled { id } => {
+            let entry = zarn_config::schedule::Schedules::system().get(id)?;
+            std::env::set_current_dir(&entry.cwd).with_context(|| format!("entering {}", entry.cwd.display()))?;
+            let mut argv = vec!["zarn".to_string()];
+            if let Some(mode) = &entry.mode {
+                argv.push("--mode".into());
+                argv.push(mode.clone());
+            }
+            argv.push("--print".into());
+            argv.push(entry.prompt.clone());
+            let args = Args::parse_from(argv);
+            print::run(&args, entry.prompt.clone()).await
+        }
+        Command::Plugin { action } => match action {
+            None | Some(cli::PluginAction::List) => commands::plugin_list(),
+            Some(cli::PluginAction::Add { source }) => commands::plugin_add(source),
+            Some(cli::PluginAction::Approve { name, yes }) => commands::plugin_approve(name, *yes),
+            Some(cli::PluginAction::Revoke { name }) => commands::plugin_revoke(name),
+            Some(cli::PluginAction::Remove { name }) => commands::plugin_remove(name),
+        },
+        Command::Models { provider, refresh } => commands::models(provider.as_deref(), *refresh).await,
+        Command::Rank { entries, save } => commands::rank(entries, *save).await,
+        Command::Limits { session, day } => commands::limits(session.as_deref(), day.as_deref()),
+        Command::Modes { action } => match action {
+            None | Some(cli::ModesAction::List) => commands::modes_list(),
+            Some(cli::ModesAction::Show { name }) => commands::modes_show(name),
+        },
+        Command::Doctor { offline } => commands::doctor(*offline).await,
+    }
+}
+
+fn session_path(id: Option<&str>) -> Result<PathBuf> {
     let root = session::data_root();
     let cwd = std::env::current_dir()?;
-
-    let path = match id {
-        None => session::newest(&root, &cwd)
-            .context("no previous session for this directory")?,
+    match id {
+        None => session::newest(&root, &cwd).context("no previous session for this directory"),
         Some(id) => session::find(&root, &cwd, id)
-            .with_context(|| format!("no session matching '{id}' in this directory"))?,
-    };
-
-    let (meta, messages) = session::read(&path)?;
-    eprintln!(
-        "resuming {} ({} messages, {} in / {} out)",
-        meta.id, messages.len(), meta.input_tokens, meta.output_tokens
-    );
-    Ok(messages)
-}
-
-fn config_target() -> Result<PathBuf> {
-    Config::home_path().context("cannot determine a home directory for the config")
-}
-
-fn cmd_config_init() -> Result<()> {
-    let path = config_target()?;
-    if path.exists() {
-        println!("config already exists at {}", path.display());
-        return Ok(());
-    }
-
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating {}", parent.display()))?;
-    }
-    std::fs::write(&path, Config::starter())
-        .with_context(|| format!("writing {}", path.display()))?;
-
-    println!("wrote a starter config to {}", path.display());
-    println!("set the api_key_env variables it names, then run: zarn config check");
-    Ok(())
-}
-
-fn cmd_config_check() -> Result<()> {
-    let sources = Config::sources();
-    println!("sources, highest precedence first:");
-    for path in &sources {
-        let mark = if path.exists() { "found" } else { "absent" };
-        println!("  [{mark}] {}", path.display());
-    }
-
-    let cfg = Config::load()?;
-    println!();
-
-    let mut providers: Vec<_> = cfg.providers.iter().collect();
-    providers.sort_by_key(|(name, _)| name.as_str());
-    println!("providers:");
-    for (name, spec) in providers {
-        println!("  {name} ({})", spec.kind);
-        if let Some(base_url) = &spec.base_url {
-            println!("    base_url      {base_url}");
-        }
-        match &spec.api_key_env {
-            Some(var) => {
-                let state = if std::env::var(var).is_ok() { "set" } else { "NOT SET" };
-                println!("    api_key_env   {var} ({state})");
-            }
-            None => println!("    api_key_env   none"),
-        }
-        if let Some(window) = spec.context_window {
-            println!("    context       {window}");
-        }
-    }
-
-    let mut profiles: Vec<_> = cfg.profiles.iter().collect();
-    profiles.sort_by_key(|(name, _)| name.as_str());
-    println!("\nprofiles:");
-    for (name, profile) in profiles {
-        println!("  {name}");
-        if let Some(provider) = &profile.provider {
-            println!("    provider      {provider}");
-        }
-        if let Some(model) = &profile.model {
-            println!("    model         {model}");
-        }
-        if let Some(fallback) = &profile.fallback
-            && !fallback.is_empty()
-        {
-            println!("    fallback      {}", fallback.join(" -> "));
-        }
-    }
-
-    let mut permissions: Vec<_> = cfg.permissions.iter().collect();
-    permissions.sort_by_key(|(name, _)| name.as_str());
-    println!("\npermissions:");
-    if permissions.is_empty() {
-        println!("  none set; risk defaults apply");
-    }
-    for (tool, policy) in permissions {
-        println!("  {tool:<8} {policy:?}");
-    }
-
-    let mut servers: Vec<_> = cfg.mcp.iter().collect();
-    servers.sort_by_key(|(name, _)| name.as_str());
-    if !servers.is_empty() {
-        println!("\nmcp servers:");
-        for (name, server) in servers {
-            match (&server.command, &server.url) {
-                (Some(command), _) => {
-                    println!("  {name:<12} stdio  {command} {}", server.args.join(" "))
-                }
-                (None, Some(url)) => println!("  {name:<12} http   {url}"),
-                (None, None) => println!("  {name:<12} INVALID: neither command nor url"),
-            }
-        }
-    }
-
-    println!("\nconfig is valid");
-    Ok(())
-}
-
-async fn reachable(base_url: &str) -> String {
-    let client = match reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(3))
-        .build()
-    {
-        Ok(client) => client,
-        Err(err) => return format!("unknown ({err})"),
-    };
-
-    match client.get(base_url).send().await {
-        Ok(response) => format!("reachable (HTTP {})", response.status().as_u16()),
-        Err(err) if err.is_timeout() => "unreachable (timed out)".to_string(),
-        Err(err) if err.is_connect() => "unreachable (connection refused)".to_string(),
-        Err(_) => "unreachable".to_string(),
+            .with_context(|| format!("no session matching '{id}' in this directory")),
     }
 }
 
-async fn cmd_providers() -> Result<()> {
-    let cfg = Config::load()?;
-    if cfg.providers.is_empty() {
-        println!("no providers configured; run: zarn config init");
-        return Ok(());
-    }
-
-    let mut providers: Vec<_> = cfg.providers.iter().collect();
-    providers.sort_by_key(|(name, _)| name.as_str());
-
-    for (name, spec) in providers {
-        let key = match &spec.api_key_env {
-            None => "no key needed".to_string(),
-            Some(var) if std::env::var(var).is_ok() => format!("{var} set"),
-            Some(var) => format!("{var} NOT SET"),
-        };
-        let health = match &spec.base_url {
-            Some(base_url) => reachable(base_url).await,
-            None => "no base_url to probe".to_string(),
-        };
-        println!("{name:<12} {:<16} {key:<28} {health}", spec.kind);
-    }
-
-    Ok(())
-}
-
-async fn run_agent(args: &Args) -> Result<()> {
-    let mut cfg = Config::load().unwrap_or_default();
-    let mcp = std::mem::take(&mut cfg.mcp);
-
-    let profile_name = args.profile
-        .clone()
-        .or_else(|| std::env::var("ZARN_PROFILE").ok())
-        .unwrap_or_else(|| "default".to_string());
-
-    let profile = cfg.profiles.entry(profile_name.clone())
-        .or_default();
-
-    let provider_name = profile.provider.as_deref()
-        .unwrap_or("openai");
-
-    let mut specs = vec![];
-    if let Some(fallback) = &profile.fallback {
-        for name in fallback {
-            if let Some(spec) = cfg.providers.remove(name) {
-                specs.push(spec);
-            }
-        }
-    }
-    if let Some(spec) = cfg.providers.remove(provider_name) {
-        specs.insert(0, spec);
-    } else {
-        specs.insert(0, ProviderSpec {
-            kind: provider_name.to_string(),
-            ..ProviderSpec::default()
-        });
-    }
-
-    let provider = build_chain(&specs)?;
-    let model = args.model
-        .clone()
-        .or_else(|| profile.model.clone())
-        .or_else(|| std::env::var("ZARN_MODEL").ok())
-        .unwrap_or_else(|| "gpt-4o-mini".to_string());
-
-    let mut registry = zarn_tools::builtins();
-    for tool in zarn_tools::mcp::connect_all(&mcp).await {
-        registry.register(tool);
-    }
-    let tools = Arc::new(registry);
-    let ctx = Arc::new(Ctx::new(std::env::current_dir()?));
-    let config = AgentConfig {
-        model,
-        ..AgentConfig::default()
-    };
-
-    let run_mode = args.run_mode();
-
-    match run_mode {
-        RunMode::Interactive | RunMode::ContinueLast | RunMode::ResumeSession(_) => {
-            let history = match &run_mode {
-                RunMode::ContinueLast => resume_messages(None)?,
-                RunMode::ResumeSession(id) => resume_messages(Some(id))?,
-                _ => Vec::new(),
-            };
-            let (prompt_sink, permissions) = zarn_tui::permission_channel();
-            let mut perms = Permissions::new(prompt_sink);
-            perms = perms.with_tools(cfg.permissions);
-            let gate = Arc::new(perms);
-            let agent = Arc::new(
-                Agent::new(provider, tools, ctx, config).with_gate(gate),
-            );
-            zarn_tui::run(agent, history, permissions).await?;
-        }
-        RunMode::OneShot(prompt) => {
-            let agent = Agent::new(provider, tools, ctx, config)
-                .with_gate(Arc::new(Permissions::headless().with_tools(cfg.permissions)));
-
-            let (tx, mut rx) = tokio::sync::mpsc::channel(256);
-            let printer = tokio::spawn(async move {
-                let mut out = std::io::stdout();
-                while let Some(event) = rx.recv().await {
-                    match event {
-                        AgentEvent::Provider(Event::TextDelta(text)) => {
-                            let _ = write!(out, "{text}");
-                            let _ = out.flush();
-                        }
-                        AgentEvent::ToolStarted { name, args, .. } => {
-                            let _ = writeln!(out, "\n[tool] {name} {args}");
-                            let _ = out.flush();
-                        }
-                        AgentEvent::ToolFinished { name, output, .. } => {
-                            let status = if output.is_error { "failed" } else { "ok" };
-                            let _ = writeln!(out, "[tool] {name} {status}");
-                            let _ = out.flush();
-                        }
-                        _ => {}
-                    }
-                }
-            });
-
-            let cancel = CancellationToken::new();
-            let mut messages = vec![Message::user(&prompt)];
-            let result = agent.run(&mut messages, &tx, &cancel).await;
-            drop(tx);
-            let _ = printer.await;
-            println!();
-
-            match result {
-                Ok(_) => {}
-                Err(err) => bail!(err),
-            }
-        }
-    }
-
-    Ok(())
+async fn tui(args: &Args, resume: Option<PathBuf>) -> Result<()> {
+    zarn_tui::run(zarn_tui::Options {
+        profile: args.profile.clone(),
+        model: args.model.clone(),
+        resume,
+        mode: args.mode.clone().or_else(|| args.permission_mode.clone()),
+        fork: args.fork_session,
+        add_dirs: args.add_dir.clone(),
+        ..zarn_tui::Options::default()
+    })
+    .await
 }

@@ -1,1 +1,7 @@
 /target
+.env
+.env.*
+auth.json
+auth.json.*
+*.jsonl
+.zarn/

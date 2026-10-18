@@ -1,0 +1,12 @@
+╭ zarn settings · changes save as you go ──────────────────────────────────────────────────────────╮
+│Providers  Models  Skills  MCP  Agents  Modes  Quota  Permissions  Hooks  Plugins  General        │
+│                                                                                                  │
+│› bash   deny  user                                                                               │
+│  read   allow  default                                                                           │
+│  skill  allow  default                                                                           │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│↑↓ move · ←→ tab · enter cycles · a allow · s ask · d deny, or delete a rule · esc close          │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

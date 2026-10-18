@@ -1,0 +1,647 @@
+use crate::agents::{self, AgentFile};
+use crate::auth::KeyStore;
+use crate::context::{self, DEFAULT_BUDGET};
+use crate::guard::{guarded_named, redacting};
+use crate::{Config, catalog};
+use anyhow::{Result, bail};
+use std::path::Path;
+use std::sync::Arc;
+use zarn_core::agent::AgentConfig;
+use zarn_core::provider::Provider;
+use crate::modes::{self, ModeDef};
+use std::collections::HashSet;
+use std::sync::Mutex;
+use zarn_core::subagent::{AgentDef, ProviderFactory, TaskTool, ToolFactory};
+use zarn_core::tools::{Ctx, Tool, ToolRegistry};
+use zarn_providers::{FallbackProvider, PinnedModel, ProviderSpec, Switch, SwitchSink};
+use zarn_tools::exit_plan::{ExitPlan, PlanApprover};
+use zarn_tools::skill::{Skill, SkillTool};
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct Plan {
+    pub profile: String,
+    pub provider_name: String,
+    pub model: String,
+    pub names: Vec<String>,
+    pub specs: Vec<ProviderSpec>,
+    pub models: Vec<Option<String>>,
+    pub skipped: Vec<String>,
+    pub auto_from: Option<usize>,
+}
+
+impl Plan {
+    pub fn entries(&self) -> Vec<(String, ProviderSpec)> {
+        self.names.iter().cloned().zip(self.specs.iter().cloned()).collect()
+    }
+
+    pub fn pinned(&self) -> Vec<(String, String, ProviderSpec, Option<String>)> {
+        self.chain_labels()
+            .into_iter()
+            .zip(self.names.iter().map(|n| n.split_once(':').map(|(p, _)| p.to_string()).unwrap_or_else(|| n.clone())))
+            .zip(self.specs.iter().cloned())
+            .zip(self.models.iter().cloned().chain(std::iter::repeat(None)))
+            .map(|(((label, name), spec), model)| (label, name, spec, model))
+            .collect()
+    }
+
+    pub fn chain_labels(&self) -> Vec<String> {
+        self.names
+            .iter()
+            .zip(self.models.iter().cloned().chain(std::iter::repeat(None)))
+            .enumerate()
+            .map(|(i, (name, model))| match (i, model) {
+                (0, _) => format!("{name}:{}", self.model),
+                (_, Some(model)) if !name.contains(':') => format!("{name}:{model}"),
+                _ => name.clone(),
+            })
+            .collect()
+    }
+}
+
+pub type Notify = Arc<dyn Fn(String) + Send + Sync>;
+
+pub fn switch_sink(notify: &Option<Notify>) -> Option<SwitchSink> {
+    let notify = notify.clone()?;
+    Some(Arc::new(move |switch: &Switch| notify(switch.notice())))
+}
+
+pub fn active_profile(cfg: &Config, requested: Option<&str>) -> String {
+    requested
+        .map(str::to_string)
+        .or_else(|| std::env::var("ZARN_PROFILE").ok().filter(|p| !p.is_empty()))
+        .unwrap_or_else(|| cfg.default_profile())
+}
+
+pub fn plan(
+    cfg: &Config,
+    store: &KeyStore,
+    profile: &str,
+    model_override: Option<&str>,
+) -> Result<Plan> {
+    let Some(spec) = cfg.profiles.get(profile) else {
+        bail!("no provider is configured for profile '{profile}'. Run /login or `zarn providers add`.");
+    };
+    let Some(primary) = spec.provider.clone() else {
+        bail!("profile '{profile}' names no provider. Pick one in /config or with /provider.");
+    };
+    let model = model_override
+        .map(str::to_string)
+        .or_else(|| spec.model.clone())
+        .or_else(|| std::env::var("ZARN_MODEL").ok().filter(|m| !m.is_empty()));
+    let Some(model) = model else {
+        bail!("profile '{profile}' has no model. Pick one with /model.");
+    };
+
+    let chain = cfg.chain_for(store, profile)?;
+    let mut names = vec![primary.clone()];
+    names.extend(spec.fallback.iter().flatten().cloned());
+
+    let mut candidates: Vec<(String, ProviderSpec, Option<String>, String)> = Vec::new();
+    let mut fallbacks = names.into_iter().zip(chain);
+    if let Some((name, resolved)) = fallbacks.next() {
+        candidates.push((name.clone(), resolved, None, name));
+    }
+    for (provider, chained) in spec.chain_entries() {
+        let Some(mut resolved) = cfg.providers.get(&provider).cloned() else {
+            continue;
+        };
+        resolved.api_key = cfg.resolve_key(store, &provider).map(|(key, _)| key);
+        candidates.push((format!("{provider}:{chained}"), resolved, Some(chained), provider));
+    }
+    for (name, resolved) in fallbacks {
+        let pinned = crate::ops::model_for(cfg, &name).filter(|m| *m != model);
+        candidates.push((name.clone(), resolved, pinned, name));
+    }
+    let explicit = candidates.len();
+    if spec.chain.is_none() && spec.fallback.is_none() && cfg.general.auto_switch() != "off" {
+        let mut extra = Vec::new();
+        if let Some(own) = cfg.providers.get(&primary) {
+            for alt in catalog::suggested_for(own).iter().filter(|m| **m != model).take(2) {
+                extra.push((primary.clone(), alt.to_string()));
+            }
+        }
+        if cfg.general.auto_switch() == "all" {
+            let mut others: Vec<&String> = cfg.providers.keys().filter(|n| **n != primary).collect();
+            others.sort();
+            for other in others {
+                if let Some(alt) = cfg.providers.get(other).and_then(|s| catalog::suggested_for(s).first().map(|m| m.to_string())) {
+                    extra.push((other.clone(), alt));
+                }
+            }
+        }
+        for (provider, alt) in extra {
+            let Some(mut resolved) = cfg.providers.get(&provider).cloned() else {
+                continue;
+            };
+            resolved.api_key = cfg.resolve_key(store, &provider).map(|(key, _)| key);
+            if catalog::needs_key(&resolved) && resolved.api_key.is_none() {
+                continue;
+            }
+            candidates.push((format!("{provider}:{alt}"), resolved, Some(alt), provider));
+        }
+    }
+
+    let mut specs = Vec::new();
+    let mut kept = Vec::new();
+    let mut models = Vec::new();
+    let mut skipped = Vec::new();
+    let mut seen = HashSet::new();
+    let mut auto_from = None;
+    for (at, (label, resolved, pinned, provider)) in candidates.into_iter().enumerate() {
+        let key = (provider.clone(), pinned.clone().unwrap_or_else(|| model.clone()));
+        if !seen.insert(key) {
+            continue;
+        }
+        let missing = catalog::needs_key(&resolved) && resolved.api_key.is_none();
+        if missing && kept.is_empty() {
+            if let Some(err) = store.helper_error(&provider) {
+                bail!("{err}. Fix the helper command, or run /login {provider}.");
+            }
+            bail!(
+                "provider '{provider}' has no API key. Run /login {provider} or `zarn login {provider}`."
+            );
+        }
+        if missing {
+            skipped.push(label);
+            continue;
+        }
+        if at >= explicit && auto_from.is_none() {
+            auto_from = Some(kept.len());
+        }
+        kept.push(label);
+        specs.push(resolved);
+        models.push(pinned);
+    }
+
+    Ok(Plan {
+        profile: profile.to_string(),
+        provider_name: primary,
+        model,
+        names: kept,
+        specs,
+        models,
+        skipped,
+        auto_from,
+    })
+}
+
+pub fn resolve_model(cfg: &Config, requested: &str) -> Option<(Vec<String>, String)> {
+    if let Some((provider, model)) = requested.split_once(':')
+        && cfg.providers.contains_key(provider)
+        && !model.is_empty()
+    {
+        return Some((vec![provider.to_string()], model.to_string()));
+    }
+    let chain = |p: &crate::ProfileSpec| {
+        let mut names: Vec<String> = p.provider.iter().cloned().collect();
+        names.extend(p.fallback.iter().flatten().cloned());
+        names
+    };
+    if let Some(profile) = cfg.profiles.get(requested)
+        && profile.provider.is_some()
+        && let Some(model) = &profile.model
+    {
+        return Some((chain(profile), model.clone()));
+    }
+    cfg.profiles
+        .values()
+        .find(|p| p.provider.is_some() && p.model.as_deref() == Some(requested))
+        .map(|p| (chain(p), requested.to_string()))
+}
+
+#[derive(Clone)]
+pub struct Providers {
+    pub cfg: Config,
+    pub store: Arc<KeyStore>,
+    pub main: Arc<dyn Provider>,
+    pub main_model: String,
+    pub notify: Option<Notify>,
+}
+
+impl Providers {
+    fn say(&self, text: String) {
+        if let Some(notify) = &self.notify {
+            notify(text);
+        }
+    }
+
+    pub fn chain(&self, names: &[String]) -> Result<Arc<dyn Provider>, String> {
+        let mut entries = Vec::new();
+        let mut missing = Vec::new();
+        for name in names {
+            let Ok(spec) = crate::ops::spec_with_key(&self.cfg, &self.store, name) else {
+                missing.push(format!("{name} is not configured"));
+                continue;
+            };
+            if catalog::needs_key(&spec) && spec.api_key.is_none() {
+                missing.push(format!("{name} has no API key"));
+                continue;
+            }
+            entries.push((name.clone(), spec));
+        }
+        if entries.is_empty() {
+            return Err(missing.join(", "));
+        }
+        guarded_named(&entries, switch_sink(&self.notify)).map_err(|e| e.to_string())
+    }
+
+    pub fn for_model(&self, requested: Option<&str>) -> (Arc<dyn Provider>, String) {
+        let Some(requested) = requested.filter(|m| !m.trim().is_empty()) else {
+            return (self.main.clone(), self.main_model.clone());
+        };
+        match resolve_model(&self.cfg, requested) {
+            None => (self.main.clone(), requested.to_string()),
+            Some((names, model)) => match self.chain(&names) {
+                Ok(provider) => (provider, model),
+                Err(why) => {
+                    self.say(format!(
+                        "{requested}: {why}, answered by the main model {}",
+                        self.main_model
+                    ));
+                    (self.main.clone(), self.main_model.clone())
+                }
+            },
+        }
+    }
+
+}
+
+pub const AGENT_ROLES: [&str; 3] = ["explore", "plan", "review"];
+
+#[derive(Clone)]
+pub struct Router {
+    pub providers: Providers,
+    pub main_name: String,
+    warned: Arc<Mutex<HashSet<String>>>,
+}
+
+#[derive(Clone)]
+pub struct Routed {
+    pub provider: Arc<dyn Provider>,
+    pub model: String,
+    pub provider_name: String,
+}
+
+impl Router {
+    pub fn new(providers: Providers, main_name: impl Into<String>) -> Self {
+        Router {
+            providers,
+            main_name: main_name.into(),
+            warned: Arc::default(),
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.providers.cfg.routing.enabled()
+    }
+
+    pub fn configured(&self, role: &str) -> bool {
+        self.enabled()
+            && self
+                .providers
+                .cfg
+                .routing
+                .roles
+                .get(role)
+                .is_some_and(|r| r.provider.is_some() || r.model.is_some())
+    }
+
+    fn main(&self) -> Routed {
+        Routed {
+            provider: self.providers.main.clone(),
+            model: self.providers.main_model.clone(),
+            provider_name: self.main_name.clone(),
+        }
+    }
+
+    fn warn_once(&self, role: &str, text: String) {
+        let first = self
+            .warned
+            .lock()
+            .map(|mut w| w.insert(role.to_string()))
+            .unwrap_or(true);
+        if first {
+            self.providers.say(text);
+        }
+    }
+
+    pub fn for_model(&self, model: &str) -> (Arc<dyn Provider>, String) {
+        self.providers.for_model(Some(model))
+    }
+
+    pub fn for_role(&self, role: &str) -> Routed {
+        if !self.configured(role) {
+            return self.main();
+        }
+        let spec = self.providers.cfg.routing.roles[role].clone();
+        let name = spec.provider.clone().unwrap_or_else(|| self.main_name.clone());
+        let model = spec
+            .model
+            .clone()
+            .or_else(|| crate::ops::model_for(&self.providers.cfg, &name))
+            .unwrap_or_else(|| self.providers.main_model.clone());
+        if name == self.main_name {
+            return Routed {
+                provider: PinnedModel::wrap(self.providers.main.clone(), model.clone()),
+                model,
+                provider_name: name,
+            };
+        }
+        match self.providers.chain(std::slice::from_ref(&name)) {
+            Err(why) => {
+                self.warn_once(
+                    role,
+                    format!(
+                        "routing role {role}: {why}, answered by {} with {}",
+                        self.main_name, self.providers.main_model
+                    ),
+                );
+                self.main()
+            }
+            Ok(provider) => {
+                let chain = FallbackProvider::named(vec![
+                    (name.clone(), PinnedModel::wrap(provider, model.clone())),
+                    (
+                        self.main_name.clone(),
+                        PinnedModel::wrap(self.providers.main.clone(), self.providers.main_model.clone()),
+                    ),
+                ]);
+                let chain = match switch_sink(&self.providers.notify) {
+                    Some(sink) => chain.with_sink(sink),
+                    None => chain,
+                };
+                Routed {
+                    provider: Arc::new(chain),
+                    model,
+                    provider_name: name,
+                }
+            }
+        }
+    }
+
+    pub fn for_agent(&self, def: &AgentDef) -> Arc<dyn Provider> {
+        if let Some(model) = def.model.as_deref().filter(|m| !m.trim().is_empty()) {
+            let (provider, model) = self.providers.for_model(Some(model));
+            return PinnedModel::wrap(provider, model);
+        }
+        let role = if AGENT_ROLES.contains(&def.name.as_str()) && self.configured(&def.name) {
+            def.name.as_str()
+        } else {
+            "subagent"
+        };
+        let routed = self.for_role(role);
+        PinnedModel::wrap(routed.provider, routed.model)
+    }
+
+    pub fn factory(&self) -> ProviderFactory {
+        let me = self.clone();
+        Arc::new(move |def: &AgentDef| me.for_agent(def))
+    }
+}
+
+pub struct Runtime {
+    pub plan: Plan,
+    pub model: String,
+    pub mode: ModeDef,
+    pub router: Router,
+    pub provider: Arc<dyn Provider>,
+    pub tools: Arc<ToolRegistry>,
+    pub system: String,
+    pub parts: context::SystemParts,
+    pub skills: Vec<Skill>,
+    pub agents: Vec<AgentFile>,
+    pub warnings: Vec<String>,
+    pub parallel: usize,
+    pub deferred: Option<Arc<zarn_tools::tool_search::Deferred>>,
+    pub chain: Option<crate::guard::Chain>,
+}
+
+impl Runtime {
+    pub fn filter(&self) -> Option<zarn_core::agent::ToolFilter> {
+        let deferred = self.deferred.clone()?;
+        Some(Arc::new(move |spec: &zarn_core::types::ToolSpec| deferred.visible(&spec.name)))
+    }
+
+    pub fn agent(&self, ctx: Arc<Ctx>, gate: Arc<dyn zarn_core::agent::ToolGate>) -> zarn_core::agent::Agent {
+        let mut agent = zarn_core::agent::Agent::new(self.provider.clone(), self.tools.clone(), ctx, self.agent_config()).with_gate(gate);
+        if let Some(filter) = self.filter() {
+            agent = agent.with_filter(filter);
+        }
+        agent
+    }
+
+    pub fn agent_config(&self) -> AgentConfig {
+        let defaults = AgentConfig::default();
+        AgentConfig {
+            model: self.model.clone(),
+            parallel: self.parallel,
+            max_iterations: self.mode.max_iterations.unwrap_or(defaults.max_iterations),
+            max_tokens: self.plan.specs.first().and_then(|s| s.max_output).unwrap_or(defaults.max_tokens),
+            ..defaults
+        }
+    }
+}
+
+fn subagent_tools(options: zarn_tools::Options) -> ToolFactory {
+    Arc::new(move |names: &[String]| {
+        let wanted: Vec<String> = names.iter().map(|n| n.to_lowercase()).collect();
+        let mut registry = ToolRegistry::new();
+        for tool in zarn_tools::builtin_list_with(options) {
+            let name = tool.spec().name;
+            if wanted.is_empty() || wanted.contains(&name) {
+                registry.register(redacting(tool));
+            }
+        }
+        registry
+    })
+}
+
+pub fn enabled_skills(cfg: &Config, all: Vec<Skill>) -> Vec<Skill> {
+    all.into_iter()
+        .filter(|s| cfg.skill_enabled(&s.name))
+        .collect()
+}
+
+pub struct Assembly {
+    pub store: Arc<KeyStore>,
+    pub notify: Option<Notify>,
+    pub mode: Option<ModeDef>,
+    pub approver: Option<Arc<dyn PlanApprover>>,
+    pub todos: Option<zarn_tools::todo::TodoList>,
+    pub shells: Option<Arc<zarn_tools::shells::Shells>>,
+    pub task_gate: Option<Arc<dyn zarn_core::agent::ToolGate>>,
+    pub task_monitor: Option<zarn_core::subagent::TaskMonitor>,
+    pub background: Option<Arc<zarn_core::subagent::Background>>,
+    pub memory: Option<Arc<context::NestedMemory>>,
+    pub rests: Option<zarn_providers::fallback::Rests>,
+}
+
+fn allowed(mode: &ModeDef, name: &str) -> bool {
+    mode.tools.is_empty() || mode.tools.iter().any(|t| t.eq_ignore_ascii_case(name)) || name == "exit_plan" || name == "tool_search"
+}
+
+pub fn assemble(
+    cfg: &Config,
+    plan: Plan,
+    cwd: &Path,
+    ctx: Arc<Ctx>,
+    extra_tools: Vec<Box<dyn Tool>>,
+    assembly: Assembly,
+) -> Result<Runtime> {
+    let (base, chain) = crate::guard::guarded_pinned(&plan.pinned(), switch_sink(&assembly.notify), assembly.rests.clone())?;
+    let providers = Providers {
+        cfg: cfg.clone(),
+        store: assembly.store.clone(),
+        main: base,
+        main_model: plan.model.clone(),
+        notify: assembly.notify.clone(),
+    };
+    let router = Router::new(providers, plan.provider_name.clone());
+    let mode = assembly
+        .mode
+        .clone()
+        .unwrap_or_else(|| modes::builtin("default").expect("default mode"));
+    let role = if mode.safe_only && router.configured("plan") { "plan" } else { "main" };
+    let main = router.for_role(role);
+    let skills = enabled_skills(cfg, context::discover_skills());
+    let agents = agents::load();
+    let budget = cfg.general.context_budget.unwrap_or(DEFAULT_BUDGET);
+    let mut parts = context::system_parts(cwd, &skills, budget);
+    parts.mode = modes::prompt_section(&mode);
+    parts.style = crate::styles::section(&crate::styles::load(), cfg.general.output_style.as_deref());
+    let system = parts.join();
+
+    let options = cfg.general.tool_options();
+    let shells = assembly.shells.clone().unwrap_or_default();
+    let mut tools: Vec<Box<dyn Tool>> = zarn_tools::builtin_list_sharing(options, shells);
+    let mut warnings = Vec::new();
+    if let Some(search) = &cfg.websearch {
+        match search.backend(&assembly.store) {
+            Ok(backend) => tools.push(Box::new(zarn_tools::web::WebSearch::new(backend))),
+            Err(err) => warnings.push(format!("websearch is off: {err}")),
+        }
+    }
+    if !skills.is_empty() {
+        tools.push(Box::new(SkillTool::new(skills.clone())));
+    }
+    let parallel = cfg.general.max_parallel_agents();
+    if !agents.is_empty() {
+        let mut task = TaskTool::new(
+            agents.iter().map(|a| a.def.clone()).collect(),
+            router.factory(),
+            subagent_tools(options),
+            ctx,
+            AgentConfig {
+                model: main.model.clone(),
+                parallel,
+                ..AgentConfig::default()
+            },
+        );
+        if let Some(gate) = assembly.task_gate.clone() {
+            task = task.with_gate(gate);
+        }
+        if let Some(monitor) = assembly.task_monitor.clone() {
+            task = task.with_monitor(monitor);
+        }
+        if let Some(background) = assembly.background.clone() {
+            task = task.with_background(background);
+        }
+        tools.push(Box::new(task));
+    }
+    if let Some(list) = assembly.todos.clone() {
+        tools.push(Box::new(zarn_tools::todo::TodoTool::new(list)));
+    }
+    if mode.safe_only
+        && let Some(approver) = assembly.approver.clone()
+    {
+        tools.push(Box::new(ExitPlan::new(approver)));
+    }
+    let mcp_specs: Vec<zarn_core::types::ToolSpec> = extra_tools
+        .iter()
+        .map(|t| t.spec())
+        .filter(|s| allowed(&mode, &s.name))
+        .collect();
+    tools.extend(extra_tools);
+    let threshold = cfg.general.lazy_tools_threshold();
+    let deferred = if !mcp_specs.is_empty() && tools.len() > threshold {
+        let deferred = zarn_tools::tool_search::Deferred::new(mcp_specs.iter().map(|s| s.name.clone()));
+        tools.push(Box::new(zarn_tools::tool_search::ToolSearch::new(mcp_specs, deferred.clone())));
+        Some(deferred)
+    } else {
+        None
+    };
+    let memory = assembly.memory.clone().unwrap_or_else(|| context::NestedMemory::new(cwd));
+    let used = context::memory_used(&context::memory_files(cwd, crate::paths::user_dir().as_deref()), budget);
+    memory.set_budget((budget as usize).saturating_sub(used));
+    let mut registry = ToolRegistry::new();
+    for tool in tools {
+        if allowed(&mode, &tool.spec().name) {
+            registry.register(redacting(context::WithMemory::wrap(tool, memory.clone())));
+        }
+    }
+
+    Ok(Runtime {
+        plan,
+        model: main.model.clone(),
+        mode,
+        provider: main.provider,
+        router,
+        tools: Arc::new(registry),
+        system,
+        parts,
+        skills,
+        agents,
+        warnings,
+        parallel,
+        deferred,
+        chain,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::MemoryBackend;
+
+    fn cfg(body: &str) -> Config {
+        toml::from_str(body).unwrap()
+    }
+
+    fn store() -> (tempfile::TempDir, KeyStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = KeyStore::new(Arc::new(MemoryBackend::new()), dir.path().join("auth.json"));
+        (dir, store)
+    }
+
+    #[test]
+    fn a_fresh_install_has_nothing_to_run() {
+        let (_d, store) = store();
+        assert!(plan(&Config::default(), &store, "default", None).is_err());
+    }
+
+    #[test]
+    fn a_primary_without_a_key_is_an_error_naming_login() {
+        let (_d, store) = store();
+        let c = cfg("[providers.a]\nkind = \"anthropic\"\n[profiles.default]\nprovider = \"a\"\nmodel = \"m\"\n");
+        let err = plan(&c, &store, "default", None).unwrap_err().to_string();
+        assert!(err.contains("login a"));
+    }
+
+    #[test]
+    fn a_fallback_without_a_key_is_skipped_not_fatal() {
+        let (_d, store) = store();
+        store.save("a", "test-key-not-real").unwrap();
+        let c = cfg("[providers.a]\nkind = \"anthropic\"\n[providers.b]\nkind = \"google\"\n[profiles.default]\nprovider = \"a\"\nmodel = \"m\"\nfallback = [\"b\"]\n");
+        let p = plan(&c, &store, "default", None).unwrap();
+        assert_eq!(p.specs.len(), 1);
+        assert_eq!(p.skipped, vec!["b".to_string()]);
+        assert_eq!(p.model, "m");
+    }
+
+    #[test]
+    fn a_model_override_beats_the_profile() {
+        let (_d, store) = store();
+        let c = cfg("[providers.local]\nkind = \"ollama\"\n[profiles.default]\nprovider = \"local\"\nmodel = \"m\"\n");
+        assert_eq!(plan(&c, &store, "default", Some("other")).unwrap().model, "other");
+    }
+}

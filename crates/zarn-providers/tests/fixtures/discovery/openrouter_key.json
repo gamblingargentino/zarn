@@ -1,0 +1,9 @@
+{
+  "data": {
+    "label": "zarn test",
+    "usage": 12.5,
+    "limit": 50,
+    "limit_remaining": 37.5,
+    "is_free_tier": false
+  }
+}

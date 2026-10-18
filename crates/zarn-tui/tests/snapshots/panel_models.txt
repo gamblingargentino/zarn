@@ -1,0 +1,24 @@
+╭ zarn settings · changes save as you go ──────────────────────────────────────────────────────────╮
+│Providers  Models  Skills  MCP  Agents  Modes  Quota  Permissions  Hooks  Plugins  General        │
+│                                                                                                  │
+│› default profile           default                                                               │
+│  default · provider        claude                                                                │
+│  default · model           claude-sonnet-5-5                                                     │
+│  default · fallback 1      local                                                                 │
+│  default · + add fallback                                                                        │
+│  + new profile                                                                                   │
+│  routing                   off  send each role below to its own provider and model               │
+│  role · main               main model                                                            │
+│  role · subagent           main model                                                            │
+│  role · explore            main model                                                            │
+│  role · plan               main model                                                            │
+│  role · compact            main model                                                            │
+│  role · title              main model                                                            │
+│  role · init               main model                                                            │
+│  role · review             main model                                                            │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│                                                                                                  │
+│↑↓ move · ←→ tab · enter change · [ ] reorder · d remove fallback or clear role · esc close       │
+╰──────────────────────────────────────────────────────────────────────────────────────────────────╯

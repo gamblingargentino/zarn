@@ -12,12 +12,63 @@ fn test_request() -> Request {
 mod openai {
     use super::*;
 
+    const OUT_OF_CREDIT: &str = r#"{"error":{"message":"This request requires more credits, or fewer max_tokens. You requested up to 4096 tokens, but can only afford 4000. To increase, visit https://openrouter.ai/settings/credits and upgrade to a paid account","code":402,"metadata":{"raw":"[{\"code\":402},{\"code\":402},{\"code\":402}]"}},"user_id":"user_x"}"#;
+
+    #[tokio::test]
+    async fn a_credit_limit_on_max_tokens_is_retried_once_with_what_the_account_affords() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(|req: &wiremock::Request| {
+                serde_json::from_slice::<serde_json::Value>(&req.body).is_ok_and(|b| b["max_tokens"] == 4096)
+            })
+            .respond_with(ResponseTemplate::new(402).set_body_string(OUT_OF_CREDIT))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(|req: &wiremock::Request| {
+                serde_json::from_slice::<serde_json::Value>(&req.body).is_ok_and(|b| b["max_tokens"] == 4000)
+            })
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string("data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n")
+                    .insert_header("content-type", "text/event-stream"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = OpenAiCompatProvider::new(server.uri(), "test-key-not-real");
+        let mut request = test_request();
+        request.max_tokens = 4096;
+        let mut stream = provider.stream(request).await.unwrap();
+        assert_eq!(stream.next().await.unwrap(), Event::TextDelta("hi".into()));
+    }
+
+    #[tokio::test]
+    async fn an_error_shows_the_provider_message_not_the_raw_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(402).set_body_string(OUT_OF_CREDIT.replace("4096", "50").replace("4000", "10")))
+            .mount(&server)
+            .await;
+        let provider = OpenAiCompatProvider::new(server.uri(), "test-key-not-real");
+        let mut request = test_request();
+        request.max_tokens = 50;
+        let err = match provider.stream(request).await {
+            Err(err) => err.to_string(),
+            Ok(_) => panic!("expected an error"),
+        };
+        assert!(err.contains("This request requires more credits"), "{err}");
+        assert!(err.contains("(HTTP 402)"), "{err}");
+        assert!(!err.contains("metadata") && !err.contains("user_id"), "{err}");
+    }
+
     #[tokio::test]
     async fn posts_to_chat_completions_with_bearer_auth() {
         let server = MockServer::start().await;
         let _mock_request = Mock::given(method("POST"))
             .and(path("/chat/completions"))
-            .and(header("authorization", "Bearer test-key"))
+            .and(header("authorization", "Bearer test-key-not-real"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n",
             ).insert_header("content-type", "text/event-stream"))
@@ -25,7 +76,7 @@ mod openai {
             .mount(&server)
             .await;
 
-        let provider = OpenAiCompatProvider::new(server.uri(), "test-key");
+        let provider = OpenAiCompatProvider::new(server.uri(), "test-key-not-real");
         let mut stream = provider.stream(test_request()).await.unwrap();
 
         let text_event = stream.next().await.unwrap();
@@ -49,7 +100,7 @@ mod openai {
             .mount(&server)
             .await;
 
-        let provider = OpenAiCompatProvider::new(server.uri(), "test-key");
+        let provider = OpenAiCompatProvider::new(server.uri(), "test-key-not-real");
         let mut stream = provider.stream(test_request()).await.unwrap();
 
         let mut events = Vec::new();
@@ -77,7 +128,7 @@ mod openai {
             .mount(&server)
             .await;
 
-        let provider = OpenAiCompatProvider::new(server.uri(), "test-key");
+        let provider = OpenAiCompatProvider::new(server.uri(), "test-key-not-real");
         let mut stream = provider.stream(test_request()).await.unwrap();
 
         let text_event = stream.next().await.unwrap();
@@ -96,7 +147,7 @@ mod openai {
             .mount(&server)
             .await;
 
-        let provider = OpenAiCompatProvider::new(server.uri(), "test-key");
+        let provider = OpenAiCompatProvider::new(server.uri(), "test-key-not-real");
         let result = provider.stream(test_request()).await;
 
         assert!(matches!(result, Err(ProviderError::RateLimit(_))));
@@ -111,7 +162,7 @@ mod openai {
             .mount(&server)
             .await;
 
-        let provider = OpenAiCompatProvider::new(server.uri(), "test-key");
+        let provider = OpenAiCompatProvider::new(server.uri(), "test-key-not-real");
         let result = provider.stream(test_request()).await;
 
         assert!(matches!(result, Err(ProviderError::Auth(_))));
@@ -126,7 +177,7 @@ mod openai {
             .mount(&server)
             .await;
 
-        let provider = OpenAiCompatProvider::new(server.uri(), "test-key");
+        let provider = OpenAiCompatProvider::new(server.uri(), "test-key-not-real");
         let result = provider.stream(test_request()).await;
 
         assert!(matches!(result, Err(ProviderError::BadRequest(_))));
@@ -141,7 +192,7 @@ mod openai {
             .mount(&server)
             .await;
 
-        let provider = OpenAiCompatProvider::new(server.uri(), "test-key");
+        let provider = OpenAiCompatProvider::new(server.uri(), "test-key-not-real");
         let result = provider.stream(test_request()).await;
 
         assert!(matches!(result, Err(ProviderError::Network(_))));
@@ -156,7 +207,7 @@ mod anthropic {
         let server = MockServer::start().await;
         let _mock = Mock::given(method("POST"))
             .and(path("/messages"))
-            .and(header("x-api-key", "test-key"))
+            .and(header("x-api-key", "test-key-not-real"))
             .and(header("anthropic-version", "2023-06-01"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hello\"}}\n\nevent: message_stop\ndata: {\"type\":\"message_stop\"}\n\n",
@@ -165,7 +216,7 @@ mod anthropic {
             .mount(&server)
             .await;
 
-        let provider = AnthropicProvider::new("test-key").with_base_url(server.uri());
+        let provider = AnthropicProvider::new("test-key-not-real").with_base_url(server.uri());
         let mut stream = provider.stream(test_request()).await.unwrap();
 
         let text_event = stream.next().await.unwrap();
@@ -205,7 +256,7 @@ data: {"type":"message_stop"}
             .mount(&server)
             .await;
 
-        let provider = AnthropicProvider::new("test-key").with_base_url(server.uri());
+        let provider = AnthropicProvider::new("test-key-not-real").with_base_url(server.uri());
         let mut stream = provider.stream(test_request()).await.unwrap();
 
         let start = stream.next().await.unwrap();
@@ -243,7 +294,7 @@ data: {{"type":"message_stop"}}
             .mount(&server)
             .await;
 
-        let provider = AnthropicProvider::new("test-key").with_base_url(server.uri());
+        let provider = AnthropicProvider::new("test-key-not-real").with_base_url(server.uri());
         let mut stream = provider.stream(test_request()).await.unwrap();
 
         let text_event = stream.next().await.unwrap();
@@ -262,7 +313,7 @@ data: {{"type":"message_stop"}}
             .mount(&server)
             .await;
 
-        let provider = AnthropicProvider::new("test-key").with_base_url(server.uri());
+        let provider = AnthropicProvider::new("test-key-not-real").with_base_url(server.uri());
         let result = provider.stream(test_request()).await;
 
         assert!(matches!(result, Err(ProviderError::RateLimit(_))));
@@ -277,7 +328,7 @@ data: {{"type":"message_stop"}}
             .mount(&server)
             .await;
 
-        let provider = AnthropicProvider::new("test-key").with_base_url(server.uri());
+        let provider = AnthropicProvider::new("test-key-not-real").with_base_url(server.uri());
         let result = provider.stream(test_request()).await;
 
         assert!(matches!(result, Err(ProviderError::Auth(_))));
@@ -292,7 +343,7 @@ data: {{"type":"message_stop"}}
             .mount(&server)
             .await;
 
-        let provider = AnthropicProvider::new("test-key").with_base_url(server.uri());
+        let provider = AnthropicProvider::new("test-key-not-real").with_base_url(server.uri());
         let result = provider.stream(test_request()).await;
 
         assert!(matches!(result, Err(ProviderError::BadRequest(_))));
@@ -307,7 +358,7 @@ data: {{"type":"message_stop"}}
             .mount(&server)
             .await;
 
-        let provider = AnthropicProvider::new("test-key").with_base_url(server.uri());
+        let provider = AnthropicProvider::new("test-key-not-real").with_base_url(server.uri());
         let result = provider.stream(test_request()).await;
 
         assert!(matches!(result, Err(ProviderError::Network(_))));
@@ -326,7 +377,7 @@ mod google {
                 let has_alt_sse = req.url.query().is_some_and(|q| q.contains("alt=sse"));
                 has_endpoint && has_alt_sse
             })
-            .and(header("x-goog-api-key", "test-key"))
+            .and(header("x-goog-api-key", "test-key-not-real"))
             .respond_with(ResponseTemplate::new(200).set_body_string(
                 "data: {\"candidates\":[{\"content\":{\"parts\":[{\"text\":\"hello\"}]}}]}\n\ndata: {\"candidates\":[{\"content\":{\"parts\":[]},\"finishReason\":\"STOP\"}]}\n\n",
             ).insert_header("content-type", "text/event-stream"))
@@ -334,7 +385,7 @@ mod google {
             .mount(&server)
             .await;
 
-        let provider = GoogleProvider::new("test-key").with_base_url(server.uri());
+        let provider = GoogleProvider::new("test-key-not-real").with_base_url(server.uri());
         let mut stream = provider.stream(test_request()).await.unwrap();
 
         let text_event = stream.next().await.unwrap();
@@ -372,7 +423,7 @@ mod google {
             .mount(&server)
             .await;
 
-        let provider = GoogleProvider::new("test-key").with_base_url(server.uri());
+        let provider = GoogleProvider::new("test-key-not-real").with_base_url(server.uri());
         let mut stream = provider.stream(test_request()).await.unwrap();
 
         let text = stream.next().await.unwrap();
@@ -402,7 +453,7 @@ mod google {
             .mount(&server)
             .await;
 
-        let provider = GoogleProvider::new("test-key").with_base_url(server.uri());
+        let provider = GoogleProvider::new("test-key-not-real").with_base_url(server.uri());
         let mut stream = provider.stream(test_request()).await.unwrap();
 
         let text_event = stream.next().await.unwrap();
@@ -417,7 +468,7 @@ mod google {
             .mount(&server)
             .await;
 
-        let provider = GoogleProvider::new("test-key").with_base_url(server.uri());
+        let provider = GoogleProvider::new("test-key-not-real").with_base_url(server.uri());
         let result = provider.stream(test_request()).await;
 
         assert!(matches!(result, Err(ProviderError::RateLimit(_))));
@@ -431,7 +482,7 @@ mod google {
             .mount(&server)
             .await;
 
-        let provider = GoogleProvider::new("test-key").with_base_url(server.uri());
+        let provider = GoogleProvider::new("test-key-not-real").with_base_url(server.uri());
         let result = provider.stream(test_request()).await;
 
         assert!(matches!(result, Err(ProviderError::Auth(_))));
@@ -445,7 +496,7 @@ mod google {
             .mount(&server)
             .await;
 
-        let provider = GoogleProvider::new("test-key").with_base_url(server.uri());
+        let provider = GoogleProvider::new("test-key-not-real").with_base_url(server.uri());
         let result = provider.stream(test_request()).await;
 
         assert!(matches!(result, Err(ProviderError::BadRequest(_))));
@@ -459,7 +510,7 @@ mod google {
             .mount(&server)
             .await;
 
-        let provider = GoogleProvider::new("test-key").with_base_url(server.uri());
+        let provider = GoogleProvider::new("test-key-not-real").with_base_url(server.uri());
         let result = provider.stream(test_request()).await;
 
         assert!(matches!(result, Err(ProviderError::Network(_))));
@@ -649,7 +700,7 @@ mod request_bodies {
         let server = MockServer::start().await;
         empty_sse(&server, "/messages").await;
 
-        let provider = AnthropicProvider::new("test-key").with_base_url(server.uri());
+        let provider = AnthropicProvider::new("test-key-not-real").with_base_url(server.uri());
         let _ = provider.stream(request_with_tools(6)).await.unwrap();
 
         let body = captured_body(&server).await;
@@ -677,7 +728,7 @@ mod request_bodies {
             .messages
             .insert(0, Message::System("you are zarn".into()));
 
-        let provider = AnthropicProvider::new("test-key").with_base_url(server.uri());
+        let provider = AnthropicProvider::new("test-key-not-real").with_base_url(server.uri());
         let _ = provider.stream(request).await.unwrap();
 
         let body = captured_body(&server).await;
@@ -742,7 +793,7 @@ mod request_bodies {
             .messages
             .insert(0, Message::System("be brief".into()));
 
-        let provider = GoogleProvider::new("test-key").with_base_url(server.uri());
+        let provider = GoogleProvider::new("test-key-not-real").with_base_url(server.uri());
         let _ = provider.stream(request).await.unwrap();
 
         let body = captured_body(&server).await;

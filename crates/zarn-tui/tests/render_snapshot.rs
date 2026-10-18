@@ -88,6 +88,7 @@ fn tool_card_renders_name_and_status() {
         status: CardStatus::Done,
         output: Some("file1.txt\nfile2.txt".into()),
         expanded: false,
+        ..ToolCard::default()
     }));
 
     let output = render_app(80, 24, &app);
@@ -112,6 +113,7 @@ fn long_tool_output_is_collapsed_with_line_count() {
         status: CardStatus::Done,
         output: Some(long_output),
         expanded: false,
+        ..ToolCard::default()
     }));
 
     let output = render_app(80, 24, &app);
@@ -138,6 +140,7 @@ fn expanding_output_shows_all_lines_and_removes_more_marker() {
         status: CardStatus::Done,
         output: Some(long_output),
         expanded: false,
+        ..ToolCard::default()
     }));
 
     app.expand_last_output();
@@ -157,12 +160,12 @@ fn pending_permission_prompt_renders_options() {
     let mut app = App::new("model");
     let (tx, _rx) = tokio::sync::oneshot::channel();
 
-    app.pending = Some(PermissionRequest {
-        tool: "bash".into(),
-        risk: Risk::Execute,
-        args: json!({ "command": "rm -rf /" }),
-        reply: tx,
-    });
+    app.pending = Some(PermissionRequest::new(
+        "bash",
+        Risk::Execute,
+        json!({ "command": "rm -rf /" }),
+        tx,
+    ));
 
     let output = render_app(80, 24, &app);
     let text = output.join("\n");
@@ -224,6 +227,7 @@ fn tool_status_pending_shows_correct_label() {
         status: CardStatus::Pending,
         output: None,
         expanded: false,
+        ..ToolCard::default()
     }));
 
     let output = render_app(80, 24, &app);
@@ -242,6 +246,7 @@ fn tool_status_running_shows_correct_label() {
         status: CardStatus::Running,
         output: None,
         expanded: false,
+        ..ToolCard::default()
     }));
 
     let output = render_app(80, 24, &app);
@@ -260,6 +265,7 @@ fn tool_status_failed_shows_correct_label() {
         status: CardStatus::Failed,
         output: Some("Error: permission denied".into()),
         expanded: false,
+        ..ToolCard::default()
     }));
 
     let output = render_app(80, 24, &app);
@@ -298,7 +304,7 @@ fn cached_tokens_appear_in_status_when_present() {
 #[test]
 fn cost_appears_in_status_line() {
     let mut app = App::new("model");
-    app.status.cost = 0.0042;
+    app.status.cost = Some(0.0042);
 
     let output = render_app(80, 24, &app);
     let status_line = &output[20];
@@ -329,17 +335,26 @@ fn tool_with_args_shows_truncated_argument_values() {
     let mut app = App::new("model");
     app.blocks.push(Block::Tool(ToolCard {
         id: "tool-1".into(),
-        name: "bash".into(),
+        name: "mcp__shell__run".into(),
         args: json!({ "command": "echo 'hello'" }),
         status: CardStatus::Done,
         output: None,
         expanded: false,
+        ..ToolCard::default()
+    }));
+    app.blocks.push(Block::Tool(ToolCard {
+        id: "tool-2".into(),
+        name: "bash".into(),
+        args: json!({ "command": "echo 'hello'" }),
+        status: CardStatus::Done,
+        ..ToolCard::default()
     }));
 
     let output = render_app(80, 24, &app);
     let text = output.join("\n");
 
-    assert!(text.contains("command"));
+    assert!(text.contains("command: echo 'hello'"));
+    assert!(text.contains("$ echo 'hello'"));
 }
 
 #[test]

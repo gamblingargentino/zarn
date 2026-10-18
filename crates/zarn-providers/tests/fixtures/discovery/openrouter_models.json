@@ -1,0 +1,22 @@
+{
+  "data": [
+    {
+      "id": "anthropic/claude-sonnet-5.5",
+      "name": "Anthropic: Claude Sonnet 5.5",
+      "context_length": 1000000,
+      "architecture": {
+        "modality": "text+image->text",
+        "input_modalities": ["text", "image"],
+        "output_modalities": ["text"]
+      },
+      "supported_parameters": ["max_tokens", "temperature", "tools", "tool_choice"]
+    },
+    {
+      "id": "meta-llama/llama-guard",
+      "name": "Llama Guard",
+      "context_length": 8192,
+      "architecture": { "input_modalities": ["text"], "output_modalities": ["text"] },
+      "supported_parameters": ["max_tokens"]
+    }
+  ]
+}

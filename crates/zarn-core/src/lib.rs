@@ -8,3 +8,4 @@ pub mod session;
 pub mod subagent;
 pub mod tools;
 pub mod types;
+pub mod worktree;

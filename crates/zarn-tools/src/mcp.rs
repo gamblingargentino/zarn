@@ -4,7 +4,7 @@ use eventsource_stream::Eventsource;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -21,19 +21,53 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct ServerConfig {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub command: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub args: Vec<String>,
-    #[serde(default)]
-    pub env: HashMap<String, String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
-    #[serde(default)]
-    pub headers: HashMap<String, String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<String>,
 }
 
 type Pending = Arc<Mutex<HashMap<u64, oneshot::Sender<Result<Value, String>>>>>;
+pub type Listener = Arc<dyn Fn(&str) + Send + Sync>;
+type Listeners = Arc<std::sync::Mutex<Option<Listener>>>;
+
+fn announce(listeners: &Listeners, method: &str) {
+    let listener = listeners.lock().ok().and_then(|l| l.clone());
+    if let Some(listener) = listener {
+        listener(method);
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Resource {
+    pub uri: String,
+    pub name: String,
+    pub description: String,
+    pub mime: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PromptArg {
+    pub name: String,
+    pub required: bool,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Prompt {
+    pub name: String,
+    pub description: String,
+    pub arguments: Vec<PromptArg>,
+}
 
 fn piped(command: &mut tokio::process::Command) -> &mut tokio::process::Command {
     command
@@ -71,7 +105,7 @@ enum Transport {
     Http {
         client: reqwest::Client,
         url: String,
-        headers: HashMap<String, String>,
+        headers: BTreeMap<String, String>,
     },
 }
 
@@ -79,12 +113,15 @@ pub struct McpClient {
     name: String,
     transport: Transport,
     next_id: AtomicU64,
+    listeners: Listeners,
+    capabilities: std::sync::Mutex<Value>,
 }
 
 impl McpClient {
     pub async fn connect(name: &str, config: &ServerConfig) -> Result<Arc<Self>> {
+        let listeners: Listeners = Arc::default();
         let transport = match (&config.command, &config.url) {
-            (Some(command), _) => Self::spawn_stdio(command, config).await?,
+            (Some(command), _) => Self::spawn_stdio(command, config, listeners.clone()).await?,
             (None, Some(url)) => Transport::Http {
                 client: reqwest::Client::new(),
                 url: url.clone(),
@@ -97,6 +134,8 @@ impl McpClient {
             name: name.to_string(),
             transport,
             next_id: AtomicU64::new(1),
+            listeners,
+            capabilities: std::sync::Mutex::new(Value::Null),
         });
 
         timeout(STARTUP_TIMEOUT, client.initialize())
@@ -106,7 +145,13 @@ impl McpClient {
         Ok(client)
     }
 
-    async fn spawn_stdio(command: &str, config: &ServerConfig) -> Result<Transport> {
+    pub fn on_notification(&self, listener: Listener) {
+        if let Ok(mut current) = self.listeners.lock() {
+            *current = Some(listener);
+        }
+    }
+
+    async fn spawn_stdio(command: &str, config: &ServerConfig, listeners: Listeners) -> Result<Transport> {
         let mut child = match spawn_child(command, config) {
             Ok(child) => child,
             Err(err) if cfg!(windows) && err.kind() == std::io::ErrorKind::NotFound => {
@@ -126,6 +171,12 @@ impl McpClient {
                 let Ok(value) = serde_json::from_str::<Value>(&line) else {
                     continue;
                 };
+                if let Some(method) = value.get("method").and_then(Value::as_str) {
+                    if value.get("id").is_none() {
+                        announce(&listeners, method);
+                    }
+                    continue;
+                }
                 let Some(id) = value.get("id").and_then(Value::as_u64) else {
                     continue;
                 };
@@ -145,8 +196,15 @@ impl McpClient {
         })
     }
 
+    pub fn supports(&self, capability: &str) -> bool {
+        self.capabilities
+            .lock()
+            .map(|c| c.get(capability).is_some_and(|v| !v.is_null()))
+            .unwrap_or(false)
+    }
+
     async fn initialize(&self) -> Result<()> {
-        self.request(
+        let result = self.request(
             "initialize",
             json!({
                 "protocolVersion": PROTOCOL_VERSION,
@@ -155,6 +213,9 @@ impl McpClient {
             }),
         )
         .await?;
+        if let Ok(mut caps) = self.capabilities.lock() {
+            *caps = result.get("capabilities").cloned().unwrap_or(Value::Null);
+        }
         self.notify("notifications/initialized", json!({})).await
     }
 
@@ -220,6 +281,12 @@ impl McpClient {
                 let response = timeout(CALL_TIMEOUT, request.send())
                     .await
                     .map_err(|_| anyhow!("server {} timed out on {method}", self.name))??;
+                if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                    bail!("server {} needs authorization (HTTP 401); run /mcp login {}", self.name, self.name);
+                }
+                if !response.status().is_success() {
+                    bail!("server {} answered HTTP {} to {method}", self.name, response.status());
+                }
 
                 let is_sse = response
                     .headers()
@@ -228,7 +295,7 @@ impl McpClient {
                     .is_some_and(|v| v.contains("text/event-stream"));
 
                 if is_sse {
-                    read_sse(response, id).await?
+                    read_sse(response, id, &self.listeners).await?
                 } else {
                     split_response(response.json().await?)
                 }
@@ -265,6 +332,93 @@ impl McpClient {
             .collect())
     }
 
+    pub async fn list_resources(&self) -> Result<Vec<Resource>> {
+        let result = self.request("resources/list", json!({})).await?;
+        let listed = result.get("resources").and_then(Value::as_array).cloned().unwrap_or_default();
+        Ok(listed
+            .iter()
+            .filter_map(|r| {
+                let s = |k: &str| r.get(k).and_then(Value::as_str).unwrap_or_default().to_string();
+                let uri = s("uri");
+                if uri.is_empty() {
+                    return None;
+                }
+                Some(Resource { uri, name: s("name"), description: s("description"), mime: s("mimeType") })
+            })
+            .collect())
+    }
+
+    pub async fn read_resource(&self, uri: &str) -> Result<String> {
+        let result = self.request("resources/read", json!({ "uri": uri })).await?;
+        let contents = result.get("contents").and_then(Value::as_array).cloned().unwrap_or_default();
+        let parts: Vec<String> = contents
+            .iter()
+            .map(|c| match c.get("text").and_then(Value::as_str) {
+                Some(text) => text.to_string(),
+                None => format!(
+                    "[binary resource {} of type {}]",
+                    c.get("uri").and_then(Value::as_str).unwrap_or(uri),
+                    c.get("mimeType").and_then(Value::as_str).unwrap_or("unknown")
+                ),
+            })
+            .collect();
+        Ok(parts.join("\n"))
+    }
+
+    pub async fn list_prompts(&self) -> Result<Vec<Prompt>> {
+        let result = self.request("prompts/list", json!({})).await?;
+        let listed = result.get("prompts").and_then(Value::as_array).cloned().unwrap_or_default();
+        Ok(listed
+            .iter()
+            .filter_map(|p| {
+                let name = p.get("name")?.as_str()?.to_string();
+                let arguments = p
+                    .get("arguments")
+                    .and_then(Value::as_array)
+                    .map(|args| {
+                        args.iter()
+                            .filter_map(|a| {
+                                Some(PromptArg {
+                                    name: a.get("name")?.as_str()?.to_string(),
+                                    required: a.get("required").and_then(Value::as_bool).unwrap_or(false),
+                                })
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                Some(Prompt {
+                    name,
+                    description: p.get("description").and_then(Value::as_str).unwrap_or_default().to_string(),
+                    arguments,
+                })
+            })
+            .collect())
+    }
+
+    pub async fn get_prompt(&self, name: &str, arguments: &BTreeMap<String, String>) -> Result<String> {
+        let result = self.request("prompts/get", json!({ "name": name, "arguments": arguments })).await?;
+        let messages = result.get("messages").and_then(Value::as_array).cloned().unwrap_or_default();
+        let parts: Vec<String> = messages
+            .iter()
+            .filter_map(|m| {
+                let content = m.get("content")?;
+                match content.get("type").and_then(Value::as_str) {
+                    Some("text") => content.get("text").and_then(Value::as_str).map(str::to_string),
+                    Some("resource") => content
+                        .get("resource")
+                        .and_then(|r| r.get("text"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    _ => None,
+                }
+            })
+            .collect();
+        if parts.is_empty() {
+            bail!("prompt {name} returned no text");
+        }
+        Ok(parts.join("\n\n"))
+    }
+
     pub async fn shutdown(&self) {
         if let Transport::Stdio { child, .. } = &self.transport {
             let _ = child.lock().await.start_kill();
@@ -272,12 +426,18 @@ impl McpClient {
     }
 }
 
-async fn read_sse(response: reqwest::Response, id: u64) -> Result<Result<Value, String>> {
+async fn read_sse(response: reqwest::Response, id: u64, listeners: &Listeners) -> Result<Result<Value, String>> {
     let mut stream = response.bytes_stream().eventsource();
     while let Some(Ok(event)) = stream.next().await {
         let Ok(value) = serde_json::from_str::<Value>(&event.data) else {
             continue;
         };
+        if let Some(method) = value.get("method").and_then(Value::as_str) {
+            if value.get("id").is_none() {
+                announce(listeners, method);
+            }
+            continue;
+        }
         if value.get("id").and_then(Value::as_u64) == Some(id) {
             return Ok(split_response(value));
         }
@@ -357,37 +517,116 @@ fn render_result(result: &Value) -> ToolOutput {
     }
 }
 
-pub async fn connect_all(servers: &HashMap<String, ServerConfig>) -> Vec<Box<dyn Tool>> {
+pub struct McpServer {
+    name: String,
+    client: Arc<McpClient>,
+    specs: std::sync::RwLock<Vec<ToolSpec>>,
+    resources: Vec<Resource>,
+    prompts: Vec<Prompt>,
+}
+
+impl McpServer {
+    pub async fn start(name: &str, config: &ServerConfig) -> Result<Self> {
+        let client = McpClient::connect(name, config).await?;
+        match client.list_tools().await {
+            Ok(specs) => {
+                let resources = if client.supports("resources") {
+                    client.list_resources().await.unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                let prompts = if client.supports("prompts") {
+                    client.list_prompts().await.unwrap_or_default()
+                } else {
+                    Vec::new()
+                };
+                Ok(McpServer {
+                    name: name.to_string(),
+                    client,
+                    specs: std::sync::RwLock::new(specs),
+                    resources,
+                    prompts,
+                })
+            }
+            Err(err) => {
+                client.shutdown().await;
+                Err(err)
+            }
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn client(&self) -> &Arc<McpClient> {
+        &self.client
+    }
+
+    pub fn on_notification(&self, listener: Listener) {
+        self.client.on_notification(listener);
+    }
+
+    pub async fn refresh_tools(&self) -> Result<usize> {
+        let specs = self.client.list_tools().await?;
+        let n = specs.len();
+        if let Ok(mut current) = self.specs.write() {
+            *current = specs;
+        }
+        Ok(n)
+    }
+
+    pub fn resources(&self) -> &[Resource] {
+        &self.resources
+    }
+
+    pub fn prompts(&self) -> &[Prompt] {
+        &self.prompts
+    }
+
+    fn specs(&self) -> Vec<ToolSpec> {
+        self.specs.read().map(|s| s.clone()).unwrap_or_default()
+    }
+
+    pub fn tool_names(&self) -> Vec<String> {
+        self.specs()
+            .iter()
+            .map(|spec| namespaced(&self.name, &spec.name))
+            .collect()
+    }
+
+    pub fn tools(&self) -> Vec<Box<dyn Tool>> {
+        self.specs()
+            .iter()
+            .map(|spec| {
+                Box::new(McpTool {
+                    client: self.client.clone(),
+                    remote_name: spec.name.clone(),
+                    spec: ToolSpec {
+                        name: namespaced(&self.name, &spec.name),
+                        ..spec.clone()
+                    },
+                }) as Box<dyn Tool>
+            })
+            .collect()
+    }
+
+    pub async fn shutdown(&self) {
+        self.client.shutdown().await;
+    }
+}
+
+pub async fn connect_all<'a>(
+    servers: impl IntoIterator<Item = (&'a String, &'a ServerConfig)>,
+) -> Vec<Box<dyn Tool>> {
     let mut tools: Vec<Box<dyn Tool>> = Vec::new();
 
     for (name, config) in servers {
-        let client = match McpClient::connect(name, config).await {
-            Ok(client) => client,
+        match McpServer::start(name, config).await {
+            Ok(server) => tools.extend(server.tools()),
             Err(err) => {
                 tracing::warn!(server = %name, %err, "mcp server unavailable, skipping");
-                continue;
             }
-        };
-
-        let listed = match client.list_tools().await {
-            Ok(listed) => listed,
-            Err(err) => {
-                tracing::warn!(server = %name, %err, "mcp server listed no tools, skipping");
-                client.shutdown().await;
-                continue;
-            }
-        };
-
-        for spec in listed {
-            let remote_name = spec.name.clone();
-            tools.push(Box::new(McpTool {
-                client: client.clone(),
-                remote_name: remote_name.clone(),
-                spec: ToolSpec {
-                    name: namespaced(name, &remote_name),
-                    ..spec
-                },
-            }));
         }
     }
 

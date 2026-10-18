@@ -67,6 +67,7 @@ impl Tool for Read {
         };
 
         ctx.mark_read(&resolved);
+        crate::freshness::record(ctx, &resolved);
 
         let lines: Vec<&str> = text.lines().collect();
         if lines.is_empty() {
