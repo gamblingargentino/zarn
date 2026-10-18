@@ -120,6 +120,8 @@ struct Health {
 
 pub type SwitchSink = Arc<dyn Fn(&Switch) + Send + Sync>;
 
+pub type Rests = Arc<Mutex<std::collections::HashMap<String, Instant>>>;
+
 pub struct FallbackProvider {
     providers: Vec<Arc<dyn Provider>>,
     names: Vec<String>,
@@ -127,6 +129,7 @@ pub struct FallbackProvider {
     last: Mutex<Option<usize>>,
     health: Mutex<Vec<Health>>,
     rest: Duration,
+    shared: Option<Rests>,
 }
 
 impl FallbackProvider {
@@ -149,7 +152,25 @@ impl FallbackProvider {
             last: Mutex::new(None),
             health: Mutex::new(health),
             rest: REST,
+            shared: None,
         }
+    }
+
+    pub fn with_rests(mut self, shared: Rests) -> Self {
+        let now = Instant::now();
+        if let (Ok(map), Ok(mut health)) = (shared.lock(), self.health.lock()) {
+            for (i, name) in self.names.iter().enumerate() {
+                if let Some(until) = map.get(name).filter(|t| **t > now) {
+                    health[i].until = Some(*until);
+                }
+            }
+        }
+        self.shared = Some(shared);
+        self
+    }
+
+    pub fn active(&self) -> Option<String> {
+        self.ready().first().filter(|i| **i != 0).map(|i| self.names[*i].clone())
     }
 
     pub fn with_sink(mut self, sink: SwitchSink) -> Self {
@@ -225,8 +246,14 @@ impl FallbackProvider {
         if self.providers.len() < 2 {
             return None;
         }
-        entry.until = Some(Instant::now() + rest);
+        let until = Instant::now() + rest;
+        entry.until = Some(until);
         entry.strikes = 0;
+        if let Some(shared) = &self.shared
+            && let Ok(mut map) = shared.lock()
+        {
+            map.insert(self.names[index].clone(), until);
+        }
         Some((self.names[index].clone(), rest.as_secs().div_ceil(60)))
     }
 
@@ -235,6 +262,12 @@ impl FallbackProvider {
             && let Some(entry) = health.get_mut(index)
         {
             *entry = Health::default();
+        }
+        if let Some(shared) = &self.shared
+            && let Some(name) = self.names.get(index)
+            && let Ok(mut map) = shared.lock()
+        {
+            map.remove(name);
         }
     }
 

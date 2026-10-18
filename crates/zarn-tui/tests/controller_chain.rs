@@ -34,9 +34,11 @@ async fn a_failing_model_hands_the_turn_to_the_next_in_the_chain_with_its_own_mo
     assert!(switch.contains("main:m does not offer this model, answered by spare:backup-model"), "{switch}");
     assert!(switch.contains("sits out for 30 min"), "{switch}");
 
+    assert_eq!(c.app().status.model, "spare:backup-model (instead of m)", "the status bar names the model answering");
     let asked_main = main.received_requests().await.unwrap().len();
+    c.type_line("/style concise");
     turn(&mut c, "again").await;
-    assert_eq!(main.received_requests().await.unwrap().len(), asked_main, "a resting model is not asked");
+    assert_eq!(main.received_requests().await.unwrap().len(), asked_main, "a resting model is not asked, even after a rebuild");
     assert_eq!(chat_bodies(&spare).await.len(), 2);
 
     c.type_line("/chain");

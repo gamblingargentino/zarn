@@ -68,6 +68,7 @@ pub type Chain = Arc<zarn_providers::FallbackProvider>;
 pub fn guarded_pinned(
     entries: &[(String, String, zarn_providers::ProviderSpec, Option<String>)],
     sink: Option<zarn_providers::SwitchSink>,
+    rests: Option<zarn_providers::fallback::Rests>,
 ) -> Result<(Arc<dyn Provider>, Option<Chain>), ProviderError> {
     let providers = entries
         .iter()
@@ -88,8 +89,12 @@ pub fn guarded_pinned(
         1 => Ok((providers.into_iter().next().expect("one provider").1, None)),
         _ => {
             let chain = zarn_providers::FallbackProvider::named(providers);
-            let chain = Arc::new(match sink {
+            let chain = match sink {
                 Some(sink) => chain.with_sink(sink),
+                None => chain,
+            };
+            let chain = Arc::new(match rests {
+                Some(rests) => chain.with_rests(rests),
                 None => chain,
             });
             Ok((chain.clone(), Some(chain)))

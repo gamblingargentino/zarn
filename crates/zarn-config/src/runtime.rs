@@ -439,6 +439,7 @@ pub struct Assembly {
     pub task_monitor: Option<zarn_core::subagent::TaskMonitor>,
     pub background: Option<Arc<zarn_core::subagent::Background>>,
     pub memory: Option<Arc<context::NestedMemory>>,
+    pub rests: Option<zarn_providers::fallback::Rests>,
 }
 
 fn allowed(mode: &ModeDef, name: &str) -> bool {
@@ -453,7 +454,7 @@ pub fn assemble(
     extra_tools: Vec<Box<dyn Tool>>,
     assembly: Assembly,
 ) -> Result<Runtime> {
-    let (base, chain) = crate::guard::guarded_pinned(&plan.pinned(), switch_sink(&assembly.notify))?;
+    let (base, chain) = crate::guard::guarded_pinned(&plan.pinned(), switch_sink(&assembly.notify), assembly.rests.clone())?;
     let providers = Providers {
         cfg: cfg.clone(),
         store: assembly.store.clone(),

@@ -249,6 +249,7 @@ pub struct Controller {
     pending_edit: Option<PathBuf>,
     precompacted: bool,
     ranked: Vec<zarn_config::rank::Probe>,
+    rests: zarn_providers::fallback::Rests,
     todos: zarn_tools::todo::TodoList,
     notifier: crate::notify::Notifier,
     shells: Arc<zarn_tools::shells::Shells>,
@@ -348,6 +349,7 @@ impl Controller {
             pending_edit: None,
             precompacted: false,
             ranked: Vec::new(),
+            rests: Default::default(),
             todos: Arc::default(),
             notifier: crate::notify::Notifier::stdout(),
             shells: zarn_tools::shells::Shells::new(),
@@ -748,6 +750,7 @@ impl Controller {
             }),
             background: Some(self.background.clone()),
             memory: Some(self.memory.clone()),
+            rests: Some(self.rests.clone()),
         };
         match runtime::assemble(&cfg, plan, &self.cwd, self.ctx.clone(), tools, assembly) {
             Ok(rt) => {
@@ -770,6 +773,7 @@ impl Controller {
                 self.system = rt.system.clone();
                 self.set_system();
                 self.app.status.model = rt.model.clone();
+                self.show_active_model(&rt);
                 self.cost.set_model(rt.model.clone());
                 self.app.not_ready = None;
                 self.runtime = Some(rt);
@@ -1843,7 +1847,18 @@ impl Controller {
         });
     }
 
+    fn show_active_model(&mut self, rt: &Runtime) {
+        self.app.status.model = match rt.chain.as_ref().and_then(|c| c.active()) {
+            Some(active) => format!("{active} (instead of {})", rt.model),
+            None => rt.model.clone(),
+        };
+    }
+
     fn update_meter(&mut self) {
+        if let Some(rt) = self.runtime.take() {
+            self.show_active_model(&rt);
+            self.runtime = Some(rt);
+        }
         let Some(agent) = &self.agent else {
             self.app.status.context = None;
             return;

@@ -149,6 +149,7 @@ pub async fn run(args: &Args, prompt: String) -> Result<()> {
             task_monitor: None,
             background: None,
             memory: None,
+            rests: None,
         },
     )?;
     for warning in &rt.warnings {
